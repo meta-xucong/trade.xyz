@@ -1,0 +1,29 @@
+[package]
+name = "trade_xyz_bot"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+argon2 = "0.5"
+axum = { version = "0.8", features = ["ws"] }
+base64 = "0.22"
+chacha20poly1305 = "0.10"
+clap = { version = "4", features = ["derive"] }
+ethers = "2"
+futures-util = "0.3"
+hyperliquid_rust_sdk = "0.6"
+rand_core = { version = "0.6", features = ["getrandom"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "time"] }
+tokio-tungstenite = { version = "0.20", features = ["native-tls"] }
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1", features = ["v5"] }
+zeroize = { version = "1", features = ["derive"] }
+
+[patch.crates-io]
+hyperliquid_rust_sdk = { path = "vendor/hyperliquid_rust_sdk" }
