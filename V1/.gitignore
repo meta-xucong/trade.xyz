@@ -1,0 +1,13 @@
+/target
+.cargo/
+.target-*/
+.codex-longrun/
+.codex-longrun/target-*/
+artifacts/
+.env
+.env.*
+config/local.toml
+config/secrets.toml
+secrets/
+data/
+logs/
