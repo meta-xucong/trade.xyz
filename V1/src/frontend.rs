@@ -5885,7 +5885,7 @@ async fn execute_fib_residual_cleanup_if_needed(
     max_slippage_bps: f64,
     vault_password: Option<&str>,
     stage: &str,
-) -> Result<Option<SignedRunbookResult>> {
+) -> Result<Option<FastSignedOrderResult>> {
     if market.is_spot() {
         return Ok(None);
     }
@@ -5893,12 +5893,20 @@ async fn execute_fib_residual_cleanup_if_needed(
     if !fib_position_requires_residual_cleanup(&position) {
         return Ok(None);
     }
+    if position.value_usd <= 0.0 {
+        anyhow::bail!(
+            "Fib {stage} residual cleanup for {} / {} found size={} but no positive notional value to close",
+            account.account_id,
+            coin,
+            position.size
+        );
+    }
     let side = if position.size > 0.0 {
         OrderSide::Sell
     } else {
         OrderSide::Buy
     };
-    let options = SignedRunbookOptions {
+    let options = SignedSmokeOptions {
         account_id: account.account_id.clone(),
         coin: coin.to_string(),
         side,
@@ -5911,7 +5919,7 @@ async fn execute_fib_residual_cleanup_if_needed(
         cancel_resting: true,
         confirm_mainnet_live: config.app.environment == "mainnet",
     };
-    let result = execute_signed_runbook(config.clone(), options, vault_password)
+    let result = execute_fast_signed_order(config.clone(), options, vault_password, None)
         .await
         .with_context(|| {
             format!(
@@ -5921,12 +5929,28 @@ async fn execute_fib_residual_cleanup_if_needed(
         })?;
     anyhow::ensure!(
         result.submitted,
-        "Fib {stage} residual cleanup for {} / {} did not submit",
+        "Fib {stage} residual cleanup for {} / {} did not submit: {}",
         account.account_id,
-        coin
+        coin,
+        fib_fast_signed_result_summary(&result)
     );
     wait_for_fib_strictly_flat_perp_position(config, market, account, coin).await?;
     Ok(Some(result))
+}
+
+fn fib_fast_signed_result_summary(result: &FastSignedOrderResult) -> String {
+    let mut parts = vec![format!("transport={}", result.transport)];
+    parts.push(format!(
+        "planned_size={} limit_px={} reduce_only={}",
+        result.plan.size, result.plan.limit_price, result.plan.reduce_only
+    ));
+    if let Some(report) = &result.submit_report {
+        parts.push(format!("submit_report={report:?}"));
+    }
+    if !result.warnings.is_empty() {
+        parts.push(format!("warnings={}", result.warnings.join("; ")));
+    }
+    parts.join(", ")
 }
 
 fn mark_fib_record_cycle_completed(
