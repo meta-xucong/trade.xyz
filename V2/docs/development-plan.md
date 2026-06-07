@@ -20,6 +20,14 @@ through warm per-account workers instead of frontend HTTP handlers.
 - Add a minimal coordinator and account-worker runtime without live submit.
 - Add mock exchange adapters for deterministic tests.
 
+Initial status:
+
+- V2 now starts from a full copied V1 baseline.
+- The first dedicated V2 module is `src/v2_runtime.rs`.
+- The initial worker runtime is intentionally side-effect free: it validates
+  typed commands, signer warm/cold state, idempotency, queue bounds, and
+  multi-account fan-out without submitting exchange actions.
+
 ## Phase 2: Realtime State
 
 - Implement WebSocket-first market and account state caches.

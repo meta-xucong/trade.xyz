@@ -10,3 +10,7 @@ Read these documents before implementing V2:
 6. `security-and-operations.md`
 7. `testing-and-acceptance.md`
 
+The remaining documents in this directory were copied from the accepted V1
+baseline. Treat them as historical implementation context until they are
+explicitly revised for V2.
+
