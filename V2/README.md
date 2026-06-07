@@ -13,3 +13,6 @@ V2 keeps those lessons but changes the execution model:
 
 Start with `docs/README.md`.
 
+The Rust package name is `trade_xyz_bot_v2` so V2 build outputs and process
+names are easy to distinguish from V1.
+

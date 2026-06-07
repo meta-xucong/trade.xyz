@@ -1,0 +1,64 @@
+[app]
+name = "trade_xyz_bot"
+environment = "testnet"
+dry_run = true
+fail_closed = true
+
+[hyperliquid]
+info_url = "https://api.hyperliquid-testnet.xyz/info"
+exchange_url = "https://api.hyperliquid-testnet.xyz/exchange"
+ws_url = "wss://api.hyperliquid-testnet.xyz/ws"
+dex = "xyz"
+
+[process]
+role = "coordinator"
+ipc_bind_addr = "127.0.0.1:8788"
+worker_heartbeat_ms = 500
+signal_ttl_ms = 3000
+worker_startup_timeout_ms = 10000
+
+[secrets]
+vault_path = "secrets/trade_xyz.vault"
+allow_env_fallback = false
+
+[storage]
+audit_log_path = "logs/audit.jsonl"
+
+[risk.global]
+kill_switch = false
+allow_reduce_only_when_killed = true
+
+[[accounts]]
+account_id = "addr_a"
+address = "0xYOUR_MASTER_OR_SUBACCOUNT_ADDRESS_A"
+secret_id = "addr_a_api_wallet"
+api_wallet_env = "HL_API_WALLET_PRIVATE_KEY_ADDR_A"
+enabled = true
+worker_enabled = true
+copy_ratio = 0.10
+max_order_notional_usd = 100.0
+
+[[accounts]]
+account_id = "addr_b"
+address = "0xYOUR_MASTER_OR_SUBACCOUNT_ADDRESS_B"
+secret_id = "addr_b_api_wallet"
+api_wallet_env = "HL_API_WALLET_PRIVATE_KEY_ADDR_B"
+enabled = true
+worker_enabled = true
+copy_ratio = 0.05
+max_order_notional_usd = 100.0
+
+[manual_ops]
+enabled = true
+manual_trading_enabled = true
+manual_live_enabled = false
+mainnet_live_enabled = false
+require_confirm_above_notional_usd = 100.0
+max_manual_order_notional_usd = 25.0
+max_manual_batch_accounts = 5
+blocked_symbols = []
+
+[module_symbol_policies]
+manual_blocked_symbols = []
+fib_blocked_symbols = []
+copy_blocked_symbols = []
