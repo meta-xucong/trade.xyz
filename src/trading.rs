@@ -2,11 +2,12 @@ use std::{
     collections::HashSet,
     ffi::OsStr,
     path::{Component, Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
 use ethers::signers::LocalWallet;
+use futures_util::future::join_all;
 use hyperliquid_rust_sdk::{
     ClientCancelRequest, ClientCancelRequestCloid, ClientLimit, ClientOrder, ClientOrderRequest,
     ClientTrigger, ExchangeClient, ExchangeDataStatus, ExchangeResponseStatus,
@@ -15,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    config::{AccountConfig, AppConfig, save_config},
+    config::{AccountConfig, AppConfig, MARKET_HL_PERP, MARKET_SPOT, MARKET_XYZ_PERP, save_config},
     domain::{
         ApprovedOrder, ExecutionMode, ExecutionPolicy, OrderSide, OrderSubmitted, WorkerError,
         WorkerReport, now_ms,
@@ -30,7 +31,9 @@ use crate::{
         fetch_xyz_market_snapshot_cached, normalize_dex_coin, normalize_spot_coin,
         round_perp_price, round_size_down, round_spot_price, sdk_base_url, submit_send_asset,
     },
+    realtime::RealtimeState,
     secrets::{ApiWalletSecret, account_secret_id, load_account_secret, load_secret_by_id},
+    ws_post::WsPostClient,
 };
 
 // Observed from Hyperliquid mainnet action-level order errors on 2026-05-31.
@@ -471,6 +474,19 @@ impl LiveExchangeExecutor {
         }
     }
 
+    pub async fn submit_fast(&self, order: ApprovedOrder) -> WorkerReport {
+        let fallback = ErrorFallback::from_order(&order);
+        match self.submit_fast_inner(order).await {
+            Ok(report) => report,
+            Err(error) => WorkerReport::Error(WorkerError {
+                worker_id: fallback.worker_id,
+                account_id: fallback.account_id,
+                message: error.to_string(),
+                error_at_ms: now_ms(),
+            }),
+        }
+    }
+
     pub async fn submit_bulk(&self, orders: Vec<ApprovedOrder>) -> Vec<WorkerReport> {
         let fallbacks = orders
             .iter()
@@ -584,6 +600,109 @@ impl LiveExchangeExecutor {
             .order(request, None)
             .await
             .context("Hyperliquid order request failed")?;
+
+        response_to_worker_report(order, plan.limit_price, plan.size, response)
+    }
+
+    async fn submit_fast_inner(&self, order: ApprovedOrder) -> Result<WorkerReport> {
+        anyhow::ensure!(
+            order.account_id == self.account.account_id,
+            "order account {} does not match executor account {}",
+            order.account_id,
+            self.account.account_id
+        );
+        let effective_config = self.config_for_order(&order);
+        let is_buy = matches!(order.side, OrderSide::Buy);
+        let is_spot = is_spot_dex(&effective_config.hyperliquid.dex);
+        let perp_snapshot = if is_spot {
+            None
+        } else {
+            Some(
+                fetch_xyz_market_snapshot_cached(
+                    &effective_config.app.environment,
+                    &effective_config.hyperliquid.dex,
+                    15_000,
+                )
+                .await
+                .context("failed to fetch perp market snapshot")?,
+            )
+        };
+        let plan = if is_spot {
+            let spot_snapshot =
+                fetch_spot_market_snapshot_cached(&effective_config.app.environment, 15_000)
+                    .await
+                    .context("failed to fetch spot market snapshot")?;
+            if let Some(exact_size) = order.exact_size {
+                build_spot_order_plan_for_size(
+                    &spot_snapshot,
+                    &order.coin,
+                    order.side,
+                    exact_size,
+                    order.max_slippage_bps,
+                )?
+            } else {
+                build_spot_order_plan(
+                    &spot_snapshot,
+                    &order.coin,
+                    is_buy,
+                    order.notional_usd,
+                    order.price,
+                    order.max_slippage_bps,
+                )?
+            }
+        } else if let Some(exact_size) = order.exact_size {
+            build_order_plan_for_size(
+                perp_snapshot
+                    .as_ref()
+                    .context("missing perp snapshot for order planning")?,
+                &order.coin,
+                order.side,
+                exact_size,
+                order.max_slippage_bps,
+            )?
+        } else {
+            build_order_plan(
+                perp_snapshot
+                    .as_ref()
+                    .context("missing perp snapshot for order planning")?,
+                &order.coin,
+                is_buy,
+                order.notional_usd,
+                order.price,
+                order.max_slippage_bps,
+            )?
+        };
+        let exchange_client = if is_spot {
+            self.exchange_client(None).await?
+        } else {
+            self.exchange_client_from_snapshot(
+                perp_snapshot
+                    .as_ref()
+                    .context("missing perp snapshot for fast exchange client")?,
+            )?
+        };
+        let cloid = uuid::Uuid::parse_str(&order.cloid)
+            .with_context(|| format!("risk cloid {} is not a UUID", order.cloid))?;
+        let tif = tif_for_policy(order.execution_policy);
+        let request = ClientOrderRequest {
+            asset: plan.coin.clone(),
+            is_buy,
+            reduce_only: order.reduce_only,
+            limit_px: plan.limit_price,
+            sz: plan.size,
+            cloid: Some(cloid),
+            order_type: ClientOrder::Limit(ClientLimit { tif }),
+        };
+
+        let payload = exchange_client
+            .signed_bulk_order_payload_with_grouping(vec![request], None, "na")
+            .context("failed to build signed websocket order payload")?;
+        let response_payload = WsPostClient::for_environment(&effective_config.app.environment)
+            .post_action(payload)
+            .await
+            .context("Hyperliquid websocket order post failed")?;
+        let response: ExchangeResponseStatus = serde_json::from_value(response_payload)
+            .context("failed to parse Hyperliquid websocket order response")?;
 
         response_to_worker_report(order, plan.limit_price, plan.size, response)
     }
@@ -757,7 +876,11 @@ impl LiveExchangeExecutor {
         let exchange_client = if is_spot {
             self.exchange_client(None).await?
         } else {
-            self.exchange_client(snapshot.as_ref()).await?
+            self.exchange_client_from_snapshot(
+                snapshot
+                    .as_ref()
+                    .context("missing snapshot for fast protective exchange client")?,
+            )?
         };
         let is_buy = matches!(plan.exit_side, OrderSide::Buy);
         self.cancel_existing_protective_trigger_orders(&exchange_client, &plan.coin)
@@ -821,6 +944,107 @@ impl LiveExchangeExecutor {
             .bulk_order_with_grouping(requests, None, grouping)
             .await
             .context("Hyperliquid protective trigger order request failed")?;
+        response_to_worker_reports(approved_orders, &response)
+    }
+
+    pub async fn submit_protective_trigger_orders_fast(
+        &self,
+        plan: &ProtectiveExitPlanResult,
+    ) -> Result<Vec<WorkerReport>> {
+        anyhow::ensure!(
+            plan.account_id == self.account.account_id,
+            "protective plan account {} does not match executor account {}",
+            plan.account_id,
+            self.account.account_id
+        );
+        anyhow::ensure!(!plan.legs.is_empty(), "protective plan has no trigger legs");
+
+        let is_spot = is_spot_dex(&self.config.hyperliquid.dex);
+        let snapshot = if is_spot {
+            None
+        } else {
+            Some(
+                fetch_xyz_market_snapshot_cached(
+                    &self.config.app.environment,
+                    &self.config.hyperliquid.dex,
+                    15_000,
+                )
+                .await
+                .context("failed to fetch XYZ market snapshot")?,
+            )
+        };
+        let exchange_client = if is_spot {
+            self.exchange_client(None).await?
+        } else {
+            self.exchange_client_from_snapshot(
+                snapshot
+                    .as_ref()
+                    .context("missing snapshot for fast protective exchange client")?,
+            )?
+        };
+        let is_buy = matches!(plan.exit_side, OrderSide::Buy);
+
+        let now = now_ms();
+        let mut approved_orders = Vec::with_capacity(plan.legs.len());
+        let mut requests = Vec::with_capacity(plan.legs.len());
+        for leg in &plan.legs {
+            let tpsl = match leg.kind.as_str() {
+                "take_profit" => "tp",
+                "stop_loss" => "sl",
+                _ => anyhow::bail!("unsupported protective leg kind {}", leg.kind),
+            };
+            let cloid = uuid::Uuid::parse_str(&leg.cloid)
+                .with_context(|| format!("protective cloid {} is not a UUID", leg.cloid))?;
+            requests.push(ClientOrderRequest {
+                asset: plan.coin.clone(),
+                is_buy,
+                reduce_only: true,
+                limit_px: leg.limit_price,
+                sz: leg.size,
+                cloid: Some(cloid),
+                order_type: ClientOrder::Trigger(ClientTrigger {
+                    is_market: false,
+                    trigger_px: leg.trigger_price,
+                    tpsl: tpsl.to_string(),
+                }),
+            });
+            approved_orders.push(ApprovedOrder {
+                risk_decision_id: format!("protective-exit-arm-risk-{}-{}", leg.kind, now),
+                intent_id: format!("protective-exit-arm-intent-{}-{}", leg.kind, now),
+                signal_id: Some(format!("protective-exit-arm-signal-{}-{}", leg.kind, now)),
+                worker_id: format!("worker-{}", self.account.account_id),
+                account_id: self.account.account_id.clone(),
+                strategy_id: "manual_protective_exit".to_string(),
+                market: None,
+                dex: Some(self.config.hyperliquid.dex.clone()),
+                coin: plan.coin.clone(),
+                side: plan.exit_side,
+                notional_usd: leg.size * leg.limit_price,
+                exact_size: Some(leg.size),
+                price: Some(leg.limit_price),
+                execution_mode: ExecutionMode::Taker,
+                execution_policy: ExecutionPolicy::Taker,
+                max_slippage_bps: 0.0,
+                reduce_only: true,
+                cloid: leg.cloid.clone(),
+                expires_at_ms: Some(now + self.config.process.signal_ttl_ms),
+            });
+        }
+
+        let grouping = if is_spot {
+            "normalTpsl"
+        } else {
+            "positionTpsl"
+        };
+        let payload = exchange_client
+            .signed_bulk_order_payload_with_grouping(requests, None, grouping)
+            .context("failed to build signed websocket protective order payload")?;
+        let response_payload = WsPostClient::for_environment(&self.config.app.environment)
+            .post_action(payload)
+            .await
+            .context("Hyperliquid websocket protective order post failed")?;
+        let response: ExchangeResponseStatus = serde_json::from_value(response_payload)
+            .context("failed to parse Hyperliquid websocket protective order response")?;
         response_to_worker_reports(approved_orders, &response)
     }
 
@@ -914,7 +1138,7 @@ impl LiveExchangeExecutor {
             )
             .await
             .context("failed to fetch XYZ market snapshot")?;
-            self.exchange_client(Some(&snapshot)).await?
+            self.exchange_client_from_snapshot(&snapshot)?
         };
         let cloid =
             uuid::Uuid::parse_str(cloid).with_context(|| format!("invalid cloid {cloid}"))?;
@@ -1001,6 +1225,63 @@ impl LiveExchangeExecutor {
         }
     }
 
+    pub async fn cancel_open_orders_for_coin_fast(
+        &self,
+        coin: &str,
+        realtime: Option<&RealtimeState>,
+    ) -> Result<Option<String>> {
+        let market_id = market_id_for_dex(&self.config.hyperliquid.dex);
+        let open_orders = if let Some(orders) =
+            realtime.and_then(|realtime| realtime.open_orders(market_id, &self.account.address))
+        {
+            orders
+        } else {
+            let query_dex = info_query_dex(&self.config.hyperliquid.dex);
+            fetch_open_orders(
+                &self.config.app.environment,
+                &query_dex,
+                &self.account.address,
+            )
+            .await
+            .context("failed to fetch open orders for fast cancel fallback")?
+        };
+        let cancels = open_orders
+            .into_iter()
+            .filter(|order| order_coin_matches(&self.config.hyperliquid.dex, &order.coin, coin))
+            .map(|order| ClientCancelRequest {
+                asset: normalize_order_coin_for_cancel(&self.config.hyperliquid.dex, &order.coin),
+                oid: order.oid,
+            })
+            .collect::<Vec<_>>();
+        if cancels.is_empty() {
+            return Ok(None);
+        }
+
+        let is_spot = is_spot_dex(&self.config.hyperliquid.dex);
+        let exchange_client = if is_spot {
+            self.exchange_client(None).await?
+        } else {
+            let snapshot = fetch_xyz_market_snapshot_cached(
+                &self.config.app.environment,
+                &self.config.hyperliquid.dex,
+                15_000,
+            )
+            .await
+            .context("failed to fetch XYZ market snapshot")?;
+            self.exchange_client_from_snapshot(&snapshot)?
+        };
+        let payload = exchange_client
+            .signed_bulk_cancel_payload(cancels, None)
+            .context("failed to build signed websocket cancel payload")?;
+        let response_payload = WsPostClient::for_environment(&self.config.app.environment)
+            .post_action(payload)
+            .await
+            .context("Hyperliquid websocket cancel post failed")?;
+        let response: ExchangeResponseStatus = serde_json::from_value(response_payload)
+            .context("failed to parse Hyperliquid websocket cancel response")?;
+        Ok(Some(format!("{response:?}")))
+    }
+
     pub async fn update_leverage(
         &self,
         coin: &str,
@@ -1066,6 +1347,27 @@ impl LiveExchangeExecutor {
             }
         }
         unreachable!("exchange client retry loop should always return before reaching this point")
+    }
+
+    fn exchange_client_from_snapshot(
+        &self,
+        snapshot: &XyzMarketSnapshot,
+    ) -> Result<ExchangeClient> {
+        let wallet: LocalWallet = self.secret.private_key.parse().with_context(|| {
+            format!(
+                "failed to parse API wallet private key for account {} (secret_id {})",
+                self.account.account_id, self.secret.secret_id
+            )
+        })?;
+        let base_url = sdk_base_url(&self.config.app.environment)?;
+        Ok(ExchangeClient::new_with_asset_map(
+            None,
+            wallet,
+            Some(base_url),
+            snapshot.sdk_meta(),
+            snapshot.coin_to_asset.clone(),
+            None,
+        ))
     }
 }
 
@@ -1185,6 +1487,37 @@ pub struct SignedSmokeResult {
     pub submit_report: Option<WorkerReport>,
     pub cancel_response: Option<String>,
     pub reconciliation: Option<SignedSmokeReconciliation>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FastSignedOrderResult {
+    pub environment: String,
+    pub account_id: String,
+    pub coin: String,
+    pub transport: String,
+    pub submit_requested: bool,
+    pub submitted: bool,
+    pub submit_latency_ms: Option<u64>,
+    pub plan: SignedSmokePlanReport,
+    pub submit_report: Option<WorkerReport>,
+    pub cancel_response: Option<String>,
+    pub cache_notes: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FastProtectiveExitArmResult {
+    pub environment: String,
+    pub account_id: String,
+    pub coin: String,
+    pub transport: String,
+    pub submit_requested: bool,
+    pub submitted: bool,
+    pub submit_latency_ms: Option<u64>,
+    pub plan: ProtectiveExitPlanResult,
+    pub submit_reports: Vec<WorkerReport>,
+    pub cache_notes: Vec<String>,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2039,6 +2372,49 @@ async fn fetch_signed_close_size_hint(
     }
 }
 
+fn realtime_signed_close_size_hint(
+    config: &AppConfig,
+    account: &AccountConfig,
+    coin: &str,
+    side: OrderSide,
+    reduce_only: bool,
+    close_full_position: bool,
+    realtime: Option<&RealtimeState>,
+) -> Option<(f64, String)> {
+    let close_gate = signed_close_exempt_from_opening_rules(
+        &config.hyperliquid.dex,
+        side,
+        reduce_only,
+        close_full_position,
+    );
+    if !close_gate || !close_full_position {
+        return None;
+    }
+    let realtime = realtime?;
+    let canonical_coin = canonical_coin_for_dex(&config.hyperliquid.dex, coin);
+    if is_spot_dex(&config.hyperliquid.dex) {
+        let state = realtime.spot_state(&account.address)?;
+        let summary = spot_account_readiness_state(&state, &canonical_coin);
+        signed_close_size_hint(true, true, Some(&summary)).map(|size| {
+            (
+                size,
+                "close_full_position size from realtime spot state".to_string(),
+            )
+        })
+    } else {
+        let market_id = market_id_for_dex(&config.hyperliquid.dex);
+        let state = realtime.clearinghouse_state(market_id, &account.address)?;
+        let summary =
+            summarize_account_readiness_state(&config.hyperliquid.dex, &state, &canonical_coin);
+        signed_close_size_hint(true, true, Some(&summary)).map(|size| {
+            (
+                size,
+                format!("close_full_position size from realtime {market_id} state"),
+            )
+        })
+    }
+}
+
 pub async fn query_order_status(
     config: &AppConfig,
     account_id: &str,
@@ -2459,6 +2835,194 @@ pub async fn execute_signed_smoke(
 
     result.submit_report = Some(report);
     Ok(result)
+}
+
+pub async fn execute_fast_signed_order(
+    config: AppConfig,
+    options: SignedSmokeOptions,
+    vault_password: Option<&str>,
+    realtime: Option<&RealtimeState>,
+) -> Result<FastSignedOrderResult> {
+    let canonical_coin = canonical_coin_for_dex(&config.hyperliquid.dex, &options.coin);
+    let mut options = options;
+    options.coin = canonical_coin;
+    let account = config
+        .account(&options.account_id)
+        .cloned()
+        .with_context(|| format!("account {} not found in config", options.account_id))?;
+    anyhow::ensure!(
+        account.enabled && account.worker_enabled,
+        "account {} is not enabled for worker execution",
+        account.account_id
+    );
+    validate_signed_smoke_constraints(&config, &account, &options)?;
+
+    let mut cache_notes = Vec::new();
+    let exact_close_size = if let Some((size, note)) = realtime_signed_close_size_hint(
+        &config,
+        &account,
+        &options.coin,
+        options.side,
+        options.reduce_only,
+        options.close_full_position,
+        realtime,
+    ) {
+        cache_notes.push(note);
+        Some(size)
+    } else {
+        let size = fetch_signed_close_size_hint(
+            &config,
+            &account,
+            &options.coin,
+            options.side,
+            options.reduce_only,
+            options.close_full_position,
+        )
+        .await?;
+        if size.is_some() {
+            cache_notes.push("close_full_position size from bounded REST fallback".to_string());
+        }
+        size
+    };
+
+    let plan = if is_spot_dex(&config.hyperliquid.dex) {
+        let snapshot = fetch_spot_market_snapshot_cached(&config.app.environment, 15_000)
+            .await
+            .context("failed to fetch spot market snapshot")?;
+        let plan = build_signed_spot_order_plan(
+            &snapshot,
+            &options.coin,
+            options.side,
+            options.notional_usd,
+            options.max_slippage_bps,
+            options.execution_mode,
+            exact_close_size,
+        )?;
+        apply_order_plan_size_override(plan, None, &options.coin)?
+    } else {
+        let snapshot = fetch_xyz_market_snapshot_cached(
+            &config.app.environment,
+            &config.hyperliquid.dex,
+            15_000,
+        )
+        .await
+        .context("failed to fetch XYZ market snapshot")?;
+        let plan = build_signed_order_plan(
+            &snapshot,
+            &options.coin,
+            options.side,
+            options.notional_usd,
+            options.max_slippage_bps,
+            options.execution_mode,
+            exact_close_size,
+        )?;
+        apply_order_plan_size_override(plan, None, &options.coin)?
+    };
+    let execution_policy = execution_policy_for_mode(options.execution_mode);
+    let plan_report = SignedSmokePlanReport {
+        environment: config.app.environment.clone(),
+        account_id: account.account_id.clone(),
+        coin: plan.coin.clone(),
+        asset_id: plan.asset_id,
+        reference_price: plan.reference_price,
+        limit_price: plan.limit_price,
+        size: plan.size,
+        sz_decimals: plan.sz_decimals,
+        execution_mode: options.execution_mode,
+        tif: tif_for_policy(execution_policy),
+        reduce_only: options.reduce_only,
+        submit: options.submit,
+    };
+
+    if !options.submit {
+        return Ok(FastSignedOrderResult {
+            environment: config.app.environment.clone(),
+            account_id: account.account_id,
+            coin: plan.coin,
+            transport: "dry_plan".to_string(),
+            submit_requested: false,
+            submitted: false,
+            submit_latency_ms: None,
+            plan: plan_report,
+            submit_report: None,
+            cancel_response: None,
+            cache_notes,
+            warnings: Vec::new(),
+        });
+    }
+
+    validate_signed_submit_gates(&config, &options)?;
+    ensure_live_account_address(&account)?;
+    let password = vault_password.context("vault password is required for fast signed submit")?;
+    let secret = load_account_secret(&config, &account, Some(password))?;
+    let executor = LiveExchangeExecutor::new(config.clone(), account.clone(), secret);
+    let cancel_response = if options.cancel_resting {
+        let response = executor
+            .cancel_open_orders_for_coin_fast(&plan.coin, realtime)
+            .await?;
+        if response.is_some() {
+            cache_notes
+                .push("same-coin resting orders cancelled through websocket post".to_string());
+        } else {
+            cache_notes
+                .push("same-coin resting order cancel skipped because none were open".to_string());
+        }
+        response
+    } else {
+        None
+    };
+    let now = now_ms();
+    let cloid_seed = format!(
+        "fast-signed:{}:{}:{:?}:{}",
+        account.account_id, plan.coin, options.side, now
+    );
+    let cloid = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, cloid_seed.as_bytes()).to_string();
+    let order = ApprovedOrder {
+        risk_decision_id: format!("fast-signed-risk-{now}"),
+        intent_id: format!("fast-signed-intent-{now}"),
+        signal_id: Some(format!("fast-signed-signal-{now}")),
+        worker_id: format!("worker-{}", account.account_id),
+        account_id: account.account_id.clone(),
+        strategy_id: "fast_signed".to_string(),
+        market: None,
+        dex: Some(config.hyperliquid.dex.clone()),
+        coin: plan.coin.clone(),
+        side: options.side,
+        notional_usd: options.notional_usd,
+        exact_size: Some(plan.size),
+        price: None,
+        execution_mode: options.execution_mode,
+        execution_policy,
+        max_slippage_bps: options.max_slippage_bps,
+        reduce_only: signed_exchange_reduce_only_flag(
+            &config.hyperliquid.dex,
+            options.side,
+            options.reduce_only,
+            options.close_full_position,
+        ),
+        cloid,
+        expires_at_ms: Some(now + config.process.signal_ttl_ms),
+    };
+
+    let started = Instant::now();
+    let report = executor.submit_fast(order).await;
+    let submit_latency_ms = started.elapsed().as_millis() as u64;
+    let submitted = matches!(report, WorkerReport::Submitted(_));
+
+    Ok(FastSignedOrderResult {
+        environment: config.app.environment,
+        account_id: account.account_id,
+        coin: plan.coin,
+        transport: "websocket_post_action".to_string(),
+        submit_requested: true,
+        submitted,
+        submit_latency_ms: Some(submit_latency_ms),
+        plan: plan_report,
+        submit_report: Some(report),
+        cancel_response,
+        cache_notes,
+        warnings: Vec::new(),
+    })
 }
 
 pub async fn execute_signed_acceptance(
@@ -3628,6 +4192,148 @@ pub async fn execute_protective_exit_arm(
     })
 }
 
+pub async fn execute_fast_protective_exit_arm(
+    config: AppConfig,
+    options: ProtectiveExitArmOptions,
+    dry_run: bool,
+    vault_password: Option<&str>,
+    realtime: Option<&RealtimeState>,
+) -> Result<FastProtectiveExitArmResult> {
+    let plan = build_protective_exit_plan(&config, options.exit, dry_run).await?;
+    if !options.submit {
+        return Ok(FastProtectiveExitArmResult {
+            environment: config.app.environment.clone(),
+            account_id: plan.account_id.clone(),
+            coin: plan.coin.clone(),
+            transport: "dry_plan".to_string(),
+            submit_requested: false,
+            submitted: false,
+            submit_latency_ms: None,
+            plan,
+            submit_reports: Vec::new(),
+            cache_notes: Vec::new(),
+            warnings: Vec::new(),
+        });
+    }
+
+    validate_live_order_gates(&config, options.confirm_mainnet_live, true)?;
+    let account = config
+        .account(&plan.account_id)
+        .cloned()
+        .with_context(|| format!("account {} not found in config", plan.account_id))?;
+    anyhow::ensure!(
+        account.enabled && account.worker_enabled,
+        "account {} is not enabled for worker execution",
+        account.account_id
+    );
+    ensure_live_account_address(&account)?;
+
+    let mut cache_notes = Vec::new();
+    let mut warnings = Vec::new();
+    let canonical_coin = canonical_coin_for_dex(&config.hyperliquid.dex, &plan.coin);
+    if is_spot_dex(&config.hyperliquid.dex) {
+        if let Some(state) = realtime.and_then(|realtime| realtime.spot_state(&account.address)) {
+            cache_notes.push("matching inventory checked from realtime spot state".to_string());
+            let readiness = spot_account_readiness_state(&state, &canonical_coin);
+            anyhow::ensure!(
+                reduce_only_spot_position_available(plan.exit_side, readiness.coin_position_size),
+                "cannot set native spot TP/SL before holding matching inventory; {}",
+                reduce_only_spot_position_detail(plan.exit_side, readiness.coin_position_size)
+            );
+        } else {
+            warnings
+                .push("spot realtime state unavailable; using bounded REST pre-check".to_string());
+            let state = fetch_spot_clearinghouse_state(&config.app.environment, &account.address)
+                .await
+                .context("failed to fetch spot state for fast protective TP/SL pre-check")?;
+            let readiness = spot_account_readiness_state(&state, &canonical_coin);
+            anyhow::ensure!(
+                reduce_only_spot_position_available(plan.exit_side, readiness.coin_position_size),
+                "cannot set native spot TP/SL before holding matching inventory; {}",
+                reduce_only_spot_position_detail(plan.exit_side, readiness.coin_position_size)
+            );
+        }
+    } else {
+        let market_id = market_id_for_dex(&config.hyperliquid.dex);
+        if let Some(state) =
+            realtime.and_then(|realtime| realtime.clearinghouse_state(market_id, &account.address))
+        {
+            cache_notes.push(format!(
+                "matching position checked from realtime {market_id} state"
+            ));
+            let readiness =
+                summarize_account_readiness_state(&config.hyperliquid.dex, &state, &canonical_coin);
+            anyhow::ensure!(
+                reduce_only_position_available(plan.exit_side, readiness.coin_position_size),
+                "cannot set exchange-native TP/SL before opening a matching position; {}",
+                reduce_only_position_detail(plan.exit_side, readiness.coin_position_size)
+            );
+        } else {
+            warnings.push(
+                "perp realtime state unavailable; using bounded REST position pre-check"
+                    .to_string(),
+            );
+            let state = fetch_clearinghouse_state(
+                &config.app.environment,
+                &config.hyperliquid.dex,
+                &account.address,
+            )
+            .await
+            .context("failed to fetch clearinghouse state for fast protective TP/SL pre-check")?;
+            let readiness =
+                summarize_account_readiness_state(&config.hyperliquid.dex, &state, &canonical_coin);
+            anyhow::ensure!(
+                reduce_only_position_available(plan.exit_side, readiness.coin_position_size),
+                "cannot set exchange-native TP/SL before opening a matching position; {}",
+                reduce_only_position_detail(plan.exit_side, readiness.coin_position_size)
+            );
+        }
+    }
+
+    if let Some(realtime) = realtime {
+        let market_id = market_id_for_dex(&config.hyperliquid.dex);
+        if let Some(open_orders) = realtime.open_orders(market_id, &account.address) {
+            cache_notes.push(format!(
+                "existing protective order guard checked from realtime {market_id} open orders"
+            ));
+            anyhow::ensure!(
+                !open_orders
+                    .iter()
+                    .any(|order| is_native_protective_open_order(order, &plan.coin)),
+                "fast TP/SL refuses to replace existing protective orders; use strict replacement flow"
+            );
+        }
+    }
+
+    let password = vault_password
+        .context("vault password is required for fast protective TP/SL submission")?;
+    let secret = load_account_secret(&config, &account, Some(password))?;
+    let executor = LiveExchangeExecutor::new(config.clone(), account, secret);
+    let started = Instant::now();
+    let submit_reports = executor
+        .submit_protective_trigger_orders_fast(&plan)
+        .await?;
+    let submit_latency_ms = started.elapsed().as_millis() as u64;
+    let submitted = !submit_reports.is_empty()
+        && submit_reports
+            .iter()
+            .all(|report| matches!(report, WorkerReport::Submitted(_)));
+
+    Ok(FastProtectiveExitArmResult {
+        environment: config.app.environment,
+        account_id: plan.account_id.clone(),
+        coin: plan.coin.clone(),
+        transport: "websocket_post_action".to_string(),
+        submit_requested: true,
+        submitted,
+        submit_latency_ms: Some(submit_latency_ms),
+        plan,
+        submit_reports,
+        cache_notes,
+        warnings,
+    })
+}
+
 pub async fn execute_cancel_by_cloid(
     config: AppConfig,
     account_id: String,
@@ -4496,12 +5202,7 @@ pub async fn execute_usdc_dex_transfer_batch_preflight(
         .as_deref()
         .map(normalize_transfer_layer)
         .unwrap_or_else(|| normalize_transfer_layer(&config.hyperliquid.dex));
-    let mut ready_account_ids = Vec::new();
-    let mut blocked_account_ids = Vec::new();
-    let mut failed_account_ids = Vec::new();
-    let mut results = Vec::new();
-
-    for account_id in &account_ids {
+    let preflight_futures = account_ids.iter().cloned().map(|account_id| {
         let preflight_options = UsdcDexTransferOptions {
             account_id: account_id.clone(),
             destination_account_id: options.destination_account_id.clone(),
@@ -4511,14 +5212,24 @@ pub async fn execute_usdc_dex_transfer_batch_preflight(
             submit: false,
             confirm_mainnet_live: options.confirm_mainnet_live,
         };
+        let config = config.clone();
+        async move {
+            let result = Box::pin(execute_usdc_dex_transfer_preflight(
+                config,
+                preflight_options,
+                vault_password,
+            ))
+            .await;
+            (account_id, result)
+        }
+    });
+    let mut ready_account_ids = Vec::new();
+    let mut blocked_account_ids = Vec::new();
+    let mut failed_account_ids = Vec::new();
+    let mut results = Vec::new();
 
-        match Box::pin(execute_usdc_dex_transfer_preflight(
-            config.clone(),
-            preflight_options,
-            vault_password,
-        ))
-        .await
-        {
+    for (account_id, result) in join_all(preflight_futures).await {
+        match result {
             Ok(data) => {
                 if data.ready_for_testnet_transfer || data.ready_for_mainnet_transfer {
                     ready_account_ids.push(account_id.clone());
@@ -5203,10 +5914,10 @@ pub async fn build_account_funding_batch_report(
     account_ids: &[String],
 ) -> AccountFundingBatchReport {
     let account_ids = account_funding_account_ids(config, account_ids);
-    let mut results = Vec::new();
-    for account_id in &account_ids {
-        results.push(
-            match build_account_funding_report(config, account_id).await {
+    let funding_futures = account_ids.iter().cloned().map(|account_id| {
+        let config = config.clone();
+        async move {
+            match build_account_funding_report(&config, &account_id).await {
                 Ok(data) => AccountFundingAccountResult {
                     ok: true,
                     data: Some(data),
@@ -5217,9 +5928,10 @@ pub async fn build_account_funding_batch_report(
                     data: None,
                     error: Some(error.to_string()),
                 },
-            },
-        );
-    }
+            }
+        }
+    });
+    let results = join_all(funding_futures).await;
 
     let ready_account_ids = results
         .iter()
@@ -5839,6 +6551,16 @@ fn info_query_dex(dex: &str) -> String {
         String::new()
     } else {
         dex.trim().to_ascii_lowercase()
+    }
+}
+
+fn market_id_for_dex(dex: &str) -> &'static str {
+    if is_spot_dex(dex) {
+        MARKET_SPOT
+    } else if dex.trim().eq_ignore_ascii_case("xyz") {
+        MARKET_XYZ_PERP
+    } else {
+        MARKET_HL_PERP
     }
 }
 
@@ -6534,6 +7256,19 @@ fn normalize_order_coin_for_cancel(dex: &str, coin: &str) -> String {
         normalize_spot_coin(coin)
     } else {
         normalize_dex_coin(dex, coin)
+    }
+}
+
+fn order_coin_matches(dex: &str, order_coin: &str, coin: &str) -> bool {
+    if is_spot_dex(dex)
+        || order_coin.contains('/')
+        || coin.contains('/')
+        || order_coin.contains('-')
+        || coin.contains('-')
+    {
+        normalize_spot_coin(order_coin) == normalize_spot_coin(coin)
+    } else {
+        normalize_dex_coin(dex, order_coin) == normalize_dex_coin(dex, coin)
     }
 }
 

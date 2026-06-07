@@ -6447,21 +6447,18 @@
         const marginMode = $("fibMarginMode").value;
         const confirmMainnetLive = requireRunbookMainnetConfirmation(accounts);
         if (confirmMainnetLive === null) return false;
-        for (const accountId of accounts) {
-          const ok = await applyLiveLeverageForOrder({
-            resultId: "fibResult",
-            accountId,
-            coin,
-            leverageValue,
-            marginMode,
-            actionLabel,
-            confirmMainnetLive,
-            marketId: activeFibMarket(),
-            endpoint: "/api/fib-set-leverage",
-          });
-          if (!ok) return false;
-        }
-        return true;
+        const results = await Promise.all(accounts.map((accountId) => applyLiveLeverageForOrder({
+          resultId: "fibResult",
+          accountId,
+          coin,
+          leverageValue,
+          marginMode,
+          actionLabel,
+          confirmMainnetLive,
+          marketId: activeFibMarket(),
+          endpoint: "/api/fib-set-leverage",
+        })));
+        return results.every(Boolean);
       }
 
       function renderFibDetected(detection) {
@@ -7274,6 +7271,14 @@
         };
       }
 
+      function signedRunbookEndpoint(submit) {
+        return submit ? "/api/fast-signed-runbook" : "/api/signed-runbook";
+      }
+
+      function protectiveArmEndpoint(submit) {
+        return submit ? "/api/fast-manual-protective-arm" : "/api/manual-protective-arm";
+      }
+
       async function submitManualPerpCleanupClose({
         accountId,
         marketId,
@@ -7289,7 +7294,7 @@
           manualPositionNotionalUsd(position, entry),
           0.000001,
         );
-        return api("/api/signed-runbook", {
+        return api(signedRunbookEndpoint(true), {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify(signedSmokePayload(
@@ -10124,7 +10129,7 @@
           ? "提交中，请稍候..."
           : "Submitting, please wait...";
         try {
-          const result = await api("/api/manual-protective-arm", {
+          const result = await api(protectiveArmEndpoint(payload.submit), {
             method: "POST",
             headers: { "content-type": "application/json" },
             body: JSON.stringify(payload),
@@ -10138,6 +10143,17 @@
         } finally {
           setButtonBusy(button.id, false);
         }
+      }
+
+      function dashboardRowsGroupedByAccount(rows) {
+        const groupsByAccount = new Map();
+        for (const row of rows || []) {
+          const accountId = row?.dataset?.accountId || "";
+          if (!accountId) continue;
+          if (!groupsByAccount.has(accountId)) groupsByAccount.set(accountId, []);
+          groupsByAccount.get(accountId).push(row);
+        }
+        return Array.from(groupsByAccount.values());
       }
 
       async function dashboardSyncTpslMultiAction() {
@@ -10204,11 +10220,10 @@
             return;
           }
 
-          const batch = [];
-          for (const row of targets) {
+          const syncTargetRow = async (row) => {
             const coin = row.dataset.coin || "";
             const template = sourceTemplateByCoin.get(coin);
-            if (!template) continue;
+            if (!template) return null;
             try {
               const prepared = prepareDashboardProtectiveFromRaw(
                 row,
@@ -10222,13 +10237,13 @@
                 submit,
                 confirm_mainnet_live: submit && String(state.app?.environment || "").toLowerCase() === "mainnet",
               };
-              const wrapped = await api("/api/manual-protective-arm", {
+              const wrapped = await api(protectiveArmEndpoint(payload.submit), {
                 method: "POST",
                 headers: { "content-type": "application/json" },
                 body: JSON.stringify(payload),
               });
               if (!wrapped?.ok && activeDashboardMarket() === "spot" && isProtectiveDustError(wrapped?.error)) {
-                batch.push({
+                return {
                   account_id: prepared.ctx.accountId,
                   coin: prepared.ctx.coin,
                   source_kind: template.sourceKind,
@@ -10236,18 +10251,17 @@
                   skipped: true,
                   data: null,
                   error: protectiveDustSkipMessage(prepared.ctx.coin),
-                });
-                continue;
+                };
               }
-              batch.push({
+              return {
                 account_id: prepared.ctx.accountId,
                 coin: prepared.ctx.coin,
                 source_kind: template.sourceKind,
                 ...wrapped,
-              });
+              };
             } catch (error) {
               if (activeDashboardMarket() === "spot" && isProtectiveDustError(error?.message || error)) {
-                batch.push({
+                return {
                   account_id: row.dataset.accountId || "-",
                   coin: row.dataset.coin || "-",
                   source_kind: template?.sourceKind || "draft",
@@ -10255,19 +10269,23 @@
                   skipped: true,
                   data: null,
                   error: protectiveDustSkipMessage(row.dataset.coin || "-"),
-                });
-                continue;
+                };
               }
-              batch.push({
+              return {
                 account_id: row.dataset.accountId || "-",
                 coin: row.dataset.coin || "-",
                 source_kind: template?.sourceKind || "draft",
                 ok: false,
                 data: null,
                 error: error?.message || String(error),
-              });
+              };
             }
-          }
+          };
+          const batch = (await Promise.all(dashboardRowsGroupedByAccount(targets).map(async (group) => {
+            const groupResults = [];
+            for (const row of group) groupResults.push(await syncTargetRow(row));
+            return groupResults;
+          }))).flat().filter(Boolean);
 
           const failCount = batch.filter((item) => !item.ok).length;
           const skippedCount = batch.filter((item) => item?.skipped === true).length;
@@ -10316,10 +10334,9 @@
         try {
           const market = activeDashboardMarket();
           const isSpot = isSpotMarketId(market);
-          const batch = [];
-          for (const row of rows) {
+          const closePositionRow = async (row) => {
             const ctx = dashboardRowContext(row);
-            if (!ctx.accountId || !ctx.coin || !(Math.abs(ctx.size) > 0)) continue;
+            if (!ctx.accountId || !ctx.coin || !(Math.abs(ctx.size) > 0)) return null;
             const closeSide = isSpot ? "sell" : (ctx.size > 0 ? "sell" : "buy");
             const payload = {
               source_module: "manual",
@@ -10337,7 +10354,7 @@
               confirm_mainnet_live: submit && String(state.app?.environment || "").toLowerCase() === "mainnet",
             };
             try {
-              const wrapped = await api("/api/signed-runbook", {
+              const wrapped = await api(signedRunbookEndpoint(payload.submit), {
                 method: "POST",
                 headers: { "content-type": "application/json" },
                 body: JSON.stringify(payload),
@@ -10362,7 +10379,7 @@
                 }
               }
               const closeOk = wrapped?.ok !== false && (!postCloseCleanup || postCloseCleanup.ok !== false);
-              batch.push({
+              return {
                 account_id: ctx.accountId,
                 coin: ctx.coin,
                 side: closeSide,
@@ -10375,18 +10392,23 @@
                   : (postCloseCleanup?.ok === false
                     ? (postCloseCleanup.error || "post-close cleanup failed")
                     : null),
-              });
+              };
             } catch (error) {
-              batch.push({
+              return {
                 account_id: ctx.accountId,
                 coin: ctx.coin,
                 side: closeSide,
                 ok: false,
                 data: null,
                 error: error?.message || String(error),
-              });
+              };
             }
-          }
+          };
+          const batch = (await Promise.all(dashboardRowsGroupedByAccount(rows).map(async (group) => {
+            const groupResults = [];
+            for (const row of group) groupResults.push(await closePositionRow(row));
+            return groupResults;
+          }))).flat().filter(Boolean);
           const failCount = batch.filter((item) => !item.ok).length;
           showResult("dashboardTpslResult", {
             ok: failCount === 0,
@@ -10462,7 +10484,7 @@
           : "Submitting close request, please wait...";
         setButtonBusy(button.id, true);
         try {
-          const wrapped = await api("/api/signed-runbook", {
+          const wrapped = await api(signedRunbookEndpoint(payload.submit), {
             method: "POST",
             headers: { "content-type": "application/json" },
             body: JSON.stringify(payload),
@@ -11695,7 +11717,7 @@
           const spotMarket = activeManualMarket() === "spot";
           const reduceOnly = manualEffectiveReduceOnly();
           const leverageValue = Number($("manualLeverage").value);
-          if (!spotMarket) {
+          if (!spotMarket && !reduceOnly) {
             if (!Number.isFinite(leverageValue) || leverageValue < 1) {
               return failManual(t("fib.min", { label: t("manual.leverage"), min: 1 }));
             }
@@ -11722,7 +11744,7 @@
             const marginMode = $("manualMarginMode").value;
             const batch = await Promise.all(accounts.map(async (accountId) => {
               let preOpenCleanup = null;
-              if (!spotMarket) {
+              if (!spotMarket && !reduceOnly) {
                 let leverageResult = null;
                 try {
                   leverageResult = await api("/api/manual-set-leverage", {
@@ -11788,7 +11810,7 @@
                 }
               }
               try {
-                const runbookWrapped = await api("/api/signed-runbook", {
+                const runbookWrapped = await api(signedRunbookEndpoint(true), {
                   method: "POST",
                   headers: { "content-type": "application/json" },
                   body: JSON.stringify(signedSmokePayload(accountId, true, confirmMainnetLive)),
@@ -11882,7 +11904,7 @@
                       protectionForSubmit.notionalUsd = Math.min(manualNotionalUsd(), actualNotionalUsd);
                     }
                   }
-                  const protectiveWrapped = await api("/api/manual-protective-arm", {
+                  const protectiveWrapped = await api(protectiveArmEndpoint(true), {
                     method: "POST",
                     headers: { "content-type": "application/json" },
                     body: JSON.stringify(
@@ -12187,7 +12209,7 @@
           if (!ready) return;
         }
         const confirmMainnetLive = submit && (state.app?.environment === "mainnet");
-        await showActionResult("manualResult", submit ? "manualRunbookSubmit" : "manualRunbookPlan", () => api("/api/signed-runbook", {
+        await showActionResult("manualResult", submit ? "manualRunbookSubmit" : "manualRunbookPlan", () => api(signedRunbookEndpoint(submit), {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify(signedSmokePayload(accountId, submit, confirmMainnetLive)),
@@ -12226,7 +12248,7 @@
             try {
               return {
                 account_id: targetAccountId,
-                  ...(await api("/api/manual-protective-arm", {
+                  ...(await api(protectiveArmEndpoint(false), {
                     method: "POST",
                     headers: { "content-type": "application/json" },
                     body: JSON.stringify(protectiveArmPayload(targetAccountId, protection, false, false)),

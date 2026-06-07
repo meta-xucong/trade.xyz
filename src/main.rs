@@ -13,6 +13,7 @@ pub mod strategies;
 pub mod strategy;
 pub mod trading;
 pub mod worker;
+pub mod ws_post;
 
 use std::path::PathBuf;
 
