@@ -66,6 +66,8 @@ preserving V1 safety rules.
 - The frontend must show Vault state, worker state, and kill-switch state
   clearly.
 - Live actions require risk approval even when the signer is already warm.
+- Process-level dry-run is a hard live-action gate. Fast endpoints must not
+  bypass it merely because config live gates are enabled.
 
 ## Testing Rules
 

@@ -2840,6 +2840,7 @@ pub async fn execute_signed_smoke(
 pub async fn execute_fast_signed_order(
     config: AppConfig,
     options: SignedSmokeOptions,
+    dry_run: bool,
     vault_password: Option<&str>,
     realtime: Option<&RealtimeState>,
 ) -> Result<FastSignedOrderResult> {
@@ -2919,6 +2920,8 @@ pub async fn execute_fast_signed_order(
         apply_order_plan_size_override(plan, None, &options.coin)?
     };
     let execution_policy = execution_policy_for_mode(options.execution_mode);
+    let submit_requested = options.submit;
+    let effective_submit = submit_requested && !dry_run;
     let plan_report = SignedSmokePlanReport {
         environment: config.app.environment.clone(),
         account_id: account.account_id.clone(),
@@ -2931,23 +2934,30 @@ pub async fn execute_fast_signed_order(
         execution_mode: options.execution_mode,
         tif: tif_for_policy(execution_policy),
         reduce_only: options.reduce_only,
-        submit: options.submit,
+        submit: effective_submit,
     };
 
-    if !options.submit {
+    if !effective_submit {
+        if submit_requested && dry_run {
+            cache_notes.push("console process dry-run prevented fast signed submit".to_string());
+        }
         return Ok(FastSignedOrderResult {
             environment: config.app.environment.clone(),
             account_id: account.account_id,
             coin: plan.coin,
             transport: "dry_plan".to_string(),
-            submit_requested: false,
+            submit_requested,
             submitted: false,
             submit_latency_ms: None,
             plan: plan_report,
             submit_report: None,
             cancel_response: None,
             cache_notes,
-            warnings: Vec::new(),
+            warnings: if submit_requested && dry_run {
+                vec!["console dry-run is enabled; no exchange action was submitted".to_string()]
+            } else {
+                Vec::new()
+            },
         });
     }
 

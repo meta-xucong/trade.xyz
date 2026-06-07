@@ -1632,7 +1632,7 @@ async fn fast_signed_runbook(
         options.coin = normalize_coin_for_market(&market, &options.coin);
         ensure_accounts_allowed_for_market(&config, &[options.account_id.clone()], market.id)?;
         let path = PathBuf::from(&config.secrets.vault_path);
-        let password = if options.submit {
+        let password = if fast_signed_effective_submit(options.submit, state.dry_run) {
             let close_gate = signed_close_exempt_from_opening_rules(
                 &config.hyperliquid.dex,
                 options.side,
@@ -1658,9 +1658,16 @@ async fn fast_signed_runbook(
             )?;
             Some(state.resolve_vault_password(&path, "")?)
         } else {
-            state.unlocked_vault_password(&path)?
+            None
         };
-        execute_fast_signed_order(config, options, password.as_deref(), Some(&state.realtime)).await
+        execute_fast_signed_order(
+            config,
+            options,
+            state.dry_run,
+            password.as_deref(),
+            Some(&state.realtime),
+        )
+        .await
     }
     .await;
 
@@ -1673,6 +1680,10 @@ async fn fast_signed_runbook(
         &response,
     );
     Json(response)
+}
+
+fn fast_signed_effective_submit(submit_requested: bool, process_dry_run: bool) -> bool {
+    submit_requested && !process_dry_run
 }
 
 async fn manual_protective_exit(
@@ -2272,10 +2283,10 @@ async fn account_funding_batch(
             &account_ids,
             "all_layers",
         );
-        if !payload.force_fresh {
-            if let Some(cached) = state.cached_account_funding_batch(&cache_key)? {
-                return Ok(cached);
-            }
+        if !payload.force_fresh
+            && let Some(cached) = state.cached_account_funding_batch(&cache_key)?
+        {
+            return Ok(cached);
         }
 
         let force_fresh = payload.force_fresh;
@@ -2487,7 +2498,7 @@ async fn usdc_dex_transfer_batch(
         let account_ids = selected_enabled_account_ids(&config, &payload.account_ids);
         validate_batch_account_count("USDC transfer batch plan", &config, &account_ids)?;
 
-        let transfer_futures = account_ids.iter().cloned().map(|account_id| {
+        let transfer_futures = account_ids.iter().map(|account_id| {
             let options = payload.for_account(account_id.clone());
             let config = config.clone();
             async move {
@@ -2557,7 +2568,7 @@ async fn usdc_dex_transfer_readiness_batch(
         let account_ids = selected_enabled_account_ids(&config, &payload.account_ids);
         validate_batch_account_count("USDC transfer readiness batch", &config, &account_ids)?;
 
-        let readiness_futures = account_ids.iter().cloned().map(|account_id| {
+        let readiness_futures = account_ids.iter().map(|account_id| {
             let options = payload.for_account(account_id.clone());
             let state = state.clone();
             let config = config.clone();
@@ -4654,10 +4665,7 @@ fn fib_entry_reports_are_retryable_maker_miss(
         .iter()
         .filter(|report| matches!(report, WorkerReport::Rejected(_) | WorkerReport::Error(_)))
         .count();
-    actionable == reports.len()
-        && reports
-            .iter()
-            .all(|report| fib_entry_report_is_retryable_maker_miss(report))
+    actionable == reports.len() && reports.iter().all(fib_entry_report_is_retryable_maker_miss)
 }
 
 fn fib_entry_report_is_retryable_maker_miss(report: &WorkerReport) -> bool {
@@ -6474,8 +6482,9 @@ async fn execute_fib_entry_signals(
                 };
 
                 let worker_id = format!("worker-{}", account.account_id);
-                if execute_live && !market.is_spot() {
-                    if let Err(error) = execute_fib_residual_cleanup_if_needed(
+                if execute_live
+                    && !market.is_spot()
+                    && let Err(error) = execute_fib_residual_cleanup_if_needed(
                         &config,
                         &market,
                         &account,
@@ -6485,22 +6494,21 @@ async fn execute_fib_entry_signals(
                         "pre-entry",
                     )
                     .await
-                    {
-                        for _ in account_signals {
-                            account_entry_reports.push(WorkerReport::Error(
-                                crate::domain::WorkerError {
-                                    worker_id: worker_id.clone(),
-                                    account_id: account.account_id.clone(),
-                                    message: error.to_string(),
-                                    error_at_ms: now_ms(),
-                                },
-                            ));
-                        }
-                        return Ok::<_, anyhow::Error>((
-                            account_entry_reports,
-                            account_protection_reports,
+                {
+                    for _ in account_signals {
+                        account_entry_reports.push(WorkerReport::Error(
+                            crate::domain::WorkerError {
+                                worker_id: worker_id.clone(),
+                                account_id: account.account_id.clone(),
+                                message: error.to_string(),
+                                error_at_ms: now_ms(),
+                            },
                         ));
                     }
+                    return Ok::<_, anyhow::Error>((
+                        account_entry_reports,
+                        account_protection_reports,
+                    ));
                 }
 
                 let mut approved_orders = Vec::new();
@@ -8797,7 +8805,7 @@ fn cap_recent_events_by_market(events: Vec<EventResponse>) -> Vec<EventResponse>
     let mut capped = Vec::new();
     for market_id in [MARKET_XYZ_PERP, MARKET_HL_PERP, MARKET_SPOT] {
         if let Some(mut market_events) = by_market.remove(market_id) {
-            market_events.sort_by(|left, right| right.occurred_at_ms.cmp(&left.occurred_at_ms));
+            market_events.sort_by_key(|event| std::cmp::Reverse(event.occurred_at_ms));
             capped.extend(
                 market_events
                     .into_iter()
@@ -12833,6 +12841,13 @@ mod tests {
     }
 
     #[test]
+    fn fast_signed_submit_is_disabled_by_console_dry_run() {
+        assert!(!super::fast_signed_effective_submit(true, true));
+        assert!(super::fast_signed_effective_submit(true, false));
+        assert!(!super::fast_signed_effective_submit(false, false));
+    }
+
+    #[test]
     fn fib_per_level_notional_must_meet_exchange_minimum() {
         let mut plan = FibBasicPlan {
             strategy_id: "fib-test".to_string(),
@@ -13181,6 +13196,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn test_user_fill(
         oid: u64,
         coin: &str,

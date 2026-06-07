@@ -27,6 +27,10 @@ Initial status:
 - The initial worker runtime is intentionally side-effect free: it validates
   typed commands, signer warm/cold state, idempotency, queue bounds, and
   multi-account fan-out without submitting exchange actions.
+- The next worker runtime pass adds bounded async channels and a mock exchange
+  adapter. This proves queue backpressure, concurrent account dispatch, cold
+  signer rejection, and idempotent submit behavior before wiring real exchange
+  side effects.
 
 ## Phase 2: Realtime State
 
@@ -41,6 +45,8 @@ Initial status:
 - Keep nonce state inside the worker.
 - Submit signed exchange actions through the official SDK and WebSocket post.
 - Add idempotent order submit, cancel, and native TP/SL flows.
+- Replace the Phase 1 mock adapter only after static tests prove the real
+  adapter preserves the same worker contract.
 
 ## Phase 4: Strategy Integration
 

@@ -55,3 +55,14 @@ Exchange Adapter / Hyperliquid WebSocket Post
 - Exchange adapters do not know strategy rules.
 - Frontend never submits live orders directly.
 
+## Current Implementation Boundary
+
+- `src/v2_runtime.rs` owns the first V2-native worker contract.
+- The synchronous runtime validates account ownership, signer warm/cold state,
+  idempotency keys, queue limits, and control commands.
+- The async runtime wraps that contract in bounded `tokio` channels and records
+  accepted actions through a mock exchange adapter.
+- The mock adapter is intentionally not a live trading adapter. It exists so
+  worker concurrency and fail-closed behavior can be tested before wiring
+  Hyperliquid side effects.
+
