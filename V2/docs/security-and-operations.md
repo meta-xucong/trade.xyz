@@ -13,6 +13,9 @@
 - Keep global kill switch above every module.
 - Keep module-specific risk rules for manual, Fib, and copy trading.
 - Do not implement one global risk bucket that makes strategy behavior unclear.
+- Fast/live endpoints must honor both config-level and process-level dry-run
+  gates. If either is dry-run, `submit=true` may build and display a plan but
+  must not load signer secrets or submit an exchange action.
 - Opening orders must pass notional, leverage, collateral, slippage, precision,
   and symbol checks before signing.
 - Closing and cleanup paths must be reduce-only for perps.
