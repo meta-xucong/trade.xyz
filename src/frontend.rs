@@ -37,9 +37,8 @@ use crate::{
         SpotMarketSnapshot, UserFill, UserRateLimit, build_spot_order_plan, fetch_candle_snapshot,
         fetch_clearinghouse_state, fetch_default_clearinghouse_state, fetch_open_orders,
         fetch_order_status_by_cloid, fetch_order_status_by_oid, fetch_perp_all_mids_cached,
-        fetch_spot_clearinghouse_state, fetch_spot_market_snapshot,
-        fetch_spot_market_snapshot_cached, fetch_user_fills, fetch_user_rate_limit,
-        fetch_ws_candle_probe, fetch_xyz_market_snapshot, fetch_xyz_market_snapshot_cached,
+        fetch_spot_clearinghouse_state, fetch_spot_market_snapshot_cached, fetch_user_fills,
+        fetch_user_rate_limit, fetch_ws_candle_probe, fetch_xyz_market_snapshot_cached,
         normalize_cloid_for_info, normalize_dex_coin, normalize_spot_coin, round_size_down,
         round_spot_price,
     },
@@ -62,10 +61,11 @@ use crate::{
     strategy::{LeaderFillEvent, Strategy, StrategyContext, StrategyEvent},
     trading::{
         AccountExecutor, AccountReadinessState, CancelByCloidResult, CancelOpenOrderResult,
-        HYPERLIQUID_MIN_ORDER_NOTIONAL_USD, MainnetSmokePlanOptions, MainnetSmokePlanResult,
-        ManualLeverageUpdateOptions, ManualLeverageUpdateResult, ProtectiveExitArmOptions,
-        ProtectiveExitArmResult, ProtectiveExitOptions, ProtectiveExitPlanResult,
-        ProtectiveExitSubmitOptions, ProtectiveExitSubmitResult, ProtectiveExitTriggerCheckOptions,
+        FastProtectiveExitArmResult, FastSignedOrderResult, HYPERLIQUID_MIN_ORDER_NOTIONAL_USD,
+        MainnetSmokePlanOptions, MainnetSmokePlanResult, ManualLeverageUpdateOptions,
+        ManualLeverageUpdateResult, ProtectiveExitArmOptions, ProtectiveExitArmResult,
+        ProtectiveExitOptions, ProtectiveExitPlanResult, ProtectiveExitSubmitOptions,
+        ProtectiveExitSubmitResult, ProtectiveExitTriggerCheckOptions,
         ProtectiveExitTriggerCheckResult, SignedAcceptanceOptions, SignedAcceptanceResult,
         SignedRunbookOptions, SignedRunbookResult, SignedSmokeOptions, SignedSmokeResult,
         UsdcDexTransferOptions, UsdcDexTransferResult, UsdcDexTransferRunbookResult,
@@ -73,6 +73,7 @@ use crate::{
         build_signed_order_plan, check_protective_exit_trigger,
         effective_exchange_min_order_notional_ok, effective_order_notional_usd,
         ensure_live_account_address, execute_cancel_by_cloid, execute_cancel_open_order,
+        execute_fast_protective_exit_arm, execute_fast_signed_order,
         execute_manual_leverage_update, execute_protective_exit_arm,
         execute_protective_exit_submit, execute_signed_acceptance, execute_signed_runbook,
         execute_signed_smoke, execute_usdc_dex_transfer, execute_usdc_dex_transfer_runbook,
@@ -633,6 +634,7 @@ pub async fn run(options: FrontendOptions) -> Result<()> {
         .route("/api/signed-smoke", post(signed_smoke))
         .route("/api/signed-acceptance", post(signed_acceptance))
         .route("/api/signed-runbook", post(signed_runbook))
+        .route("/api/fast-signed-runbook", post(fast_signed_runbook))
         .route("/api/manual-protective-exit", post(manual_protective_exit))
         .route(
             "/api/manual-protective-trigger",
@@ -643,6 +645,10 @@ pub async fn run(options: FrontendOptions) -> Result<()> {
             post(manual_protective_submit),
         )
         .route("/api/manual-protective-arm", post(manual_protective_arm))
+        .route(
+            "/api/fast-manual-protective-arm",
+            post(fast_manual_protective_arm),
+        )
         .route(
             "/api/manual-protective-rules",
             post(manual_protective_rules),
@@ -1588,6 +1594,87 @@ async fn signed_runbook(
     Json(response)
 }
 
+async fn fast_signed_runbook(
+    State(state): State<FrontendAppState>,
+    Json(payload): Json<SignedSmokePayload>,
+) -> Json<ApiResult<FastSignedOrderResult>> {
+    let source_module = payload
+        .source_module()
+        .map(ToString::to_string)
+        .unwrap_or_else(|_| "manual".to_string());
+    let audit_details = json!({
+        "source_module": source_module,
+        "market": payload.market.clone().unwrap_or_else(|| MARKET_XYZ_PERP.to_string()),
+        "side": payload.side.clone(),
+        "notional_usd": payload.notional_usd,
+        "max_slippage_bps": payload.max_slippage_bps,
+        "execution_mode": payload.execution_mode.clone(),
+        "reduce_only": payload.reduce_only,
+        "close_full_position": payload.close_full_position,
+        "submit": payload.submit,
+        "cancel_resting": payload.cancel_resting,
+        "confirm_mainnet_live": payload.confirm_mainnet_live,
+        "transport": "websocket_post_action",
+    });
+    let audit_action = if payload.submit {
+        "fast_signed_runbook_submit"
+    } else {
+        "fast_signed_runbook_plan"
+    };
+    let audit_account_id = Some(payload.account_id.clone());
+    let audit_coin = Some(payload.coin.clone());
+    let result = async {
+        let module = payload.source_module()?;
+        let base_config = state.config_snapshot()?;
+        let market = payload.market_profile(&base_config)?;
+        let config = scoped_config_for_module_and_market(base_config, module, &market);
+        let mut options = payload.try_into_options()?;
+        options.coin = normalize_coin_for_market(&market, &options.coin);
+        ensure_accounts_allowed_for_market(&config, &[options.account_id.clone()], market.id)?;
+        let path = PathBuf::from(&config.secrets.vault_path);
+        let password = if options.submit {
+            let close_gate = signed_close_exempt_from_opening_rules(
+                &config.hyperliquid.dex,
+                options.side,
+                options.reduce_only,
+                options.close_full_position,
+            );
+            validate_live_order_gates(&config, options.confirm_mainnet_live, close_gate)?;
+            validate_exchange_min_order_notional(options.notional_usd, close_gate)?;
+            let account = config
+                .account(&options.account_id)
+                .with_context(|| format!("account {} not found in config", options.account_id))?;
+            anyhow::ensure!(
+                account.enabled && account.worker_enabled,
+                "account {} is not enabled for worker execution",
+                account.account_id
+            );
+            ensure_live_account_address(account)?;
+            state.audit_attempt(
+                "fast_signed_runbook_submit_attempt",
+                Some(options.account_id.clone()),
+                Some(options.coin.clone()),
+                audit_details.clone(),
+            )?;
+            Some(state.resolve_vault_password(&path, "")?)
+        } else {
+            state.unlocked_vault_password(&path)?
+        };
+        execute_fast_signed_order(config, options, password.as_deref(), Some(&state.realtime)).await
+    }
+    .await;
+
+    let response = ApiResult::from_result(result);
+    state.audit_api_result(
+        audit_action,
+        audit_account_id,
+        audit_coin,
+        audit_details,
+        &response,
+    );
+    Json(response)
+}
+
 async fn manual_protective_exit(
     State(state): State<FrontendAppState>,
     Json(payload): Json<ProtectiveExitPayload>,
@@ -1873,6 +1960,70 @@ async fn manual_protective_arm(
     Json(response)
 }
 
+async fn fast_manual_protective_arm(
+    State(state): State<FrontendAppState>,
+    Json(payload): Json<ProtectiveExitArmPayload>,
+) -> Json<ApiResult<FastProtectiveExitArmResult>> {
+    let audit_details = json!({
+        "market": payload.market.clone().unwrap_or_else(|| MARKET_XYZ_PERP.to_string()),
+        "entry_side": payload.arm.exit.entry_side.clone(),
+        "entry_price": payload.arm.exit.entry_price,
+        "notional_usd": payload.arm.exit.notional_usd,
+        "take_profit_usd": payload.arm.exit.take_profit_usd,
+        "stop_loss_pct": payload.arm.exit.stop_loss_pct,
+        "take_profit_trigger_price": payload.arm.exit.take_profit_trigger_price,
+        "stop_loss_trigger_price": payload.arm.exit.stop_loss_trigger_price,
+        "max_slippage_bps": payload.arm.exit.max_slippage_bps,
+        "submit": payload.arm.submit,
+        "confirm_mainnet_live": payload.arm.confirm_mainnet_live,
+        "dry_run": state.dry_run,
+        "transport": "websocket_post_action",
+    });
+    let audit_account_id = Some(payload.arm.exit.account_id.clone());
+    let audit_coin = Some(payload.arm.exit.coin.clone());
+    let result = async {
+        let base_config = state.config_snapshot()?;
+        let market = payload.market_profile(&base_config)?;
+        ensure_accounts_allowed_for_market(
+            &base_config,
+            std::slice::from_ref(&payload.arm.exit.account_id),
+            market.id,
+        )?;
+        let config = scoped_config_for_module_and_market(base_config, "manual", &market);
+        let options = payload.into_options(&market);
+        let path = PathBuf::from(&config.secrets.vault_path);
+        let password = if options.submit {
+            state.audit_attempt(
+                "fast_manual_protective_exit_arm_submit_attempt",
+                Some(options.exit.account_id.clone()),
+                Some(options.exit.coin.clone()),
+                audit_details.clone(),
+            )?;
+            Some(state.resolve_vault_password(&path, "")?)
+        } else {
+            None
+        };
+        execute_fast_protective_exit_arm(
+            config,
+            options,
+            state.dry_run,
+            password.as_deref(),
+            Some(&state.realtime),
+        )
+        .await
+    }
+    .await;
+    let response = ApiResult::from_result(result);
+    state.audit_api_result(
+        "fast_manual_protective_exit_arm",
+        audit_account_id,
+        audit_coin,
+        audit_details,
+        &response,
+    );
+    Json(response)
+}
+
 async fn manual_protective_rules(
     State(state): State<FrontendAppState>,
     Json(payload): Json<ManualProtectiveRulesPayload>,
@@ -1902,21 +2053,32 @@ async fn manual_protective_rules(
             return Ok(cached);
         }
 
+        let rule_futures = account_ids
+            .iter()
+            .map(|account_id| {
+                let account = config
+                    .account(account_id)
+                    .with_context(|| format!("account {} not found in config", account_id))?;
+                let config = config.clone();
+                let realtime = state.realtime.clone();
+                let market = market.clone();
+                let account_id = account_id.clone();
+                let address = account.address.clone();
+                Ok(async move {
+                    load_manual_protective_rule_views_for_account(
+                        &config,
+                        &realtime,
+                        &market,
+                        &account_id,
+                        &address,
+                    )
+                    .await
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         let mut rules = Vec::new();
-        for account_id in &account_ids {
-            let account = config
-                .account(account_id)
-                .with_context(|| format!("account {} not found in config", account_id))?;
-            rules.extend(
-                load_manual_protective_rule_views_for_account(
-                    &config,
-                    &state.realtime,
-                    &market,
-                    account_id,
-                    &account.address,
-                )
-                .await?,
-            );
+        for rule_group in join_all(rule_futures).await {
+            rules.extend(rule_group?);
         }
         rules.sort_by(|left, right| {
             right
@@ -2022,12 +2184,17 @@ async fn live_readiness_batch(
         );
         ensure_accounts_allowed_for_market(&config, &account_ids, market.id)?;
 
-        let mut results = Vec::new();
-        for account_id in account_ids {
+        let readiness_futures = account_ids.iter().cloned().map(|account_id| {
+            let state = state.clone();
+            let config = config.clone();
             let mut account_payload = payload.for_account(account_id);
             account_payload.coin = normalize_coin_for_market(&market, &account_payload.coin);
-            results.push(build_live_readiness(&state, &config, module, account_payload).await?);
-        }
+            async move { build_live_readiness(&state, &config, module, account_payload).await }
+        });
+        let results = join_all(readiness_futures)
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
 
         let ready_account_ids = results
             .iter()
@@ -2111,17 +2278,22 @@ async fn account_funding_batch(
             }
         }
 
-        let mut results = Vec::new();
-        for account_id in &account_ids {
-            results.push(ApiResult::from_result(
-                build_account_funding(
-                    &config,
-                    account_id,
-                    (!payload.force_fresh).then_some(&state.realtime),
+        let force_fresh = payload.force_fresh;
+        let funding_futures = account_ids.iter().cloned().map(|account_id| {
+            let config = config.clone();
+            let realtime = state.realtime.clone();
+            async move {
+                ApiResult::from_result(
+                    build_account_funding(
+                        &config,
+                        &account_id,
+                        (!force_fresh).then_some(&realtime),
+                    )
+                    .await,
                 )
-                .await,
-            ));
-        }
+            }
+        });
+        let results = join_all(funding_futures).await;
 
         let ready_account_ids = results
             .iter()
@@ -2315,13 +2487,14 @@ async fn usdc_dex_transfer_batch(
         let account_ids = selected_enabled_account_ids(&config, &payload.account_ids);
         validate_batch_account_count("USDC transfer batch plan", &config, &account_ids)?;
 
-        let mut results = Vec::new();
-        for account_id in &account_ids {
+        let transfer_futures = account_ids.iter().cloned().map(|account_id| {
             let options = payload.for_account(account_id.clone());
-            results.push(ApiResult::from_result(
-                execute_usdc_dex_transfer(config.clone(), options, None).await,
-            ));
-        }
+            let config = config.clone();
+            async move {
+                ApiResult::from_result(execute_usdc_dex_transfer(config, options, None).await)
+            }
+        });
+        let results = join_all(transfer_futures).await;
 
         let planned_account_ids = results
             .iter()
@@ -2384,11 +2557,16 @@ async fn usdc_dex_transfer_readiness_batch(
         let account_ids = selected_enabled_account_ids(&config, &payload.account_ids);
         validate_batch_account_count("USDC transfer readiness batch", &config, &account_ids)?;
 
-        let mut results = Vec::new();
-        for account_id in &account_ids {
+        let readiness_futures = account_ids.iter().cloned().map(|account_id| {
             let options = payload.for_account(account_id.clone());
-            results.push(build_usdc_dex_transfer_readiness(&state, &config, options).await?);
-        }
+            let state = state.clone();
+            let config = config.clone();
+            async move { build_usdc_dex_transfer_readiness(&state, &config, options).await }
+        });
+        let results = join_all(readiness_futures)
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
 
         let ready_account_ids = results
             .iter()
@@ -11228,7 +11406,12 @@ async fn build_live_readiness(
     };
 
     let plan_result = if config.hyperliquid.dex.trim().eq_ignore_ascii_case("spot") {
-        match fetch_spot_market_snapshot(&config.app.environment).await {
+        match fetch_spot_market_snapshot_cached(
+            &config.app.environment,
+            MARKET_SNAPSHOT_QUOTE_CACHE_TTL_MS,
+        )
+        .await
+        {
             Ok(snapshot) => build_signed_spot_order_plan(
                 &snapshot,
                 &canonical_coin,
@@ -11241,7 +11424,13 @@ async fn build_live_readiness(
             Err(error) => Err(error.to_string()),
         }
     } else {
-        match fetch_xyz_market_snapshot(&config.app.environment, &config.hyperliquid.dex).await {
+        match fetch_xyz_market_snapshot_cached(
+            &config.app.environment,
+            &config.hyperliquid.dex,
+            MARKET_SNAPSHOT_QUOTE_CACHE_TTL_MS,
+        )
+        .await
+        {
             Ok(snapshot) => build_signed_order_plan(
                 &snapshot,
                 &canonical_coin,

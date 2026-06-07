@@ -125,6 +125,28 @@ impl ExchangeClient {
         })
     }
 
+    pub fn new_with_asset_map(
+        client: Option<Client>,
+        wallet: LocalWallet,
+        base_url: Option<BaseUrl>,
+        meta: Meta,
+        coin_to_asset: HashMap<String, u32>,
+        vault_address: Option<H160>,
+    ) -> ExchangeClient {
+        let client = client.unwrap_or_default();
+        let base_url = base_url.unwrap_or(BaseUrl::Mainnet);
+        ExchangeClient {
+            wallet,
+            meta,
+            vault_address,
+            http_client: HttpClient {
+                client,
+                base_url: base_url.get_url(),
+            },
+            coin_to_asset,
+        }
+    }
+
     async fn post(
         &self,
         action: serde_json::Value,
@@ -147,6 +169,76 @@ impl ExchangeClient {
             .await
             .map_err(|e| Error::JsonParse(e.to_string()))?;
         serde_json::from_str(output).map_err(|e| Error::JsonParse(e.to_string()))
+    }
+
+    pub fn signed_bulk_order_payload_with_grouping(
+        &self,
+        orders: Vec<ClientOrderRequest>,
+        wallet: Option<&LocalWallet>,
+        grouping: &str,
+    ) -> Result<serde_json::Value> {
+        let wallet = wallet.unwrap_or(&self.wallet);
+        let timestamp = next_nonce();
+
+        let mut transformed_orders = Vec::new();
+        for order in orders {
+            transformed_orders.push(order.convert(&self.coin_to_asset)?);
+        }
+
+        let action = Actions::Order(BulkOrder {
+            orders: transformed_orders,
+            grouping: grouping.to_string(),
+            builder: None,
+        });
+        let connection_id = action.hash(timestamp, self.vault_address)?;
+        let action = serde_json::to_value(&action).map_err(|e| Error::JsonParse(e.to_string()))?;
+        let is_mainnet = self.http_client.is_mainnet();
+        let signature = sign_l1_action(wallet, connection_id, is_mainnet)?;
+
+        serde_json::to_value(ExchangePayload {
+            action,
+            signature,
+            nonce: timestamp,
+            vault_address: self.vault_address,
+        })
+        .map_err(|e| Error::JsonParse(e.to_string()))
+    }
+
+    pub fn signed_bulk_cancel_payload(
+        &self,
+        cancels: Vec<ClientCancelRequest>,
+        wallet: Option<&LocalWallet>,
+    ) -> Result<serde_json::Value> {
+        let wallet = wallet.unwrap_or(&self.wallet);
+        let timestamp = next_nonce();
+
+        let mut transformed_cancels = Vec::new();
+        for cancel in cancels.into_iter() {
+            let &asset = self
+                .coin_to_asset
+                .get(&cancel.asset)
+                .ok_or(Error::AssetNotFound)?;
+            transformed_cancels.push(CancelRequest {
+                asset,
+                oid: cancel.oid,
+            });
+        }
+
+        let action = Actions::Cancel(BulkCancel {
+            cancels: transformed_cancels,
+        });
+        let connection_id = action.hash(timestamp, self.vault_address)?;
+        let action = serde_json::to_value(&action).map_err(|e| Error::JsonParse(e.to_string()))?;
+        let is_mainnet = self.http_client.is_mainnet();
+        let signature = sign_l1_action(wallet, connection_id, is_mainnet)?;
+
+        serde_json::to_value(ExchangePayload {
+            action,
+            signature,
+            nonce: timestamp,
+            vault_address: self.vault_address,
+        })
+        .map_err(|e| Error::JsonParse(e.to_string()))
     }
 
     pub async fn usdc_transfer(
