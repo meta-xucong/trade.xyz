@@ -32,6 +32,14 @@ preserving V1 safety rules.
 - V2 must have its own config, runtime state, logs, tests, and frontend assets.
 - Never change V1 while implementing V2 unless the user explicitly asks for a
   V1 compatibility or hotfix change.
+- V2 may observe exchange-open orders on accounts shared with V1, but bulk
+  cancel/strategy-stop actions must only cancel orders that V2 can prove it
+  owns through local order refs, deterministic cloids, or an equivalent durable
+  ownership ledger. Orders from V1, other tools, or manual orders without V2
+  ownership evidence must be displayed as unowned/manual and left untouched.
+  Existing exchange-native TP/SL protection for open positions must not be
+  cancelled by a bulk strategy-stop action unless the user explicitly asks to
+  remove protection or close the position.
 
 ## Architecture Rules
 
@@ -68,6 +76,10 @@ preserving V1 safety rules.
 - Live actions require risk approval even when the signer is already warm.
 - Process-level dry-run is a hard live-action gate. Fast endpoints must not
   bypass it merely because config live gates are enabled.
+- Strategy instances must persist their original `dry_run/live` execution mode.
+  Background submission, recovery, completion, and auto-loop code must read the
+  persisted mode and must never upgrade a dry-run strategy into live execution
+  because the current process has live gates enabled.
 
 ## Testing Rules
 

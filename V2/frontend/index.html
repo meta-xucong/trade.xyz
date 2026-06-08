@@ -3217,9 +3217,9 @@
           "dashboard.strategy_pnl_unrealized": "open",
           "dashboard.strategy_pnl_no_fills": "No strategy fills yet",
           "dashboard.strategy_pnl_no_attribution": "No exact order attribution yet",
-          "dashboard.cancel_all_orders": "Cancel All / Stop Strategies",
-          "dashboard.cancel_all_orders_tip": "Cancel all open orders in the selected dashboard market and stop linked strategies.",
-          "dashboard.cancel_all_orders_running": "Canceling open orders, please wait...",
+          "dashboard.cancel_all_orders": "Cancel This Version / Stop Strategies",
+          "dashboard.cancel_all_orders_tip": "Cancel only this version's Fib entry orders in the selected dashboard market and stop linked strategies. Orders from other versions/tools and existing TP/SL protection are left untouched.",
+          "dashboard.cancel_all_orders_running": "Canceling this version's strategy entry orders, please wait...",
           "dashboard.order.source": "Source",
           "dashboard.order.strategy": "Strategy",
           "dashboard.order.kind": "Kind",
@@ -3785,9 +3785,9 @@
           "dashboard.strategy_pnl_unrealized": "持仓浮盈亏",
           "dashboard.strategy_pnl_no_fills": "暂无策略成交",
           "dashboard.strategy_pnl_no_attribution": "暂无精确订单归因",
-          "dashboard.cancel_all_orders": "一键撤单 / 停止策略",
-          "dashboard.cancel_all_orders_tip": "撤销当前总览市场内所有未成交挂单，并停止关联策略继续自动挂单。",
-          "dashboard.cancel_all_orders_running": "正在批量撤单，请稍候...",
+          "dashboard.cancel_all_orders": "撤本版本挂单 / 停止策略",
+          "dashboard.cancel_all_orders_tip": "只撤销当前版本在所选市场内拥有归属记录的斐波那契入场挂单，并停止关联策略继续自动挂单。其他版本/其他工具的订单，以及已有持仓保护用的 TP/SL 单不会被撤。",
+          "dashboard.cancel_all_orders_running": "正在撤销本版本策略入场挂单，请稍候...",
           "dashboard.order.source": "来源",
           "dashboard.order.strategy": "策略",
           "dashboard.order.kind": "类型",
@@ -9179,17 +9179,17 @@
       function dashboardCancelOpenOrdersResultText(result) {
         const zh = state.lang === "zh";
         if (!(result && result.ok && result.data)) {
-          return result?.error || (zh ? "批量撤单失败" : "bulk cancel failed");
+          return result?.error || (zh ? "本版本策略撤单失败" : "version-scoped cancel failed");
         }
         const data = result.data;
         const reports = Array.isArray(data.cancel_reports) ? data.cancel_reports : [];
         const lines = [
-          zh ? "当前市场撤单结果" : "Current Market Cancel Result",
+          zh ? "本版本策略撤单结果" : "This Version Strategy Cancel Result",
           `${zh ? "市场" : "Market"}: ${marketLabel(data.market) || data.market || "-"}`,
-          `${zh ? "目标挂单" : "Target orders"}: ${data.target_count ?? reports.length}`,
+          `${zh ? "本版本可撤入场挂单" : "Owned cancelable entry orders"}: ${data.target_count ?? reports.length}`,
         ];
         if (reports.length === 0) {
-          lines.push(zh ? "当前市场没有可撤挂单" : "No cancelable open orders in this market");
+          lines.push(zh ? "当前市场没有本版本可撤的入场挂单" : "No version-owned cancelable entry orders in this market");
         } else {
           for (const report of reports) {
             const coin = coinDisplayPair(report.coin) || report.coin || "-";
@@ -9205,8 +9205,19 @@
         if (stopped.length > 0) {
           lines.push(`${zh ? "已停止策略" : "Stopped strategies"}: ${stopped.join(", ")}`);
         }
+        const skippedUnowned = Number(data.skipped_unowned_count || 0);
+        const skippedProtective = Number(data.skipped_protective_count || 0);
+        if (skippedUnowned > 0) {
+          lines.push(`${zh ? "已跳过其他版本/手动订单" : "Skipped other-version/manual orders"}: ${skippedUnowned}`);
+        }
+        if (skippedProtective > 0) {
+          lines.push(`${zh ? "已保留保护单" : "Kept protective TP/SL orders"}: ${skippedProtective}`);
+        }
+        if (typeof data.open_owned_orders_after === "number") {
+          lines.push(`${zh ? "撤单后本版本可撤入场挂单" : "Owned cancelable entries after cancel"}: ${data.open_owned_orders_after}`);
+        }
         if (typeof data.open_orders_after === "number") {
-          lines.push(`${zh ? "撤单后当前市场挂单数" : "Open orders after cancel"}: ${data.open_orders_after}`);
+          lines.push(`${zh ? "撤单后当前市场总挂单数" : "Total open orders after cancel"}: ${data.open_orders_after}`);
         }
         return lines.join("\n");
       }

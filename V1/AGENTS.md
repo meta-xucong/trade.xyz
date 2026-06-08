@@ -311,6 +311,11 @@ Hyperliquid. Last reviewed against official docs on 2026-06-02.
   position, set `auto_loop=false`, and surface the missing account/signal pairs
   in the frontend and lifecycle history. A single account's entry or TP/SL
   success must never mark a multi-account strategy as globally `Protected`.
+- Fib Basic strategy instances must persist their original `dry_run/live`
+  execution mode. Background armed-entry submission, recovery, completion, and
+  auto-loop restart must read that persisted mode and must never upgrade a
+  dry-run instance into live execution because the console process is currently
+  running with live gates enabled.
 - Before any live Fib Basic perp entry, and before any live manual perp opening
   order, force-read the current same-market/same-coin position for the account.
   If any nonzero residual perp position exists, submit an internal-API
@@ -322,11 +327,16 @@ Hyperliquid. Last reviewed against official docs on 2026-06-02.
   balances impossible to sell through the order book.
 - Dashboard `Current Orders / Strategy Orders` is an explicit order-management
   surface, not just a read-only strategy view. Its market-scoped
-  `Cancel All / Stop Strategies` action must re-fetch exchange `openOrders` on
-  the backend, cancel every exchange-open order in the selected market, and mark
-  linked Fib strategies stopped with `auto_loop=false`. Manual maker resting
-  orders must appear there as `source_module=manual` even when they have no
-  strategy instance.
+  cancel/stop action must re-fetch exchange `openOrders` on the backend but may
+  only cancel orders that this V1 runtime can prove it owns through local order
+  refs, deterministic cloids, or an equivalent durable ownership ledger. Orders
+  that are merely visible on the same exchange account, including V2/other-tool
+  orders and manual maker orders without V1 ownership evidence, must be shown
+  as unowned/manual and left untouched. Existing exchange-native TP/SL
+  protection for open positions must not be cancelled by this bulk action unless
+  the user explicitly requests removing protection or closing the position.
+  Linked Fib strategies may be stopped with `auto_loop=false` after their
+  owned entry orders are cancelled or preserved for retry.
 
 ## XYZ Market Risk Rules
 

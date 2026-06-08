@@ -175,6 +175,10 @@ pub struct FibInstanceRecord {
     pub status: FibInstanceStatus,
     pub config: FibBasicConfig,
     pub plan: FibBasicPlan,
+    #[serde(default = "default_true")]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub live: bool,
     pub entry_signal_ids: Vec<String>,
     #[serde(default)]
     pub entry_order_refs: Vec<FibOrderRef>,
