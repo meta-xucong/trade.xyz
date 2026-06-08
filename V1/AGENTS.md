@@ -326,17 +326,19 @@ Hyperliquid. Last reviewed against official docs on 2026-06-02.
   apply this rule to spot dust because spot lot-size constraints can make tiny
   balances impossible to sell through the order book.
 - Dashboard `Current Orders / Strategy Orders` is an explicit order-management
-  surface, not just a read-only strategy view. Its market-scoped
-  cancel/stop action must re-fetch exchange `openOrders` on the backend but may
-  only cancel orders that this V1 runtime can prove it owns through local order
-  refs, deterministic cloids, or an equivalent durable ownership ledger. Orders
-  that are merely visible on the same exchange account, including V2/other-tool
-  orders and manual maker orders without V1 ownership evidence, must be shown
-  as unowned/manual and left untouched. Existing exchange-native TP/SL
-  protection for open positions must not be cancelled by this bulk action unless
-  the user explicitly requests removing protection or closing the position.
-  Linked Fib strategies may be stopped with `auto_loop=false` after their
-  owned entry orders are cancelled or preserved for retry.
+  surface, not just a read-only strategy view. Its bulk cancel/stop action is
+  version-scoped across all supported markets: it must re-fetch exchange
+  `openOrders` on the backend but may only cancel orders that this V1 runtime
+  can prove it owns through local order refs, deterministic cloids, or an
+  equivalent durable ownership ledger. Orders that are merely visible on the
+  same exchange account, including V2/other-tool orders and manual maker orders
+  without V1 ownership evidence, must be shown as unowned/manual and left
+  untouched. Existing exchange-native TP/SL protection for open positions must
+  not be cancelled by this bulk action unless the user explicitly requests
+  removing protection or closing the position. All V1 Fib strategies that can
+  still auto-run, including active strategies without an open order, may be
+  stopped with `auto_loop=false` after their owned entry orders are cancelled or
+  preserved for retry.
 
 ## XYZ Market Risk Rules
 

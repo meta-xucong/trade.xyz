@@ -33,13 +33,16 @@ preserving V1 safety rules.
 - Never change V1 while implementing V2 unless the user explicitly asks for a
   V1 compatibility or hotfix change.
 - V2 may observe exchange-open orders on accounts shared with V1, but bulk
-  cancel/strategy-stop actions must only cancel orders that V2 can prove it
-  owns through local order refs, deterministic cloids, or an equivalent durable
-  ownership ledger. Orders from V1, other tools, or manual orders without V2
-  ownership evidence must be displayed as unowned/manual and left untouched.
-  Existing exchange-native TP/SL protection for open positions must not be
-  cancelled by a bulk strategy-stop action unless the user explicitly asks to
-  remove protection or close the position.
+  cancel/strategy-stop actions are version-scoped across all supported markets
+  and must only cancel orders that V2 can prove it owns through local order
+  refs, deterministic cloids, or an equivalent durable ownership ledger. Orders
+  from V1, other tools, or manual orders without V2 ownership evidence must be
+  displayed as unowned/manual and left untouched. Existing exchange-native TP/SL
+  protection for open positions must not be cancelled by a bulk strategy-stop
+  action unless the user explicitly asks to remove protection or close the
+  position. Active V2 Fib strategies without an open order must still be stopped
+  so they cannot auto-loop into a new entry after the operator pressed the bulk
+  stop button.
 
 ## Architecture Rules
 
