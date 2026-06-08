@@ -1914,6 +1914,15 @@ fn usdc_transfer_confirmation_phrase(
     )
 }
 
+fn normalized_transfer_destination_account_id(account_id: &str, raw: Option<&str>) -> String {
+    let destination = raw.unwrap_or_default().trim();
+    if destination.is_empty() || destination == "__same__" {
+        account_id.to_string()
+    } else {
+        destination.to_string()
+    }
+}
+
 fn usdc_transfer_layer_label(layer: &str) -> String {
     let trimmed = layer.trim();
     if trimmed.is_empty() {
@@ -4721,10 +4730,10 @@ pub async fn execute_usdc_dex_transfer(
         .account(&options.account_id)
         .cloned()
         .with_context(|| format!("account {} not found in config", options.account_id))?;
-    let destination_account_id = options
-        .destination_account_id
-        .clone()
-        .unwrap_or_else(|| source_account.account_id.clone());
+    let destination_account_id = normalized_transfer_destination_account_id(
+        &source_account.account_id,
+        options.destination_account_id.as_deref(),
+    );
     let destination_account = config
         .account(&destination_account_id)
         .cloned()
@@ -4895,10 +4904,10 @@ pub async fn execute_usdc_dex_transfer_preflight(
 ) -> Result<UsdcDexTransferPreflightResult> {
     let mut checks = Vec::new();
     let source_account = config.account(&options.account_id).cloned();
-    let destination_account_id = options
-        .destination_account_id
-        .clone()
-        .unwrap_or_else(|| options.account_id.clone());
+    let destination_account_id = normalized_transfer_destination_account_id(
+        &options.account_id,
+        options.destination_account_id.as_deref(),
+    );
     let destination_account = config.account(&destination_account_id).cloned();
     let source_dex = normalize_transfer_layer(options.source_dex.as_deref().unwrap_or_default());
     let destination_dex = options
@@ -6306,10 +6315,10 @@ pub(crate) fn validate_usdc_dex_transfer_gates(
         .as_deref()
         .map(normalize_transfer_layer)
         .unwrap_or_else(|| normalize_transfer_layer(&config.hyperliquid.dex));
-    let destination_account_id = options
-        .destination_account_id
-        .as_deref()
-        .unwrap_or(&options.account_id);
+    let destination_account_id = normalized_transfer_destination_account_id(
+        &options.account_id,
+        options.destination_account_id.as_deref(),
+    );
     anyhow::ensure!(
         usdc_transfer_layer_supported(&source_dex),
         "source layer must be default_perp (empty), spot, or a valid perp dex name"
@@ -7624,7 +7633,8 @@ mod tests {
             account_funding_report_next_actions, account_funding_report_summary,
             account_has_opening_collateral, asset_supports_cross_margin, build_mainnet_smoke_plan,
             build_signed_order_plan, ensure_live_account_address, evaluate_protective_exit_trigger,
-            failed_preflight_blockers, mainnet_smoke_plan_next_actions, order_status_lookup,
+            failed_preflight_blockers, mainnet_smoke_plan_next_actions,
+            normalized_transfer_destination_account_id, order_status_lookup,
             parse_manual_margin_mode, preflight_next_actions, preflight_readiness_summary,
             prepare_signed_live_window, prepare_usdc_dex_transfer_live_window,
             protective_exit_limit_price, protective_exit_prices,
@@ -8451,6 +8461,22 @@ mod tests {
 
         validate_usdc_dex_transfer_gates(&config, &options)
             .expect("plan-only funding transfer should be read-only");
+    }
+
+    #[test]
+    fn usdc_transfer_same_destination_sentinel_maps_to_source_account() {
+        assert_eq!(
+            normalized_transfer_destination_account_id("addr_a", None),
+            "addr_a"
+        );
+        assert_eq!(
+            normalized_transfer_destination_account_id("addr_a", Some("__same__")),
+            "addr_a"
+        );
+        assert_eq!(
+            normalized_transfer_destination_account_id("addr_a", Some("addr_b")),
+            "addr_b"
+        );
     }
 
     #[test]

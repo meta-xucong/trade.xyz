@@ -4615,7 +4615,7 @@ fn mark_fib_record_incomplete_entry_submission(
     if fib_entry_reports_are_retryable_maker_miss(record, reports) {
         record.entry_order_refs.clear();
         record.protective_order_refs.clear();
-        record.status = FibInstanceStatus::Completed;
+        record.status = FibInstanceStatus::ArmedUnfilled;
         record.config.auto_loop = true;
         record.last_message = Some(format!(
             "Fib maker entry was not accepted because the limit would cross or no longer rest; auto-loop stays active and will retry. {}",
@@ -6034,7 +6034,7 @@ fn mark_fib_record_auto_loop_retry_wait(
         .write()
         .map_err(|_| anyhow::anyhow!("fib instance lock is poisoned"))?;
     let history_record = if let Some(record) = guard.get_mut(strategy_id) {
-        record.status = FibInstanceStatus::Completed;
+        record.status = FibInstanceStatus::ArmedUnfilled;
         record.entry_order_refs.clear();
         record.protective_order_refs.clear();
         record.last_message = Some(message.to_string());
@@ -6325,7 +6325,7 @@ async fn restart_fib_cycle(state: &FrontendAppState, previous: &FibInstanceRecor
             } else if has_live_fill {
                 FibInstanceStatus::EntryFilled
             } else if entry_signals.is_empty() || record.entry_order_refs.is_empty() {
-                FibInstanceStatus::Completed
+                FibInstanceStatus::ArmedUnfilled
             } else {
                 FibInstanceStatus::EntryPending
             };
@@ -7066,13 +7066,49 @@ fn load_fib_instances_from_disk() -> Result<HashMap<String, FibInstanceRecord>> 
     if raw.trim().is_empty() {
         return Ok(HashMap::new());
     }
-    let records = serde_json::from_str::<Vec<FibInstanceRecord>>(&raw).with_context(|| {
+    let mut records = serde_json::from_str::<Vec<FibInstanceRecord>>(&raw).with_context(|| {
         format!("failed to parse persisted Fib instances from {FIB_INSTANCES_PATH}")
     })?;
+    let mut migrated = false;
+    for record in &mut records {
+        migrated |= normalize_recovered_fib_instance(record);
+    }
+    if migrated {
+        let instances = records
+            .iter()
+            .cloned()
+            .map(|record| (record.strategy_id.clone(), record))
+            .collect::<HashMap<_, _>>();
+        persist_fib_instances_best_effort(&instances);
+    }
     Ok(records
         .into_iter()
         .map(|record| (record.strategy_id.clone(), record))
         .collect())
+}
+
+fn normalize_recovered_fib_instance(record: &mut FibInstanceRecord) -> bool {
+    if matches!(record.status, FibInstanceStatus::Completed)
+        && record.config.auto_loop
+        && record.completed_cycles == 0
+        && record.last_cycle_completed_at_ms.is_none()
+        && record.entry_order_refs.is_empty()
+        && record.protective_order_refs.is_empty()
+    {
+        record.status = FibInstanceStatus::ArmedUnfilled;
+        if record
+            .last_message
+            .as_deref()
+            .unwrap_or_default()
+            .is_empty()
+        {
+            record.last_message =
+                Some("strategy recovered as active and waiting for entry".to_string());
+        }
+        record.updated_at_ms = now_ms();
+        return true;
+    }
+    false
 }
 
 fn persist_fib_instances_best_effort(instances: &HashMap<String, FibInstanceRecord>) {
@@ -10299,10 +10335,10 @@ async fn build_usdc_dex_transfer_readiness(
 ) -> Result<UsdcDexTransferReadinessResponse> {
     let mut checks = Vec::new();
     let source_account = config.account(&payload.account_id);
-    let destination_account_id = payload
-        .destination_account_id
-        .clone()
-        .unwrap_or_else(|| payload.account_id.clone());
+    let destination_account_id = normalize_transfer_destination_account_id(
+        &payload.account_id,
+        payload.destination_account_id.as_deref(),
+    );
     let destination_account = config.account(&destination_account_id);
     let source_dex =
         normalize_transfer_layer_value(payload.source_dex.as_deref().unwrap_or_default());
@@ -10663,6 +10699,15 @@ fn normalize_transfer_layer_value(raw: &str) -> String {
         "default" | "default_perp" | "hl_perp" => String::new(),
         "xyz_perp" => "xyz".to_string(),
         other => other.to_string(),
+    }
+}
+
+fn normalize_transfer_destination_account_id(account_id: &str, raw: Option<&str>) -> String {
+    let destination = raw.unwrap_or_default().trim();
+    if destination.is_empty() || destination == "__same__" {
+        account_id.to_string()
+    } else {
+        destination.to_string()
     }
 }
 
@@ -12720,8 +12765,9 @@ mod tests {
         fib_position_is_effectively_flat, fib_position_matches_direction,
         fib_restart_cooldown_secs, fib_should_stop_after_cycle, fib_waiting_for_entry_message,
         fill_event_type, live_readiness_next_actions, live_readiness_summary,
-        mark_fib_record_incomplete_entry_submission, selected_enabled_account_ids,
-        trade_record_event_type, transfer_amount_label, usdc_transfer_readiness_next_actions,
+        mark_fib_record_auto_loop_retry_wait, mark_fib_record_incomplete_entry_submission,
+        normalize_recovered_fib_instance, selected_enabled_account_ids, trade_record_event_type,
+        transfer_amount_label, usdc_transfer_readiness_next_actions,
         usdc_transfer_readiness_summary, validate_batch_account_count,
     };
 
@@ -13701,7 +13747,7 @@ mod tests {
 
         mark_fib_record_incomplete_entry_submission(&mut record, &assessment, &reports, false, &[]);
 
-        assert_eq!(record.status, FibInstanceStatus::Completed);
+        assert_eq!(record.status, FibInstanceStatus::ArmedUnfilled);
         assert!(record.config.auto_loop);
         assert!(
             record
@@ -13710,6 +13756,44 @@ mod tests {
                 .unwrap_or_default()
                 .contains("will retry")
         );
+    }
+
+    #[test]
+    fn fib_auto_loop_retry_wait_remains_armed_unfilled() {
+        let record = test_fib_record(
+            "fib-wait",
+            MARKET_HL_PERP,
+            "xyz:TSLA",
+            FibInstanceStatus::Completed,
+            true,
+        );
+        let state = test_frontend_state_with_fib_records(vec![record.clone()]);
+
+        mark_fib_record_auto_loop_retry_wait(&state, &record.strategy_id, "waiting for price")
+            .expect("mark auto-loop wait");
+
+        let guard = state.fib_instances.read().expect("fib lock");
+        let next = guard.get(&record.strategy_id).expect("fib record");
+        assert_eq!(next.status, FibInstanceStatus::ArmedUnfilled);
+        assert!(next.config.auto_loop);
+        assert!(next.entry_order_refs.is_empty());
+        assert!(next.protective_order_refs.is_empty());
+        assert_eq!(next.last_message.as_deref(), Some("waiting for price"));
+    }
+
+    #[test]
+    fn fib_recovered_zero_cycle_completed_auto_loop_becomes_armed_unfilled() {
+        let mut record = test_fib_record(
+            "fib-recovered-wait",
+            MARKET_HL_PERP,
+            "xyz:TSLA",
+            FibInstanceStatus::Completed,
+            true,
+        );
+
+        assert!(normalize_recovered_fib_instance(&mut record));
+        assert_eq!(record.status, FibInstanceStatus::ArmedUnfilled);
+        assert!(record.config.auto_loop);
     }
 
     #[test]
