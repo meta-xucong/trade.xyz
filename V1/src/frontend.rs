@@ -7534,10 +7534,12 @@ struct DashboardOpenOrdersCancelResponse {
     environment: String,
     market: String,
     market_label: String,
+    scope: String,
     dry_run: bool,
     target_count: usize,
     skipped_unowned_count: usize,
     skipped_protective_count: usize,
+    stopped_without_open_orders_count: usize,
     cancel_reports: Vec<DashboardCancelOpenOrderReport>,
     stopped_strategy_ids: Vec<String>,
     open_orders_after: usize,
@@ -8021,10 +8023,11 @@ async fn cancel_dashboard_open_orders(
     payload: DashboardOpenOrdersCancelPayload,
 ) -> Result<DashboardOpenOrdersCancelResponse> {
     let base_config = state.config_snapshot()?;
-    let market = resolve_market_profile(payload.market.as_deref(), &base_config)?;
     let execute_live = payload.live && !payload.dry_run;
     let vault_password = if execute_live {
-        let config = scoped_config_for_module_and_market(base_config.clone(), "manual", &market);
+        let default_market = resolve_market_profile(payload.market.as_deref(), &base_config)?;
+        let config =
+            scoped_config_for_module_and_market(base_config.clone(), "manual", &default_market);
         anyhow::ensure!(
             !state.dry_run && !config.app.dry_run,
             "dashboard live cancel requires frontend and config dry_run=false"
@@ -8037,48 +8040,48 @@ async fn cancel_dashboard_open_orders(
     };
 
     let snapshot = build_dashboard_open_orders_response(state).await?;
-    let visible_market_orders = snapshot
+    let visible_orders = snapshot
         .open_orders
         .into_iter()
-        .filter(|order| order.market == market.id && order.exchange_open)
+        .filter(|order| order.exchange_open)
         .collect::<Vec<_>>();
-    let skipped_unowned_count = visible_market_orders
+    let skipped_unowned_count = visible_orders
         .iter()
         .filter(|order| order.source_module != "fib")
         .count();
-    let skipped_protective_count = visible_market_orders
+    let skipped_protective_count = visible_orders
         .iter()
         .filter(|order| {
             order.source_module == "fib" && !dashboard_order_is_cancelable_fib_entry(order)
         })
         .count();
-    let mut targets = visible_market_orders
+    let mut targets = visible_orders
         .iter()
         .filter(|order| dashboard_order_is_cancelable_fib_entry(order))
         .cloned()
         .collect::<Vec<_>>();
     targets.sort_by(|left, right| {
-        left.account_id
-            .cmp(&right.account_id)
+        left.market
+            .cmp(&right.market)
+            .then(left.account_id.cmp(&right.account_id))
             .then(left.oid.cmp(&right.oid))
             .then(left.cloid.cmp(&right.cloid))
     });
     let target_count = targets.len();
-    let mut strategy_ids = visible_market_orders
-        .iter()
-        .filter(|order| order.source_module == "fib")
-        .filter_map(|order| order.strategy_id.clone())
-        .collect::<HashSet<_>>();
+    let mut strategy_ids = dashboard_cancel_strategy_ids(state, &visible_orders)?;
+    let stopped_without_open_orders_count =
+        dashboard_cancel_stopped_without_open_orders_count(&strategy_ids, &visible_orders);
     let mut seen = HashSet::<String>::new();
     let mut cancel_reports = Vec::new();
 
     for target in targets {
         let identity = target
             .oid
-            .map(|oid| format!("{}:oid:{oid}", target.account_id))
+            .map(|oid| format!("{}:{}:oid:{oid}", target.market, target.account_id))
             .unwrap_or_else(|| {
                 format!(
-                    "{}:cloid:{}",
+                    "{}:{}:cloid:{}",
+                    target.market,
                     target.account_id,
                     target.cloid.to_ascii_lowercase()
                 )
@@ -8101,9 +8104,13 @@ async fn cancel_dashboard_open_orders(
                 }
             } else {
                 let module = normalize_optional_module_name(Some(&target.source_module))?;
-                let config =
-                    scoped_config_for_module_and_market(base_config.clone(), module, &market);
-                let coin = normalize_coin_for_market(&market, &target.coin);
+                let target_market = resolve_market_profile(Some(&target.market), &base_config)?;
+                let config = scoped_config_for_module_and_market(
+                    base_config.clone(),
+                    module,
+                    &target_market,
+                );
+                let coin = normalize_coin_for_market(&target_market, &target.coin);
                 match execute_cancel_open_order(
                     config,
                     target.account_id.clone(),
@@ -8172,31 +8179,72 @@ async fn cancel_dashboard_open_orders(
         .open_orders;
     let open_orders_after = after_orders
         .iter()
-        .filter(|order| order.market == market.id && order.exchange_open)
+        .filter(|order| order.exchange_open)
         .count();
     let open_owned_orders_after = after_orders
         .iter()
-        .filter(|order| {
-            order.market == market.id
-                && order.exchange_open
-                && dashboard_order_is_cancelable_fib_entry(order)
-        })
+        .filter(|order| order.exchange_open && dashboard_order_is_cancelable_fib_entry(order))
         .count();
 
     Ok(DashboardOpenOrdersCancelResponse {
         environment: base_config.app.environment,
-        market: market.id.to_string(),
-        market_label: market.label.to_string(),
+        market: "all".to_string(),
+        market_label: "All Markets".to_string(),
+        scope: "version_all_markets".to_string(),
         dry_run: !execute_live,
         target_count,
         skipped_unowned_count,
         skipped_protective_count,
+        stopped_without_open_orders_count,
         cancel_reports,
         stopped_strategy_ids,
         open_orders_after,
         open_owned_orders_after,
         fetched_at_ms: now_ms(),
     })
+}
+
+fn active_dashboard_fib_strategy_ids(state: &FrontendAppState) -> Result<HashSet<String>> {
+    let guard = state
+        .fib_instances
+        .read()
+        .map_err(|_| anyhow::anyhow!("fib instance lock is poisoned"))?;
+    Ok(guard
+        .values()
+        .filter(|record| fib_instance_reserves_pair(record))
+        .map(|record| record.strategy_id.clone())
+        .collect())
+}
+
+fn dashboard_cancel_strategy_ids(
+    state: &FrontendAppState,
+    visible_orders: &[DashboardOpenOrderResponse],
+) -> Result<HashSet<String>> {
+    let mut strategy_ids = active_dashboard_fib_strategy_ids(state)?;
+    strategy_ids.extend(
+        visible_orders
+            .iter()
+            .filter(|order| order.source_module == "fib")
+            .filter_map(|order| order.strategy_id.clone()),
+    );
+    Ok(strategy_ids)
+}
+
+fn dashboard_cancel_stopped_without_open_orders_count(
+    strategy_ids: &HashSet<String>,
+    visible_orders: &[DashboardOpenOrderResponse],
+) -> usize {
+    strategy_ids
+        .iter()
+        .filter(|strategy_id| {
+            !visible_orders.iter().any(|order| {
+                order
+                    .strategy_id
+                    .as_deref()
+                    .is_some_and(|visible_strategy_id| visible_strategy_id == *strategy_id)
+            })
+        })
+        .count()
 }
 
 fn dashboard_order_is_cancelable_fib_entry(order: &DashboardOpenOrderResponse) -> bool {
@@ -12907,7 +12955,8 @@ mod tests {
         FibTradeDirection, FrontendAppState, ManualSettingsPayload, OrderStatusPayload,
         OrderStatusQuery, PerpFundingLayer, ReadinessCheckResponse, SpotFundingLayer,
         account_funding_next_actions, account_funding_summary, build_basic_plan,
-        build_fib_strategy_pnl_summary, dashboard_order_is_cancelable_fib_entry,
+        build_fib_strategy_pnl_summary, dashboard_cancel_stopped_without_open_orders_count,
+        dashboard_cancel_strategy_ids, dashboard_order_is_cancelable_fib_entry,
         ensure_fib_pair_available, failed_readiness_blockers,
         fib_all_target_accounts_have_complete_protection, fib_background_stop_requested,
         fib_coordinator_signals_from_plan, fib_entry_sync_assessment,
@@ -13835,6 +13884,92 @@ mod tests {
         assert!(dashboard_order_is_cancelable_fib_entry(&owned_entry));
         assert!(!dashboard_order_is_cancelable_fib_entry(&protective));
         assert!(!dashboard_order_is_cancelable_fib_entry(&unowned_manual));
+    }
+
+    fn test_dashboard_order(
+        market: &str,
+        source_module: &str,
+        strategy_id: Option<&str>,
+        order_role: &str,
+        oid: u64,
+    ) -> DashboardOpenOrderResponse {
+        DashboardOpenOrderResponse {
+            market: market.to_string(),
+            market_label: market.to_string(),
+            account_id: "addr_a".to_string(),
+            coin: if market == MARKET_XYZ_PERP {
+                "xyz:NVDA".to_string()
+            } else {
+                "ETH".to_string()
+            },
+            source_module: source_module.to_string(),
+            strategy_id: strategy_id.map(str::to_string),
+            strategy_status: Some("entry_pending".to_string()),
+            timeframe: Some("5m".to_string()),
+            fib_level: Some(0.382),
+            fib_line_version: None,
+            swing_high: None,
+            swing_low: None,
+            entry_zone_high: None,
+            entry_zone_low: None,
+            planned_take_profit_price: None,
+            planned_stop_loss_price: None,
+            order_role: order_role.to_string(),
+            side: "B".to_string(),
+            order_type: "Limit".to_string(),
+            limit_price: Some(100.0),
+            trigger_price: None,
+            size: Some(0.1),
+            current_price: Some(101.0),
+            distance_usd: Some(1.0),
+            distance_pct: Some(1.0),
+            cloid: uuid::Uuid::new_v5(
+                &uuid::Uuid::NAMESPACE_OID,
+                format!("{market}:{source_module}:{order_role}:{oid}").as_bytes(),
+            )
+            .to_string(),
+            oid: Some(oid),
+            exchange_open: true,
+            status: "waiting_fill".to_string(),
+            submitted_at_ms: oid,
+            updated_at_ms: oid,
+        }
+    }
+
+    #[test]
+    fn dashboard_cancel_scope_covers_all_version_markets_and_active_strategies() {
+        let running_without_order = test_fib_record(
+            "fib_basic_hl_perp_BTC_5m",
+            MARKET_HL_PERP,
+            "BTC",
+            FibInstanceStatus::ArmedUnfilled,
+            true,
+        );
+        let state = test_frontend_state_with_fib_records(vec![running_without_order]);
+        let visible_orders = vec![
+            test_dashboard_order(MARKET_XYZ_PERP, "fib", Some("fib_xyz"), "entry", 1),
+            test_dashboard_order(MARKET_HL_PERP, "fib", Some("fib_hl"), "entry", 2),
+            test_dashboard_order(MARKET_HL_PERP, "fib", Some("fib_hl"), "take_profit", 3),
+            test_dashboard_order(MARKET_SPOT, "manual", None, "manual_order", 4),
+        ];
+
+        let targets = visible_orders
+            .iter()
+            .filter(|order| dashboard_order_is_cancelable_fib_entry(order))
+            .collect::<Vec<_>>();
+        assert_eq!(targets.len(), 2);
+        assert!(targets.iter().any(|order| order.market == MARKET_XYZ_PERP));
+        assert!(targets.iter().any(|order| order.market == MARKET_HL_PERP));
+
+        let strategy_ids =
+            dashboard_cancel_strategy_ids(&state, &visible_orders).expect("strategy ids");
+        assert!(strategy_ids.contains("fib_xyz"));
+        assert!(strategy_ids.contains("fib_hl"));
+        assert!(strategy_ids.contains("fib_basic_hl_perp_BTC_5m"));
+        assert_eq!(
+            dashboard_cancel_stopped_without_open_orders_count(&strategy_ids, &visible_orders),
+            1
+        );
     }
 
     #[test]

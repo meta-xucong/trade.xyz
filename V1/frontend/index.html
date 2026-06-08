@@ -3218,8 +3218,8 @@
           "dashboard.strategy_pnl_no_fills": "No strategy fills yet",
           "dashboard.strategy_pnl_no_attribution": "No exact order attribution yet",
           "dashboard.cancel_all_orders": "Cancel This Version / Stop Strategies",
-          "dashboard.cancel_all_orders_tip": "Cancel only this version's Fib entry orders in the selected dashboard market and stop linked strategies. Orders from other versions/tools and existing TP/SL protection are left untouched.",
-          "dashboard.cancel_all_orders_running": "Canceling this version's strategy entry orders, please wait...",
+          "dashboard.cancel_all_orders_tip": "Cancel this version's Fib entry orders across all markets and stop all running Fib strategies. Orders from other versions/tools and existing TP/SL protection are left untouched.",
+          "dashboard.cancel_all_orders_running": "Canceling this version's strategy entry orders across all markets, please wait...",
           "dashboard.order.source": "Source",
           "dashboard.order.strategy": "Strategy",
           "dashboard.order.kind": "Kind",
@@ -3786,8 +3786,8 @@
           "dashboard.strategy_pnl_no_fills": "暂无策略成交",
           "dashboard.strategy_pnl_no_attribution": "暂无精确订单归因",
           "dashboard.cancel_all_orders": "撤本版本挂单 / 停止策略",
-          "dashboard.cancel_all_orders_tip": "只撤销当前版本在所选市场内拥有归属记录的斐波那契入场挂单，并停止关联策略继续自动挂单。其他版本/其他工具的订单，以及已有持仓保护用的 TP/SL 单不会被撤。",
-          "dashboard.cancel_all_orders_running": "正在撤销本版本策略入场挂单，请稍候...",
+          "dashboard.cancel_all_orders_tip": "撤销当前版本在所有市场内拥有归属记录的斐波那契入场挂单，并停止当前版本所有运行中的斐波那契策略。其他版本/其他工具的订单，以及已有持仓保护用的 TP/SL 单不会被撤。",
+          "dashboard.cancel_all_orders_running": "正在撤销本版本所有市场的策略入场挂单，请稍候...",
           "dashboard.order.source": "来源",
           "dashboard.order.strategy": "策略",
           "dashboard.order.kind": "类型",
@@ -9185,11 +9185,11 @@
         const reports = Array.isArray(data.cancel_reports) ? data.cancel_reports : [];
         const lines = [
           zh ? "本版本策略撤单结果" : "This Version Strategy Cancel Result",
-          `${zh ? "市场" : "Market"}: ${marketLabel(data.market) || data.market || "-"}`,
+          `${zh ? "范围" : "Scope"}: ${zh ? "所有市场" : "All markets"}`,
           `${zh ? "本版本可撤入场挂单" : "Owned cancelable entry orders"}: ${data.target_count ?? reports.length}`,
         ];
         if (reports.length === 0) {
-          lines.push(zh ? "当前市场没有本版本可撤的入场挂单" : "No version-owned cancelable entry orders in this market");
+          lines.push(zh ? "所有市场都没有本版本可撤的入场挂单" : "No version-owned cancelable entry orders across all markets");
         } else {
           for (const report of reports) {
             const coin = coinDisplayPair(report.coin) || report.coin || "-";
@@ -9205,6 +9205,10 @@
         if (stopped.length > 0) {
           lines.push(`${zh ? "已停止策略" : "Stopped strategies"}: ${stopped.join(", ")}`);
         }
+        const stoppedWithoutOrders = Number(data.stopped_without_open_orders_count || 0);
+        if (stoppedWithoutOrders > 0) {
+          lines.push(`${zh ? "其中无开放挂单但已停止的策略" : "Stopped strategies without open orders"}: ${stoppedWithoutOrders}`);
+        }
         const skippedUnowned = Number(data.skipped_unowned_count || 0);
         const skippedProtective = Number(data.skipped_protective_count || 0);
         if (skippedUnowned > 0) {
@@ -9217,7 +9221,7 @@
           lines.push(`${zh ? "撤单后本版本可撤入场挂单" : "Owned cancelable entries after cancel"}: ${data.open_owned_orders_after}`);
         }
         if (typeof data.open_orders_after === "number") {
-          lines.push(`${zh ? "撤单后当前市场总挂单数" : "Total open orders after cancel"}: ${data.open_orders_after}`);
+          lines.push(`${zh ? "撤单后所有市场总挂单数" : "Total open orders after cancel"}: ${data.open_orders_after}`);
         }
         return lines.join("\n");
       }
