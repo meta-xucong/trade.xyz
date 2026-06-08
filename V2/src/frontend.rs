@@ -3495,6 +3495,8 @@ async fn fib_ai_proposals(
                 status: FibInstanceStatus::Draft,
                 config: preview_config,
                 plan: preview_plan,
+                dry_run: true,
+                live: false,
                 entry_signal_ids: Vec::new(),
                 entry_order_refs: Vec::new(),
                 protective_order_refs: Vec::new(),
@@ -4283,6 +4285,7 @@ async fn build_fib_instance_record(
     let plan = build_basic_plan(&config)?;
     let size_decimals = fetch_fib_size_decimals(&scoped, &market, &config.coin).await?;
     validate_fib_per_level_opening_notional(&plan, size_decimals)?;
+    validate_fib_per_level_account_order_caps(&scoped, &config.account_ids, &plan)?;
     let created_at_ms = previous
         .map(|record| record.created_at_ms)
         .unwrap_or_else(now_ms);
@@ -4291,6 +4294,8 @@ async fn build_fib_instance_record(
         status,
         config,
         plan,
+        dry_run: payload.dry_run,
+        live: payload.live,
         entry_signal_ids: previous
             .map(|record| record.entry_signal_ids.clone())
             .unwrap_or_default(),
@@ -4334,6 +4339,29 @@ fn validate_fib_per_level_opening_notional(plan: &FibBasicPlan, size_decimals: u
             size_decimals,
             HYPERLIQUID_MIN_ORDER_NOTIONAL_USD
         );
+    }
+    Ok(())
+}
+
+fn validate_fib_per_level_account_order_caps(
+    config: &AppConfig,
+    account_ids: &[String],
+    plan: &FibBasicPlan,
+) -> Result<()> {
+    for level in &plan.levels {
+        for account_id in account_ids {
+            let account = config
+                .account(account_id)
+                .with_context(|| format!("fib account {account_id} is not configured"))?;
+            anyhow::ensure!(
+                level.order_notional_usd <= account.max_order_notional_usd,
+                "fib per-level opening notional {:.6} for {} exceeds account {} max_order_notional_usd {:.6}; reduce principal/leverage, select fewer levels, or raise that account limit",
+                level.order_notional_usd,
+                plan.coin,
+                account.account_id,
+                account.max_order_notional_usd
+            );
+        }
     }
     Ok(())
 }
@@ -4929,6 +4957,9 @@ async fn reconcile_fib_instances_once(state: &FrontendAppState) -> Result<()> {
         .collect::<Vec<_>>();
 
     for record in records {
+        if !fib_record_allows_background_live_actions(&record) {
+            continue;
+        }
         if maybe_recover_and_protect_fib_open_position(state, &record).await? {
             continue;
         }
@@ -5315,7 +5346,10 @@ async fn maybe_recover_and_protect_fib_open_position(
     state: &FrontendAppState,
     record: &FibInstanceRecord,
 ) -> Result<bool> {
-    if state.dry_run || !fib_record_can_recover_unprotected_position(record) {
+    if state.dry_run
+        || !fib_record_allows_background_live_actions(record)
+        || !fib_record_can_recover_unprotected_position(record)
+    {
         return Ok(false);
     }
 
@@ -5515,6 +5549,9 @@ async fn maybe_complete_fib_cycle_after_exit(
     state: &FrontendAppState,
     record: &FibInstanceRecord,
 ) -> Result<()> {
+    if state.dry_run || !fib_record_allows_background_live_actions(record) {
+        return Ok(());
+    }
     if record.protective_order_refs.is_empty() {
         return Ok(());
     }
@@ -6069,7 +6106,7 @@ async fn maybe_submit_armed_fib_entry(
     state: &FrontendAppState,
     record: &FibInstanceRecord,
 ) -> Result<()> {
-    if state.dry_run {
+    if state.dry_run || !fib_record_allows_background_live_actions(record) {
         return Ok(());
     }
     let snapshot_ms = record.updated_at_ms;
@@ -6121,7 +6158,8 @@ async fn maybe_submit_armed_fib_entry(
         return Ok(());
     }
     let (entry_reports, protection_reports) =
-        execute_fib_entry_signals(state, &next, &coordinator_signals, false, true).await?;
+        execute_fib_entry_signals(state, &next, &coordinator_signals, next.dry_run, next.live)
+            .await?;
     let has_live_fill = entry_reports.iter().any(worker_report_has_live_fill);
     next.entry_order_refs =
         fib_entry_order_refs_from_reports(&coordinator_signals, &entry_reports, &next.plan);
@@ -6134,7 +6172,8 @@ async fn maybe_submit_armed_fib_entry(
             &next.plan,
         );
         let cancel_reports =
-            cancel_incomplete_fib_entry_orders(state, &next, resting_refs, false, true).await?;
+            cancel_incomplete_fib_entry_orders(state, &next, resting_refs, next.dry_run, next.live)
+                .await?;
         remove_successfully_cancelled_fib_entry_refs(&mut next, &cancel_reports);
         mark_fib_record_incomplete_entry_submission(
             &mut next,
@@ -6239,7 +6278,10 @@ async fn maybe_restart_completed_fib_cycle(
     state: &FrontendAppState,
     record: &FibInstanceRecord,
 ) -> Result<()> {
-    if !record.config.auto_loop || state.dry_run {
+    if !record.config.auto_loop
+        || state.dry_run
+        || !fib_record_allows_background_live_actions(record)
+    {
         return Ok(());
     }
     let elapsed_ms = record
@@ -6287,7 +6329,7 @@ async fn restart_fib_cycle(state: &FrontendAppState, previous: &FibInstanceRecor
     if fib_background_stop_requested(state, previous, snapshot_ms)? {
         return Ok(());
     }
-    let payload = fib_payload_from_record(previous, false, true);
+    let payload = fib_payload_from_record(previous);
     let mut record = build_fib_instance_record(
         state,
         payload,
@@ -6307,8 +6349,14 @@ async fn restart_fib_cycle(state: &FrontendAppState, previous: &FibInstanceRecor
     if fib_background_stop_requested(state, &record, snapshot_ms)? {
         return Ok(());
     }
-    let (entry_reports, protection_reports) =
-        execute_fib_entry_signals(state, &record, &coordinator_signals, false, true).await?;
+    let (entry_reports, protection_reports) = execute_fib_entry_signals(
+        state,
+        &record,
+        &coordinator_signals,
+        record.dry_run,
+        record.live,
+    )
+    .await?;
     let has_live_fill = entry_reports.iter().any(worker_report_has_live_fill);
     record.entry_order_refs =
         fib_entry_order_refs_from_reports(&coordinator_signals, &entry_reports, &record.plan);
@@ -6320,8 +6368,14 @@ async fn restart_fib_cycle(state: &FrontendAppState, previous: &FibInstanceRecor
             &entry_reports,
             &record.plan,
         );
-        let cancel_reports =
-            cancel_incomplete_fib_entry_orders(state, &record, resting_refs, false, true).await?;
+        let cancel_reports = cancel_incomplete_fib_entry_orders(
+            state,
+            &record,
+            resting_refs,
+            record.dry_run,
+            record.live,
+        )
+        .await?;
         remove_successfully_cancelled_fib_entry_refs(&mut record, &cancel_reports);
         mark_fib_record_incomplete_entry_submission(
             &mut record,
@@ -6377,11 +6431,7 @@ async fn restart_fib_cycle(state: &FrontendAppState, previous: &FibInstanceRecor
     Ok(())
 }
 
-fn fib_payload_from_record(
-    record: &FibInstanceRecord,
-    dry_run: bool,
-    live: bool,
-) -> FibBasicPayload {
+fn fib_payload_from_record(record: &FibInstanceRecord) -> FibBasicPayload {
     FibBasicPayload {
         strategy_id: Some(record.strategy_id.clone()),
         direction: Some(record.config.direction.as_str().to_string()),
@@ -6418,9 +6468,13 @@ fn fib_payload_from_record(
         locked_swing_high: Some(record.config.swing_high),
         locked_swing_low: Some(record.config.swing_low),
         auto_loop: record.config.auto_loop,
-        dry_run,
-        live,
+        dry_run: record.dry_run,
+        live: record.live,
     }
+}
+
+fn fib_record_allows_background_live_actions(record: &FibInstanceRecord) -> bool {
+    record.live && !record.dry_run
 }
 
 async fn execute_fib_entry_signals(
@@ -6833,6 +6887,9 @@ fn fib_history_entry_from_record(
 }
 
 fn append_fib_instance_history_best_effort(record: &FibInstanceRecord, action: &str) {
+    if fib_persistence_disabled_in_tests() {
+        return;
+    }
     if let Err(error) = append_fib_instance_history(record, action) {
         tracing::warn!(
             %error,
@@ -6946,6 +7003,9 @@ fn build_fib_history_response(
 }
 
 fn read_fib_instance_history_entries(limit: usize) -> Result<Vec<FibInstanceHistoryEntry>> {
+    if fib_persistence_disabled_in_tests() {
+        return Ok(Vec::new());
+    }
     if limit == 0 {
         return Ok(Vec::new());
     }
@@ -7070,6 +7130,9 @@ fn fib_history_entry_from_audit_event(
 }
 
 fn load_fib_instances_from_disk() -> Result<HashMap<String, FibInstanceRecord>> {
+    if fib_persistence_disabled_in_tests() {
+        return Ok(HashMap::new());
+    }
     let path = Path::new(FIB_INSTANCES_PATH);
     if !path.exists() {
         return Ok(HashMap::new());
@@ -7102,6 +7165,12 @@ fn load_fib_instances_from_disk() -> Result<HashMap<String, FibInstanceRecord>> 
 }
 
 fn normalize_recovered_fib_instance(record: &mut FibInstanceRecord) -> bool {
+    let mut migrated = false;
+    if fib_record_has_any_live_order_ref(record) && (record.dry_run || !record.live) {
+        record.dry_run = false;
+        record.live = true;
+        migrated = true;
+    }
     if matches!(record.status, FibInstanceStatus::Completed)
         && record.config.auto_loop
         && record.completed_cycles == 0
@@ -7120,15 +7189,36 @@ fn normalize_recovered_fib_instance(record: &mut FibInstanceRecord) -> bool {
                 Some("strategy recovered as active and waiting for entry".to_string());
         }
         record.updated_at_ms = now_ms();
-        return true;
+        migrated = true;
     }
-    false
+    migrated
+}
+
+fn fib_record_has_any_live_order_ref(record: &FibInstanceRecord) -> bool {
+    record
+        .entry_order_refs
+        .iter()
+        .chain(record.protective_order_refs.iter())
+        .any(|order_ref| !order_ref.dry_run)
 }
 
 fn persist_fib_instances_best_effort(instances: &HashMap<String, FibInstanceRecord>) {
+    if fib_persistence_disabled_in_tests() {
+        return;
+    }
     if let Err(error) = persist_fib_instances(instances) {
         tracing::warn!(%error, path = FIB_INSTANCES_PATH, "failed to persist Fib instances");
     }
+}
+
+#[cfg(test)]
+fn fib_persistence_disabled_in_tests() -> bool {
+    true
+}
+
+#[cfg(not(test))]
+fn fib_persistence_disabled_in_tests() -> bool {
+    false
 }
 
 fn persist_fib_instances(instances: &HashMap<String, FibInstanceRecord>) -> Result<()> {
@@ -7460,9 +7550,12 @@ struct DashboardOpenOrdersCancelResponse {
     market_label: String,
     dry_run: bool,
     target_count: usize,
+    skipped_unowned_count: usize,
+    skipped_protective_count: usize,
     cancel_reports: Vec<DashboardCancelOpenOrderReport>,
     stopped_strategy_ids: Vec<String>,
     open_orders_after: usize,
+    open_owned_orders_after: usize,
     fetched_at_ms: u64,
 }
 
@@ -7958,10 +8051,25 @@ async fn cancel_dashboard_open_orders(
     };
 
     let snapshot = build_dashboard_open_orders_response(state).await?;
-    let mut targets = snapshot
+    let visible_market_orders = snapshot
         .open_orders
         .into_iter()
         .filter(|order| order.market == market.id && order.exchange_open)
+        .collect::<Vec<_>>();
+    let skipped_unowned_count = visible_market_orders
+        .iter()
+        .filter(|order| order.source_module != "fib")
+        .count();
+    let skipped_protective_count = visible_market_orders
+        .iter()
+        .filter(|order| {
+            order.source_module == "fib" && !dashboard_order_is_cancelable_fib_entry(order)
+        })
+        .count();
+    let mut targets = visible_market_orders
+        .iter()
+        .filter(|order| dashboard_order_is_cancelable_fib_entry(order))
+        .cloned()
         .collect::<Vec<_>>();
     targets.sort_by(|left, right| {
         left.account_id
@@ -7970,7 +8078,7 @@ async fn cancel_dashboard_open_orders(
             .then(left.cloid.cmp(&right.cloid))
     });
     let target_count = targets.len();
-    let mut strategy_ids = targets
+    let mut strategy_ids = visible_market_orders
         .iter()
         .filter(|order| order.source_module == "fib")
         .filter_map(|order| order.strategy_id.clone())
@@ -8069,15 +8177,24 @@ async fn cancel_dashboard_open_orders(
     }
 
     let stopped_strategy_ids = if execute_live {
-        stop_dashboard_fib_strategies(state, &strategy_ids)?
+        stop_dashboard_fib_strategies(state, &strategy_ids, &cancel_reports)?
     } else {
         Vec::new()
     };
-    let open_orders_after = build_dashboard_open_orders_response(state)
+    let after_orders = build_dashboard_open_orders_response(state)
         .await?
-        .open_orders
-        .into_iter()
+        .open_orders;
+    let open_orders_after = after_orders
+        .iter()
         .filter(|order| order.market == market.id && order.exchange_open)
+        .count();
+    let open_owned_orders_after = after_orders
+        .iter()
+        .filter(|order| {
+            order.market == market.id
+                && order.exchange_open
+                && dashboard_order_is_cancelable_fib_entry(order)
+        })
         .count();
 
     Ok(DashboardOpenOrdersCancelResponse {
@@ -8086,20 +8203,43 @@ async fn cancel_dashboard_open_orders(
         market_label: market.label.to_string(),
         dry_run: !execute_live,
         target_count,
+        skipped_unowned_count,
+        skipped_protective_count,
         cancel_reports,
         stopped_strategy_ids,
         open_orders_after,
+        open_owned_orders_after,
         fetched_at_ms: now_ms(),
     })
+}
+
+fn dashboard_order_is_cancelable_fib_entry(order: &DashboardOpenOrderResponse) -> bool {
+    order.source_module == "fib"
+        && order
+            .strategy_id
+            .as_deref()
+            .is_some_and(|id| !id.trim().is_empty())
+        && order.order_role == "entry"
 }
 
 fn stop_dashboard_fib_strategies(
     state: &FrontendAppState,
     strategy_ids: &HashSet<String>,
+    cancel_reports: &[DashboardCancelOpenOrderReport],
 ) -> Result<Vec<String>> {
     if strategy_ids.is_empty() {
         return Ok(Vec::new());
     }
+    let successful_cancel_cloids = cancel_reports
+        .iter()
+        .filter(|report| report.ok)
+        .filter(|report| report.source_module == "fib")
+        .map(|report| report.cloid.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    let failed_cancel_count = cancel_reports
+        .iter()
+        .filter(|report| !report.ok && report.source_module == "fib")
+        .count();
     let mut guard = state
         .fib_instances
         .write()
@@ -8112,10 +8252,18 @@ fn stop_dashboard_fib_strategies(
         };
         record.status = FibInstanceStatus::Killed;
         record.config.auto_loop = false;
-        record.entry_order_refs.clear();
-        record.protective_order_refs.clear();
-        record.last_message =
-            Some("strategy stopped from dashboard; visible open orders were cancelled".to_string());
+        if !successful_cancel_cloids.is_empty() {
+            record.entry_order_refs.retain(|order_ref| {
+                !successful_cancel_cloids.contains(&order_ref.cloid.to_ascii_lowercase())
+            });
+        }
+        record.last_message = Some(if failed_cancel_count > 0 {
+            format!(
+                "strategy stopped from dashboard; {failed_cancel_count} owned entry cancel request(s) failed and are preserved for retry; protective TP/SL orders were left active"
+            )
+        } else {
+            "strategy stopped from dashboard; owned entry orders were cancelled; protective TP/SL orders were left active".to_string()
+        });
         record.updated_at_ms = now_ms();
         history_records.push(record.clone());
         stopped.push(strategy_id.clone());
@@ -12760,7 +12908,7 @@ mod tests {
 
     use crate::{
         audit::AuditEvent,
-        config::{AppConfig, MARKET_HL_PERP, MARKET_SPOT},
+        config::{AppConfig, MARKET_HL_PERP, MARKET_SPOT, MARKET_XYZ_PERP},
         domain::{ExecutionMode, OrderSide, WorkerReport},
         hyperliquid::UserFill,
         realtime::RealtimeState,
@@ -12768,11 +12916,12 @@ mod tests {
     };
 
     use super::{
-        FibBasicConfig, FibBasicLevelPlan, FibBasicPlan, FibInstanceRecord, FibInstanceStatus,
-        FibOrderRef, FibPositionSnapshot, FibProfitLossMode, FibTradeDirection, FrontendAppState,
-        ManualSettingsPayload, OrderStatusPayload, OrderStatusQuery, PerpFundingLayer,
-        ReadinessCheckResponse, SpotFundingLayer, account_funding_next_actions,
-        account_funding_summary, build_basic_plan, build_fib_strategy_pnl_summary,
+        DashboardOpenOrderResponse, FibBasicConfig, FibBasicLevelPlan, FibBasicPlan,
+        FibInstanceRecord, FibInstanceStatus, FibOrderRef, FibPositionSnapshot, FibProfitLossMode,
+        FibTradeDirection, FrontendAppState, ManualSettingsPayload, OrderStatusPayload,
+        OrderStatusQuery, PerpFundingLayer, ReadinessCheckResponse, SpotFundingLayer,
+        account_funding_next_actions, account_funding_summary, build_basic_plan,
+        build_fib_strategy_pnl_summary, dashboard_order_is_cancelable_fib_entry,
         ensure_fib_pair_available, failed_readiness_blockers,
         fib_all_target_accounts_have_complete_protection, fib_background_stop_requested,
         fib_coordinator_signals_from_plan, fib_entry_sync_assessment,
@@ -12965,6 +13114,75 @@ mod tests {
     }
 
     #[test]
+    fn fib_per_level_notional_must_fit_each_selected_account_cap() {
+        let mut config = AppConfig::default();
+        config.accounts = vec![
+            crate::config::AccountConfig {
+                account_id: "addr_a".to_string(),
+                address: "0x0000000000000000000000000000000000000001".to_string(),
+                secret_id: "addr_a_api_wallet".to_string(),
+                api_wallet_env: String::new(),
+                enabled: true,
+                worker_enabled: true,
+                copy_ratio: 0.1,
+                max_order_notional_usd: 12.0,
+                blocked_markets: Vec::new(),
+            },
+            crate::config::AccountConfig {
+                account_id: "addr_b".to_string(),
+                address: "0x0000000000000000000000000000000000000002".to_string(),
+                secret_id: "addr_b_api_wallet".to_string(),
+                api_wallet_env: String::new(),
+                enabled: true,
+                worker_enabled: true,
+                copy_ratio: 0.1,
+                max_order_notional_usd: 12.0,
+                blocked_markets: Vec::new(),
+            },
+        ];
+        let mut plan = FibBasicPlan {
+            strategy_id: "fib-test".to_string(),
+            direction: FibTradeDirection::Short,
+            market: MARKET_XYZ_PERP.to_string(),
+            coin: "xyz:TSLA".to_string(),
+            timeframe: "1h".to_string(),
+            swing_high: 433.26,
+            swing_low: 384.28,
+            current_price: 402.9,
+            line_version: "line".to_string(),
+            levels: vec![FibBasicLevelPlan {
+                level: 0.382,
+                entry_price: 402.99036,
+                entry_zone_high: 403.09,
+                entry_zone_low: 402.89,
+                take_profit_price: 401.78,
+                stop_loss_price: 404.19,
+                take_profit_return_pct: 3.0,
+                stop_loss_return_pct: 3.0,
+                current_distance_usd: 0.0,
+                current_within_zone: true,
+                order_notional_usd: 12.5,
+            }],
+        };
+
+        let error = super::validate_fib_per_level_account_order_caps(
+            &config,
+            &["addr_a".to_string(), "addr_b".to_string()],
+            &plan,
+        )
+        .expect_err("per-level notional above account cap should be rejected");
+        assert!(error.to_string().contains("max_order_notional_usd"));
+
+        plan.levels[0].order_notional_usd = 12.0;
+        super::validate_fib_per_level_account_order_caps(
+            &config,
+            &["addr_a".to_string(), "addr_b".to_string()],
+            &plan,
+        )
+        .expect("per-level notional equal to account cap should pass");
+    }
+
+    #[test]
     fn fib_completion_treats_sub_half_usd_residual_as_flat() {
         assert!(fib_position_is_effectively_flat(FibPositionSnapshot {
             size: 0.0001,
@@ -13121,6 +13339,46 @@ mod tests {
     }
 
     #[test]
+    fn fib_entry_signal_notional_ignores_account_copy_ratio() {
+        let config = FibBasicConfig {
+            strategy_id: "fib-ratio-test".to_string(),
+            direction: FibTradeDirection::Long,
+            market: MARKET_HL_PERP.to_string(),
+            dex: String::new(),
+            account_ids: vec!["addr_a".to_string()],
+            coin: "ETH".to_string(),
+            timeframe: "5m".to_string(),
+            lookback_bars: 30,
+            swing_high: 100.0,
+            swing_low: 80.0,
+            current_price: 90.05,
+            levels: vec![0.5],
+            entry_above_tolerance_usd: 0.1,
+            entry_below_tolerance_usd: 0.1,
+            principal_usd: 1.1,
+            leverage: 10.0,
+            execution_mode: ExecutionMode::Taker,
+            take_profit_mode: FibProfitLossMode::PrincipalPercent,
+            take_profit_value: 5.0,
+            stop_loss_mode: FibProfitLossMode::PrincipalPercent,
+            stop_loss_value: 5.0,
+            max_slippage_bps: 20.0,
+            max_entries_per_level: 1,
+            cooldown_secs: 300,
+            stop_loss_cooldown_secs: 900,
+            stop_loss_stop_strategy: false,
+            locked_range: false,
+            auto_loop: true,
+        };
+        let plan = build_basic_plan(&config).expect("plan");
+        let signals = fib_coordinator_signals_from_plan(&config, &plan).expect("signals");
+        let intent = signals[0].to_trade_intent("addr_a", "worker-addr_a", 0.05);
+
+        assert!(!signals[0].order.apply_account_ratio);
+        assert!((intent.sizing.notional_usd - 11.0).abs() < 0.0001);
+    }
+
+    #[test]
     fn fib_short_taker_signal_sells_without_fixed_fib_price() {
         let config = FibBasicConfig {
             strategy_id: "fib-short-taker-test".to_string(),
@@ -13194,6 +13452,30 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn fib_payload_from_record_preserves_dry_run_live_mode() {
+        let mut record = test_fib_record(
+            "fib-mode",
+            MARKET_HL_PERP,
+            "ETH",
+            FibInstanceStatus::Completed,
+            true,
+        );
+        record.dry_run = true;
+        record.live = false;
+        let payload = super::fib_payload_from_record(&record);
+        assert!(payload.dry_run);
+        assert!(!payload.live);
+        assert!(!super::fib_record_allows_background_live_actions(&record));
+
+        record.dry_run = false;
+        record.live = true;
+        let payload = super::fib_payload_from_record(&record);
+        assert!(!payload.dry_run);
+        assert!(payload.live);
+        assert!(super::fib_record_allows_background_live_actions(&record));
+    }
+
     fn test_fib_record(
         strategy_id: &str,
         market: &str,
@@ -13237,6 +13519,8 @@ mod tests {
             status,
             config,
             plan,
+            dry_run: true,
+            live: false,
             entry_signal_ids: Vec::new(),
             entry_order_refs: Vec::new(),
             protective_order_refs: Vec::new(),
@@ -13519,6 +13803,60 @@ mod tests {
         assert!((summary.total_net_pnl_usd - 0.47).abs() < 0.000001);
         assert!((summary.last_cycle_net_pnl_usd - 0.47).abs() < 0.000001);
         assert_eq!(summary.matched_order_count, 2);
+    }
+
+    #[test]
+    fn dashboard_cancel_scope_only_targets_owned_fib_entries() {
+        let owned_entry = DashboardOpenOrderResponse {
+            market: MARKET_XYZ_PERP.to_string(),
+            market_label: "XYZ".to_string(),
+            account_id: "addr_a".to_string(),
+            coin: "xyz:NVDA".to_string(),
+            source_module: "fib".to_string(),
+            strategy_id: Some("fib-owned".to_string()),
+            strategy_status: Some("entry_pending".to_string()),
+            timeframe: Some("5m".to_string()),
+            fib_level: Some(0.382),
+            fib_line_version: None,
+            swing_high: None,
+            swing_low: None,
+            entry_zone_high: None,
+            entry_zone_low: None,
+            planned_take_profit_price: None,
+            planned_stop_loss_price: None,
+            order_role: "entry".to_string(),
+            side: "A".to_string(),
+            order_type: "Limit".to_string(),
+            limit_price: Some(212.0),
+            trigger_price: None,
+            size: Some(0.05),
+            current_price: Some(205.0),
+            distance_usd: Some(7.0),
+            distance_pct: Some(3.4),
+            cloid: uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, b"owned-entry").to_string(),
+            oid: Some(1),
+            exchange_open: true,
+            status: "waiting_fill".to_string(),
+            submitted_at_ms: 1,
+            updated_at_ms: 1,
+        };
+        let mut protective = owned_entry.clone();
+        protective.order_role = "take_profit".to_string();
+        protective.strategy_id = Some("fib-owned".to_string());
+        protective.cloid =
+            uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, b"protective").to_string();
+        protective.oid = Some(2);
+        let mut unowned_manual = owned_entry.clone();
+        unowned_manual.source_module = "manual".to_string();
+        unowned_manual.strategy_id = None;
+        unowned_manual.order_role = "manual_order".to_string();
+        unowned_manual.cloid =
+            uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, b"manual").to_string();
+        unowned_manual.oid = Some(3);
+
+        assert!(dashboard_order_is_cancelable_fib_entry(&owned_entry));
+        assert!(!dashboard_order_is_cancelable_fib_entry(&protective));
+        assert!(!dashboard_order_is_cancelable_fib_entry(&unowned_manual));
     }
 
     #[test]
@@ -13816,6 +14154,34 @@ mod tests {
         assert!(normalize_recovered_fib_instance(&mut record));
         assert_eq!(record.status, FibInstanceStatus::ArmedUnfilled);
         assert!(record.config.auto_loop);
+    }
+
+    #[test]
+    fn fib_recovered_live_order_refs_preserve_live_background_mode() {
+        let mut record = test_fib_record(
+            "fib-live-recovered",
+            MARKET_HL_PERP,
+            "ETH",
+            FibInstanceStatus::EntryPending,
+            true,
+        );
+        record.dry_run = true;
+        record.live = false;
+        record.entry_order_refs.push(FibOrderRef {
+            account_id: "addr_a".to_string(),
+            coin: "ETH".to_string(),
+            cloid: "live-cloid".to_string(),
+            oid: Some(42),
+            level: Some(0.5),
+            role: Some("entry".to_string()),
+            dry_run: false,
+            submitted_at_ms: 1,
+        });
+
+        assert!(normalize_recovered_fib_instance(&mut record));
+        assert!(!record.dry_run);
+        assert!(record.live);
+        assert!(super::fib_record_allows_background_live_actions(&record));
     }
 
     #[test]
