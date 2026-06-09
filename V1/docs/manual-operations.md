@@ -158,8 +158,8 @@ Manual 页的 `Execution` 选择必须作用到 signed smoke 和 signed acceptan
 - 多账号 `Smoke Plan` 必须走 `/api/mainnet-smoke-plan` 只读接口，把资金诊断、转入
   preflight、转入 live-window 预览和 order live-window 预览汇总在一份结果里；该路径
   不得写配置、签名或提交。
-- 多账号 `Transfer Preflight` 必须在真实划转前返回每个账号的 live gate、Vault、API wallet
-  secret、default perp 余额、rate limit 和 next actions；只要任一 blocker 未清除，
+- 多账号 `Transfer Preflight` 必须在真实划转前返回每个账号的 live gate、Vault、EVM
+  transfer signer、default perp 余额、rate limit 和 next actions；只要任一 blocker 未清除，
   不得进入主网资金划转。
 - `Transfer Runbook` 是单账号证据链；真实 `Transfer USDC` 无论单账号还是多账号，都应
   逐账号走同一个 runbook 后端端点，先确认 blocker 全清，再提交。

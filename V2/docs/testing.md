@@ -157,7 +157,7 @@ MarketEvent + LeaderEvent + AccountEvent
 - 前端 Manual 页必须覆盖 `Transfer Preflight`：多账号选择时返回每个账号的
   `ready_for_mainnet_transfer`/`ready_for_testnet_transfer`、`failed_blockers`、`next_actions`；
   当前主网 dry-run 状态下它必须指出 `app.dry_run=false`、manual live gate、
-  mainnet gate、Vault 解锁/API wallet secret 等 blocker，而不读取私钥、不签名、不提交。
+  mainnet gate、Vault 解锁/EVM transfer signer 等 blocker，而不读取私钥、不签名、不提交。
 - 前端 Manual 页必须覆盖 `Transfer Runbook`：单账号只读调用
   `/api/usdc-dex-transfer-runbook` 时必须返回 preflight、`transfer=null`、`submitted=false`
   和 blocker evidence；`Transfer USDC` 提交按钮必须调用同一个 runbook 端点，而不是绕过

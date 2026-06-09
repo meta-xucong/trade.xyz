@@ -2888,6 +2888,14 @@
                       <button type="button" id="vaultUseNew"><i data-lucide="plus"></i><span data-i18n="vault.new_address">New Address</span></button>
                     </div>
                   </div>
+                  <div class="field wide">
+                    <label data-i18n="vault.secret_usage">Secret Usage</label>
+                    <div class="segmented">
+                      <button type="button" class="active" id="vaultUsageTrading"><i data-lucide="bot"></i><span data-i18n="vault.usage_trading">Trading API Wallet</span></button>
+                      <button type="button" id="vaultUsageTransfer"><i data-lucide="wallet"></i><span data-i18n="vault.usage_transfer">Funding EVM Wallet</span></button>
+                    </div>
+                    <div class="quote-meta" id="vaultUsageHelp" data-i18n="vault.usage_trading_help">Used for orders, cancels, leverage and exchange-native TP/SL. It does not need to hold USDC.</div>
+                  </div>
                   <div class="field" id="vaultAccountSelectField">
                     <label for="vaultAccount" data-i18n="table.account">Account</label>
                     <select id="vaultAccount"></select>
@@ -2991,6 +2999,7 @@
         lastPointerDownAt: 0,
         vaultEntries: [],
         vaultMode: "existing",
+        vaultSecretUsage: "trading",
         vaultUnlocked: false,
         vaultExists: false,
         vaultStatusKnown: false,
@@ -3626,16 +3635,23 @@
           "vault.toggle_current_password": "Show or hide current password",
           "vault.toggle_new_password": "Show or hide new password",
           "vault.toggle_confirm_password": "Show or hide new password confirmation",
-          "vault.secret_title": "API Wallet Secret",
+          "vault.secret_title": "Account Secrets",
           "vault.per_account": "per account",
           "vault.entry_type": "Entry Type",
+          "vault.secret_usage": "Secret Usage",
+          "vault.usage_trading": "Trading API Wallet",
+          "vault.usage_transfer": "Funding EVM Wallet",
+          "vault.usage_trading_help": "Used for orders, cancels, leverage and exchange-native TP/SL. It does not need to hold USDC.",
+          "vault.usage_transfer_help": "Used only for USDC transfers between default perps, spot and XYZ. This private key must derive to the account address that holds funds.",
           "vault.existing": "Existing",
           "vault.new_address": "New Address",
           "vault.account_id": "Account ID",
           "vault.account_id_placeholder": "addr_c",
           "vault.secret_id": "Secret ID",
           "vault.address": "Address",
-          "vault.private_key": "API Wallet Private Key",
+          "vault.private_key": "Private Key",
+          "vault.private_key_trading": "API Wallet Private Key",
+          "vault.private_key_transfer": "EVM Wallet Private Key",
           "vault.toggle_private_key": "Show or hide private key",
           "vault.save_secret": "Save Secret",
           "vault.test_secret": "Test Secret",
@@ -4194,16 +4210,23 @@
           "vault.toggle_current_password": "显示或隐藏当前密码",
           "vault.toggle_new_password": "显示或隐藏新密码",
           "vault.toggle_confirm_password": "显示或隐藏确认密码",
-          "vault.secret_title": "API 钱包密钥",
+          "vault.secret_title": "账户密钥",
           "vault.per_account": "按账户管理",
           "vault.entry_type": "录入类型",
+          "vault.secret_usage": "密钥用途",
+          "vault.usage_trading": "交易 API 钱包",
+          "vault.usage_transfer": "资金划转 EVM 钱包",
+          "vault.usage_trading_help": "用于下单、撤单、杠杆和交易所原生止盈止损。这个钱包不需要持有 USDC。",
+          "vault.usage_transfer_help": "仅用于 default 永续、现货和 XYZ 之间的 USDC 划转。这个私钥必须派生出真正持有资金的账户地址。",
           "vault.existing": "已有账户",
           "vault.new_address": "新地址",
           "vault.account_id": "账户 ID",
           "vault.account_id_placeholder": "addr_c",
           "vault.secret_id": "密钥 ID",
           "vault.address": "地址",
-          "vault.private_key": "API 钱包私钥",
+          "vault.private_key": "私钥",
+          "vault.private_key_trading": "API 钱包私钥",
+          "vault.private_key_transfer": "EVM 钱包私钥",
           "vault.toggle_private_key": "显示或隐藏私钥",
           "vault.save_secret": "保存密钥",
           "vault.test_secret": "测试密钥",
@@ -4319,6 +4342,7 @@
         setCopyAdvancedOpen(state.copyAdvancedOpen, { persist: false });
         updateManualProtectionModeUi();
         updateManualAdvancedTargets();
+        updateVaultUsageUi();
         syncManualTransferInputs({ force: true });
         syncModuleSymbolPolicyInputs({ force: false });
         syncLeverageControlsForMarket();
@@ -7554,7 +7578,20 @@
       }
 
       function defaultSecretId(accountId) {
-        return accountId ? `${accountId}_api_wallet` : "";
+        return defaultSecretIdForUsage(accountId, state.vaultSecretUsage);
+      }
+
+      function defaultSecretIdForUsage(accountId, usage) {
+        if (!accountId) return "";
+        return usage === "transfer" ? `${accountId}_evm_wallet` : `${accountId}_api_wallet`;
+      }
+
+      function configuredSecretIdForUsage(account, usage) {
+        if (!account) return "";
+        if (usage === "transfer") {
+          return account.transfer_secret_id || defaultSecretIdForUsage(account.account_id, "transfer");
+        }
+        return account.secret_id || defaultSecretIdForUsage(account.account_id, "trading");
       }
 
       function updateVaultUi() {
@@ -7569,6 +7606,35 @@
           ? t("vault.placeholder_unlocked")
           : (state.vaultExists ? t("vault.placeholder_password") : t("vault.placeholder_new_password"));
         if (window.lucide) lucide.createIcons();
+      }
+
+      function updateVaultUsageUi() {
+        const isTransfer = state.vaultSecretUsage === "transfer";
+        $("vaultUsageTrading").classList.toggle("active", !isTransfer);
+        $("vaultUsageTransfer").classList.toggle("active", isTransfer);
+        $("vaultUsageHelp").textContent = t(isTransfer ? "vault.usage_transfer_help" : "vault.usage_trading_help");
+        const privateKeyLabel = document.querySelector('label[for="vaultPrivateKey"]');
+        if (privateKeyLabel) {
+          privateKeyLabel.textContent = t(isTransfer ? "vault.private_key_transfer" : "vault.private_key_trading");
+        }
+        if (window.lucide) lucide.createIcons();
+      }
+
+      function setVaultSecretUsage(usage) {
+        state.vaultSecretUsage = usage === "transfer" ? "transfer" : "trading";
+        const selectedAccountId = selectedVaultAccountId();
+        const currentDefaultIds = [
+          defaultSecretIdForUsage(selectedAccountId, "trading"),
+          defaultSecretIdForUsage(selectedAccountId, "transfer"),
+        ];
+        const shouldReplace =
+          !$("vaultSecretId").value.trim() || currentDefaultIds.includes($("vaultSecretId").value.trim());
+        updateVaultUsageUi();
+        if (shouldReplace) {
+          $("vaultSecretId").value = defaultSecretId(selectedAccountId);
+          state.lastAutoSecretId = $("vaultSecretId").value;
+        }
+        syncVaultAccountFields();
       }
 
       function setVaultStateFromSummary(summary) {
@@ -7691,7 +7757,7 @@
         const account = currentVaultAccount();
         if (!account) return;
         $("vaultAddress").value = account.address;
-        $("vaultSecretId").value = account.secret_id || account.account_id;
+        $("vaultSecretId").value = configuredSecretIdForUsage(account, state.vaultSecretUsage);
         state.lastAutoSecretId = "";
       }
 
@@ -11650,6 +11716,8 @@
       $("vaultAccountId").addEventListener("input", syncNewVaultSecretId);
       $("vaultUseExisting").addEventListener("click", () => setVaultMode("existing"));
       $("vaultUseNew").addEventListener("click", () => setVaultMode("new"));
+      $("vaultUsageTrading").addEventListener("click", () => setVaultSecretUsage("trading"));
+      $("vaultUsageTransfer").addEventListener("click", () => setVaultSecretUsage("transfer"));
       $("toggleVaultPasswordChange").addEventListener("click", () => {
         state.changePasswordVisible = !state.changePasswordVisible;
         updateVaultUi();
@@ -11668,6 +11736,7 @@
             password: $("vaultPassword").value,
             account_id: selectedVaultAccountId(),
             secret_id: $("vaultSecretId").value,
+            secret_usage: state.vaultSecretUsage,
           }),
         }));
       });
@@ -12580,6 +12649,7 @@
           address: $("vaultAddress").value,
           secret_id: $("vaultSecretId").value,
           private_key: $("vaultPrivateKey").value,
+          secret_usage: state.vaultSecretUsage,
         };
         let result = null;
         await showActionResult("vaultResult", null, async () => {

@@ -25,6 +25,7 @@
 18. [实施路线图](implementation-roadmap.md)
 19. [官方文档合规审计 2026-06-03](official-compliance-audit-2026-06-03.md)
 20. [斐波那契基础版模块审计 2026-06-03](fib-basic-module-audit-2026-06-03.md)
+21. [USDC 划转签名设计](usdc-transfer-signer-design.md)
 
 ## 设计目标
 

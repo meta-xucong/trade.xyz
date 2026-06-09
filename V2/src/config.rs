@@ -101,6 +101,10 @@ pub struct AccountConfig {
     pub secret_id: String,
     #[serde(default)]
     pub api_wallet_env: String,
+    #[serde(default)]
+    pub transfer_secret_id: String,
+    #[serde(default)]
+    pub transfer_wallet_env: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default = "default_true")]

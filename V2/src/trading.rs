@@ -32,7 +32,10 @@ use crate::{
         round_perp_price, round_size_down, round_spot_price, sdk_base_url, submit_send_asset,
     },
     realtime::RealtimeState,
-    secrets::{ApiWalletSecret, account_secret_id, load_account_secret, load_secret_by_id},
+    secrets::{
+        ApiWalletSecret, account_has_dedicated_transfer_secret, account_secret_id,
+        load_account_secret, load_secret_by_id, load_transfer_secret, transfer_secret_id,
+    },
     ws_post::WsPostClient,
 };
 
@@ -2060,10 +2063,10 @@ fn usdc_transfer_preflight_next_actions(
         );
     }
     if failed_preflight_check(checks, "vault_password_available")
-        || failed_preflight_check(checks, "api_wallet_secret_available")
+        || failed_preflight_check(checks, "evm_transfer_signer_available")
     {
         push_unique(
-            "Set TRADE_XYZ_VAULT_PASSWORD for CLI transfer preflight/submit, or unlock the Vault in the frontend."
+            "Set TRADE_XYZ_VAULT_PASSWORD for CLI transfer preflight/submit, or unlock the Vault in the frontend; ensure the configured transfer signer is the EVM account wallet."
                 .to_string(),
         );
     }
@@ -4824,7 +4827,7 @@ pub async fn execute_usdc_dex_transfer(
     }
 
     let password = vault_password.context("vault password is required for USDC DEX transfer")?;
-    let secret = load_account_secret(&config, &source_account, Some(password))?;
+    let secret = load_transfer_secret(&config, &source_account, Some(password))?;
     let submit = submit_send_asset(SendAssetSubmitRequest {
         exchange_url: &config.hyperliquid.exchange_url,
         environment: &config.app.environment,
@@ -5055,17 +5058,18 @@ pub async fn execute_usdc_dex_transfer_preflight(
         "Vault password must be available from the frontend unlock session or TRADE_XYZ_VAULT_PASSWORD",
     ));
 
-    let secret_available =
+    let transfer_secret_check =
         if let (Some(account), Some(password)) = (&source_account, vault_password) {
-            let secret_id = account_secret_id(account);
-            load_secret_by_id(&vault_path, password, &secret_id, Some(&account.account_id)).is_ok()
+            transfer_secret_readiness_check(&config, account, Some(password))
         } else {
-            false
+            Err(anyhow::anyhow!(
+                "Vault password is required to load and validate the EVM transfer signer"
+            ))
         };
     checks.push(SignedPreflightCheck::blocker(
-        "api_wallet_secret_available",
-        secret_available,
-        "matching API wallet private key must be available in the unlocked vault",
+        "evm_transfer_signer_available",
+        transfer_secret_check.is_ok(),
+        transfer_secret_check.unwrap_or_else(|error| error.to_string()),
     ));
 
     let rate_limit = if let Some(account) = &source_account {
@@ -5439,7 +5443,7 @@ pub fn prepare_usdc_dex_transfer_live_window(
         let secret_id = account_secret_id(account);
         anyhow::ensure!(
             !secret_id.trim().is_empty(),
-            "account {} must have a Vault secret_id or api_wallet_env",
+            "account {} must have a Vault secret_id/api_wallet_env for trading and a transfer_secret_id/transfer_wallet_env for USDC funding transfers",
             account.account_id
         );
         let confirmation_phrase =
@@ -5610,7 +5614,7 @@ pub fn prepare_signed_live_window(
         let secret_id = account_secret_id(account);
         anyhow::ensure!(
             !secret_id.trim().is_empty(),
-            "account {} must have a Vault secret_id or api_wallet_env",
+            "account {} must have a Vault secret_id/api_wallet_env for trading and a transfer_secret_id/transfer_wallet_env for USDC funding transfers",
             account.account_id
         );
 
@@ -6305,6 +6309,25 @@ fn signed_runbook_check(name: &str, ok: bool, detail: String) -> SignedRunbookCh
         ok,
         detail,
     }
+}
+
+fn transfer_secret_readiness_check(
+    config: &AppConfig,
+    account: &AccountConfig,
+    password: Option<&str>,
+) -> Result<String> {
+    let dedicated = account_has_dedicated_transfer_secret(account);
+    let secret_id = transfer_secret_id(account);
+    let secret = load_transfer_secret(config, account, password)?;
+    let mode = if dedicated {
+        "dedicated transfer signer"
+    } else {
+        "legacy secret_id fallback"
+    };
+    Ok(format!(
+        "{mode} {secret_id} is available and matches EVM account address {}",
+        secret.signer_address
+    ))
 }
 
 pub(crate) fn validate_usdc_dex_transfer_gates(
@@ -7761,6 +7784,8 @@ mod tests {
             address: "0x1234567890abcdef1234567890abcdef12345678".to_string(),
             secret_id: "addr_a_api_wallet".to_string(),
             api_wallet_env: String::new(),
+            transfer_secret_id: String::new(),
+            transfer_wallet_env: String::new(),
             enabled: true,
             worker_enabled: true,
             copy_ratio: 0.1,
@@ -7775,6 +7800,8 @@ mod tests {
             address: "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd".to_string(),
             secret_id: "addr_b_api_wallet".to_string(),
             api_wallet_env: String::new(),
+            transfer_secret_id: String::new(),
+            transfer_wallet_env: String::new(),
             enabled: true,
             worker_enabled: true,
             copy_ratio: 0.05,
@@ -8042,6 +8069,11 @@ mod tests {
             SignedPreflightCheck::blocker("config_dry_run_disabled", false, "dry-run"),
             SignedPreflightCheck::blocker("mainnet_explicit_confirmation", false, "phrase"),
             SignedPreflightCheck::blocker("vault_password_available", false, "missing"),
+            SignedPreflightCheck::blocker(
+                "evm_transfer_signer_available",
+                false,
+                "signer mismatch",
+            ),
             SignedPreflightCheck::blocker("transfer_plan_valid", true, "plan ok"),
         ];
         let failed = failed_preflight_blockers(&checks);
@@ -8049,8 +8081,8 @@ mod tests {
             usdc_transfer_preflight_next_actions(&checks, "mainnet", "", "xyz", Some(&phrase));
         let summary = usdc_transfer_preflight_summary("mainnet", false, false, &failed);
 
-        assert_eq!(failed.len(), 3);
-        assert!(summary.contains("blocked by 3 check"));
+        assert_eq!(failed.len(), 4);
+        assert!(summary.contains("blocked by 4 check"));
         assert!(
             actions
                 .iter()
@@ -8060,7 +8092,7 @@ mod tests {
         assert!(
             actions
                 .iter()
-                .any(|action| action.contains("TRADE_XYZ_VAULT_PASSWORD"))
+                .any(|action| action.contains("EVM account wallet"))
         );
     }
 
@@ -8662,6 +8694,8 @@ mod tests {
             address: "0x0000000000000000000000000000000000000001".to_string(),
             secret_id: "addr_a_api_wallet".to_string(),
             api_wallet_env: String::new(),
+            transfer_secret_id: String::new(),
+            transfer_wallet_env: String::new(),
             enabled: true,
             worker_enabled: true,
             copy_ratio: 0.1,
@@ -8683,6 +8717,8 @@ mod tests {
             address: "0x1234567890abcdef1234567890abcdef12345678".to_string(),
             secret_id: "addr_a_api_wallet".to_string(),
             api_wallet_env: String::new(),
+            transfer_secret_id: String::new(),
+            transfer_wallet_env: String::new(),
             enabled: true,
             worker_enabled: true,
             copy_ratio: 0.1,

@@ -94,6 +94,14 @@ pub struct ApiWalletSecret {
     pub private_key: String,
 }
 
+#[derive(Debug, Zeroize, ZeroizeOnDrop)]
+pub struct TransferWalletSecret {
+    pub secret_id: String,
+    pub account_id: String,
+    pub private_key: String,
+    pub signer_address: String,
+}
+
 impl VaultKdf {
     pub fn default_interactive() -> Self {
         Self {
@@ -194,6 +202,51 @@ pub fn load_account_secret(
     )
 }
 
+pub fn load_transfer_secret(
+    config: &AppConfig,
+    account: &AccountConfig,
+    password: Option<&str>,
+) -> Result<TransferWalletSecret> {
+    let raw_secret = if let Some(password) = password {
+        let vault_path = PathBuf::from(&config.secrets.vault_path);
+        let secret_id = transfer_secret_id(account);
+        load_secret_by_id(&vault_path, password, &secret_id, Some(&account.account_id))?
+    } else if config.secrets.allow_env_fallback && !account.transfer_wallet_env.trim().is_empty() {
+        let private_key = std::env::var(&account.transfer_wallet_env).with_context(|| {
+            format!(
+                "environment variable {} is not set for account {}",
+                account.transfer_wallet_env, account.account_id
+            )
+        })?;
+        ApiWalletSecret {
+            secret_id: transfer_secret_id(account),
+            account_id: account.account_id.clone(),
+            private_key: normalize_private_key(&private_key)?,
+        }
+    } else {
+        anyhow::bail!(
+            "account {} requires vault password for transfer_secret_id {}",
+            account.account_id,
+            transfer_secret_id(account)
+        );
+    };
+
+    let signer_address = private_key_address(&raw_secret.private_key)?;
+    anyhow::ensure!(
+        signer_address.eq_ignore_ascii_case(account.address.trim()),
+        "transfer signer {} does not match configured EVM account address {} for {}; API wallets cannot be used for USDC funding transfers",
+        signer_address,
+        account.address,
+        account.account_id
+    );
+    Ok(TransferWalletSecret {
+        secret_id: raw_secret.secret_id.clone(),
+        account_id: raw_secret.account_id.clone(),
+        private_key: raw_secret.private_key.clone(),
+        signer_address,
+    })
+}
+
 pub fn load_secret_by_id(
     path: &Path,
     password: &str,
@@ -227,6 +280,27 @@ pub fn account_secret_id(account: &AccountConfig) -> String {
     } else {
         account.secret_id.clone()
     }
+}
+
+pub fn transfer_secret_id(account: &AccountConfig) -> String {
+    if account.transfer_secret_id.trim().is_empty() {
+        account_secret_id(account)
+    } else {
+        account.transfer_secret_id.clone()
+    }
+}
+
+pub fn private_key_address(private_key: &str) -> Result<String> {
+    use ethers::signers::{LocalWallet, Signer};
+
+    let wallet: LocalWallet = normalize_private_key(private_key)?
+        .parse()
+        .context("failed to parse private key for address derivation")?;
+    Ok(format!("{:#x}", wallet.address()))
+}
+
+pub fn account_has_dedicated_transfer_secret(account: &AccountConfig) -> bool {
+    !account.transfer_secret_id.trim().is_empty() || !account.transfer_wallet_env.trim().is_empty()
 }
 
 fn write_encrypted_vault(
@@ -399,8 +473,8 @@ mod tests {
 
     use super::{
         PlainVault, SecretUpsert, VaultKdf, change_vault_password, decrypt_vault_file,
-        load_account_secret, load_secret_by_id, summary_from_plain, upsert_secret,
-        write_encrypted_vault,
+        load_account_secret, load_secret_by_id, load_transfer_secret, private_key_address,
+        summary_from_plain, upsert_secret, write_encrypted_vault,
     };
 
     #[test]
@@ -496,6 +570,8 @@ mod tests {
             address: "0x0000000000000000000000000000000000000001".to_string(),
             secret_id: "addr_a_api_wallet".to_string(),
             api_wallet_env: String::new(),
+            transfer_secret_id: String::new(),
+            transfer_wallet_env: String::new(),
             enabled: true,
             worker_enabled: true,
             copy_ratio: 0.1,
@@ -508,6 +584,70 @@ mod tests {
         assert_eq!(secret.secret_id, "addr_a_api_wallet");
         assert_eq!(secret.account_id, "addr_a");
         assert_eq!(secret.private_key, private_key);
+    }
+
+    #[test]
+    fn transfer_secret_requires_evm_signer_matching_account_address() {
+        let dir = std::env::temp_dir().join(format!(
+            "trade_xyz_transfer_secret_test_{}",
+            crate::domain::now_ms()
+        ));
+        fs::create_dir_all(&dir).expect("test dir");
+        let path = dir.join("trade_xyz.vault");
+        let password = "transfer lookup password";
+        let api_private_key = "0x2222222222222222222222222222222222222222222222222222222222222222";
+        let evm_private_key = "0x3333333333333333333333333333333333333333333333333333333333333333";
+        let evm_address = private_key_address(evm_private_key).expect("derive evm address");
+
+        upsert_secret(
+            &path,
+            password,
+            SecretUpsert {
+                secret_id: "addr_a_api_wallet".to_string(),
+                account_id: "addr_a".to_string(),
+                address: evm_address.clone(),
+                api_wallet_private_key: api_private_key.to_string(),
+            },
+        )
+        .expect("api vault upsert");
+        upsert_secret(
+            &path,
+            password,
+            SecretUpsert {
+                secret_id: "addr_a_transfer_wallet".to_string(),
+                account_id: "addr_a".to_string(),
+                address: evm_address.clone(),
+                api_wallet_private_key: evm_private_key.to_string(),
+            },
+        )
+        .expect("transfer vault upsert");
+
+        let mut config = AppConfig::default();
+        config.secrets.vault_path = path.to_string_lossy().into_owned();
+        let mut account = AccountConfig {
+            account_id: "addr_a".to_string(),
+            address: evm_address.clone(),
+            secret_id: "addr_a_api_wallet".to_string(),
+            api_wallet_env: String::new(),
+            transfer_secret_id: String::new(),
+            transfer_wallet_env: String::new(),
+            enabled: true,
+            worker_enabled: true,
+            copy_ratio: 0.1,
+            max_order_notional_usd: 100.0,
+            blocked_markets: Vec::new(),
+        };
+
+        let legacy_error = load_transfer_secret(&config, &account, Some(password))
+            .expect_err("api wallet fallback must not pass transfer signer check")
+            .to_string();
+        assert!(legacy_error.contains("API wallets cannot be used"));
+
+        account.transfer_secret_id = "addr_a_transfer_wallet".to_string();
+        let secret =
+            load_transfer_secret(&config, &account, Some(password)).expect("load transfer secret");
+        assert_eq!(secret.secret_id, "addr_a_transfer_wallet");
+        assert_eq!(secret.signer_address, evm_address.to_ascii_lowercase());
     }
 
     #[test]

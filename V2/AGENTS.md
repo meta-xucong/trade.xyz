@@ -68,11 +68,17 @@ preserving V1 safety rules.
 - Maintain nonce state per signer. A signer must not be shared by multiple
   live processes without a single nonce owner.
 - Use bounded queues and fail closed if a worker falls behind.
+- API wallets are trading signers, not funding wallets. USDC funding transfers
+  must use a configured EVM transfer signer and verify its derived address equals
+  the account master/subaccount address before signing.
 
 ## Security Rules
 
 - Vault unlock may warm account-worker signers in memory, but secrets must never
   be written to logs, config, or audit files.
+- Keep API wallet signers and EVM transfer signers separate:
+  `secret_id`/`api_wallet_env` are for trading, while
+  `transfer_secret_id`/`transfer_wallet_env` are for funding transfers.
 - Workers must drop signer state on shutdown, crash, lock, or kill switch.
 - The frontend must show Vault state, worker state, and kill-switch state
   clearly.

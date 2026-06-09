@@ -226,13 +226,17 @@ cargo run -- signed-cancel --config config/local.toml --account-id addr_a --coin
   `Transfer USDC`，其中 preflight 和计划可批量，Live 提交按账号 fan-out 到同一 runbook
   端点返回 preflight/submit 证据。该路径只用于 smoke 前补足
   trade[XYZ] 保证金，大额资金管理应在官方界面或专门资金模块中执行。
+  划转 submit 不使用 API wallet；它必须加载 `transfer_secret_id` /
+  `transfer_wallet_env` 对应的 EVM transfer signer，并校验 signer 地址等于账户
+  `address`。相关 readiness blocker 名为 `evm_transfer_signer_available`。
 - `usdc-dex-transfer-live-window`：只生成主网资金转入窗口计划和一次性临时 live 配置，不读取
   Vault、不签名、不提交。未传 `--write true` 时只输出 JSON 预览；传 `--write true` 时写入
   `.codex-longrun/mainnet-usdc-transfer-window.toml` 一类临时配置，主 `config/local.toml`
   必须保持 `dry_run=true`。真实转入后应停止继续使用该临时配置。
 - `Preflight` 和 `Runbook Plan` 的 JSON 会包含 `readiness_summary`、`failed_blockers`
   和 `next_actions`。最终 signed smoke 前优先看这三个字段：它们应为空 blocker，并显示
-  ready；否则按 `next_actions` 补齐 Vault、API wallet secret、测试资金、仓位或配置 gate。
+  ready；否则按 `next_actions` 补齐 Vault、API wallet secret（交易）、
+  EVM transfer signer（划转）、测试资金、仓位或配置 gate。
 - `Runbook Plan`：调用 signed runbook 只读路径，一次展示 preflight、pre-submit
   reconciliation 和 acceptance plan。若前端 Vault 已解锁，该按钮会沿用当前解锁会话验证
   secret 可用性，但仍不得签名或提交。

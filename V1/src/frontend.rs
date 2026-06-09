@@ -47,7 +47,8 @@ use crate::{
     risk::{RiskContext, RiskDecision, RiskGateway},
     secrets::{
         SecretUpsert, VaultSummary, account_secret_id, change_vault_password, load_account_secret,
-        load_secret_by_id, unlock_vault, upsert_secret, vault_status,
+        load_secret_by_id, load_transfer_secret, transfer_secret_id, unlock_vault, upsert_secret,
+        vault_status,
     },
     strategies::{
         fib::{
@@ -250,8 +251,13 @@ impl FrontendAppState {
         Ok(())
     }
 
-    fn upsert_config_account(&self, input: &SecretUpsert) -> Result<()> {
-        self.upsert_config_account_fields(&input.account_id, &input.address, &input.secret_id)
+    fn upsert_config_account(&self, input: &SecretUpsert, secret_usage: SecretUsage) -> Result<()> {
+        self.upsert_config_account_fields(
+            &input.account_id,
+            &input.address,
+            &input.secret_id,
+            secret_usage,
+        )
     }
 
     fn upsert_config_account_fields(
@@ -259,10 +265,16 @@ impl FrontendAppState {
         account_id: &str,
         address: &str,
         secret_id: &str,
+        secret_usage: SecretUsage,
     ) -> Result<()> {
         let mut next_config = self.config_snapshot()?;
-        let changed =
-            upsert_config_account_record(&mut next_config, account_id, address, secret_id);
+        let changed = upsert_config_account_record(
+            &mut next_config,
+            account_id,
+            address,
+            secret_id,
+            secret_usage,
+        );
         if !changed {
             return Ok(());
         }
@@ -421,11 +433,13 @@ impl FrontendAppState {
         let mut next_config = self.config_snapshot()?;
         let mut changed = false;
         for entry in &summary.entries {
+            let secret_usage = secret_usage_for_vault_entry(&next_config, entry);
             changed |= upsert_config_account_record(
                 &mut next_config,
                 &entry.account_id,
                 &entry.address,
                 &entry.secret_id,
+                secret_usage,
             );
         }
         if !changed {
@@ -548,6 +562,7 @@ fn upsert_config_account_record(
     account_id: &str,
     address: &str,
     secret_id: &str,
+    secret_usage: SecretUsage,
 ) -> bool {
     let account_id = account_id.trim();
     let address = address.trim();
@@ -560,21 +575,34 @@ fn upsert_config_account_record(
         .iter_mut()
         .find(|account| account.account_id == account_id)
     {
+        let secret_changed = match secret_usage {
+            SecretUsage::Trading => account.secret_id != secret_id,
+            SecretUsage::Transfer => account.transfer_secret_id != secret_id,
+        };
         let changed = account.address != address
-            || account.secret_id != secret_id
+            || secret_changed
             || !account.enabled
             || !account.worker_enabled;
         account.address = address.to_string();
-        account.secret_id = secret_id.to_string();
+        match secret_usage {
+            SecretUsage::Trading => account.secret_id = secret_id.to_string(),
+            SecretUsage::Transfer => account.transfer_secret_id = secret_id.to_string(),
+        }
         account.enabled = true;
         account.worker_enabled = true;
         changed
     } else {
+        let (trading_secret_id, transfer_secret_id) = match secret_usage {
+            SecretUsage::Trading => (secret_id.to_string(), String::new()),
+            SecretUsage::Transfer => (format!("{account_id}_api_wallet"), secret_id.to_string()),
+        };
         next_config.accounts.push(AccountConfig {
             account_id: account_id.to_string(),
             address: address.to_string(),
-            secret_id: secret_id.to_string(),
+            secret_id: trading_secret_id,
             api_wallet_env: String::new(),
+            transfer_secret_id,
+            transfer_wallet_env: String::new(),
             enabled: true,
             worker_enabled: true,
             copy_ratio: 0.10,
@@ -582,6 +610,44 @@ fn upsert_config_account_record(
             blocked_markets: Vec::new(),
         });
         true
+    }
+}
+
+fn secret_usage_for_vault_entry(
+    config: &AppConfig,
+    entry: &crate::secrets::VaultEntrySummary,
+) -> SecretUsage {
+    if let Some(account) = config.account(&entry.account_id) {
+        if !account.transfer_secret_id.trim().is_empty()
+            && entry.secret_id == account.transfer_secret_id.trim()
+        {
+            return SecretUsage::Transfer;
+        }
+        if entry.secret_id == account_secret_id(account) {
+            return SecretUsage::Trading;
+        }
+    }
+    let lower = entry.secret_id.to_ascii_lowercase();
+    if lower.contains("transfer") || lower.contains("evm") {
+        SecretUsage::Transfer
+    } else {
+        SecretUsage::Trading
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecretUsage {
+    Trading,
+    Transfer,
+}
+
+impl SecretUsage {
+    fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "trading" | "api" | "api_wallet" => Ok(Self::Trading),
+            "transfer" | "evm" | "funding" => Ok(Self::Transfer),
+            other => anyhow::bail!("unsupported secret usage {other}"),
+        }
     }
 }
 
@@ -2272,10 +2338,10 @@ async fn account_funding_batch(
             &account_ids,
             "all_layers",
         );
-        if !payload.force_fresh {
-            if let Some(cached) = state.cached_account_funding_batch(&cache_key)? {
-                return Ok(cached);
-            }
+        if !payload.force_fresh
+            && let Some(cached) = state.cached_account_funding_batch(&cache_key)?
+        {
+            return Ok(cached);
         }
 
         let force_fresh = payload.force_fresh;
@@ -2487,7 +2553,7 @@ async fn usdc_dex_transfer_batch(
         let account_ids = selected_enabled_account_ids(&config, &payload.account_ids);
         validate_batch_account_count("USDC transfer batch plan", &config, &account_ids)?;
 
-        let transfer_futures = account_ids.iter().cloned().map(|account_id| {
+        let transfer_futures = account_ids.iter().map(|account_id| {
             let options = payload.for_account(account_id.clone());
             let config = config.clone();
             async move {
@@ -2557,7 +2623,7 @@ async fn usdc_dex_transfer_readiness_batch(
         let account_ids = selected_enabled_account_ids(&config, &payload.account_ids);
         validate_batch_account_count("USDC transfer readiness batch", &config, &account_ids)?;
 
-        let readiness_futures = account_ids.iter().cloned().map(|account_id| {
+        let readiness_futures = account_ids.iter().map(|account_id| {
             let options = payload.for_account(account_id.clone());
             let state = state.clone();
             let config = config.clone();
@@ -3628,10 +3694,10 @@ async fn vault_upsert(
         let path = PathBuf::from(&config.secrets.vault_path);
         payload
             .try_into_upsert(&config)
-            .and_then(|(password, upsert)| {
+            .and_then(|(password, secret_usage, upsert)| {
                 let password = state.resolve_vault_password(&path, &password)?;
                 let summary = upsert_secret(&path, &password, upsert.clone())?;
-                state.upsert_config_account(&upsert)?;
+                state.upsert_config_account(&upsert, secret_usage)?;
                 state.store_vault_session(path, password, summary)
             })
     });
@@ -3730,6 +3796,7 @@ impl FrontendStateResponse {
                         account_id: account.account_id.clone(),
                         address: account.address.clone(),
                         secret_id: account_secret_id(account),
+                        transfer_secret_id: account.transfer_secret_id.clone(),
                         blocked_markets: account.normalized_blocked_markets(),
                         copy_ratio: account.copy_ratio,
                         max_order_notional_usd: account.max_order_notional_usd,
@@ -3749,6 +3816,7 @@ impl FrontendStateResponse {
                         account_id: account.account_id.clone(),
                         address: account.address.clone(),
                         secret_id: account_secret_id(account),
+                        transfer_secret_id: account.transfer_secret_id.clone(),
                         blocked_markets: account.normalized_blocked_markets(),
                         copy_ratio: account.copy_ratio,
                         max_order_notional_usd: account.max_order_notional_usd,
@@ -4682,10 +4750,7 @@ fn fib_entry_reports_are_retryable_maker_miss(
         .iter()
         .filter(|report| matches!(report, WorkerReport::Rejected(_) | WorkerReport::Error(_)))
         .count();
-    actionable == reports.len()
-        && reports
-            .iter()
-            .all(|report| fib_entry_report_is_retryable_maker_miss(report))
+    actionable == reports.len() && reports.iter().all(fib_entry_report_is_retryable_maker_miss)
 }
 
 fn fib_entry_report_is_retryable_maker_miss(report: &WorkerReport) -> bool {
@@ -6552,8 +6617,9 @@ async fn execute_fib_entry_signals(
                 };
 
                 let worker_id = format!("worker-{}", account.account_id);
-                if execute_live && !market.is_spot() {
-                    if let Err(error) = execute_fib_residual_cleanup_if_needed(
+                if execute_live
+                    && !market.is_spot()
+                    && let Err(error) = execute_fib_residual_cleanup_if_needed(
                         &config,
                         &market,
                         &account,
@@ -6563,22 +6629,21 @@ async fn execute_fib_entry_signals(
                         "pre-entry",
                     )
                     .await
-                    {
-                        for _ in account_signals {
-                            account_entry_reports.push(WorkerReport::Error(
-                                crate::domain::WorkerError {
-                                    worker_id: worker_id.clone(),
-                                    account_id: account.account_id.clone(),
-                                    message: error.to_string(),
-                                    error_at_ms: now_ms(),
-                                },
-                            ));
-                        }
-                        return Ok::<_, anyhow::Error>((
-                            account_entry_reports,
-                            account_protection_reports,
+                {
+                    for _ in account_signals {
+                        account_entry_reports.push(WorkerReport::Error(
+                            crate::domain::WorkerError {
+                                worker_id: worker_id.clone(),
+                                account_id: account.account_id.clone(),
+                                message: error.to_string(),
+                                error_at_ms: now_ms(),
+                            },
                         ));
                     }
+                    return Ok::<_, anyhow::Error>((
+                        account_entry_reports,
+                        account_protection_reports,
+                    ));
                 }
 
                 let mut approved_orders = Vec::new();
@@ -7406,6 +7471,7 @@ struct AccountResponse {
     account_id: String,
     address: String,
     secret_id: String,
+    transfer_secret_id: String,
     blocked_markets: Vec<String>,
     copy_ratio: f64,
     max_order_notional_usd: f64,
@@ -9053,7 +9119,7 @@ fn cap_recent_events_by_market(events: Vec<EventResponse>) -> Vec<EventResponse>
     let mut capped = Vec::new();
     for market_id in [MARKET_XYZ_PERP, MARKET_HL_PERP, MARKET_SPOT] {
         if let Some(mut market_events) = by_market.remove(market_id) {
-            market_events.sort_by(|left, right| right.occurred_at_ms.cmp(&left.occurred_at_ms));
+            market_events.sort_by_key(|event| std::cmp::Reverse(event.occurred_at_ms));
             capped.extend(
                 market_events
                     .into_iter()
@@ -10672,26 +10738,27 @@ async fn build_usdc_dex_transfer_readiness(
         "vault must be unlocked in this console process before signed transfer",
     ));
 
-    let secret_available = if let Some(account) = source_account {
+    let transfer_secret_check = if let Some(account) = source_account {
         if let Ok(password) = state.resolve_vault_password(&vault_path, "") {
-            let secret_id = account_secret_id(account);
-            load_secret_by_id(
-                &vault_path,
-                &password,
-                &secret_id,
-                Some(&account.account_id),
-            )
-            .is_ok()
+            load_transfer_secret(config, account, Some(&password)).map(|secret| {
+                format!(
+                    "EVM transfer signer {} is available and matches account {}",
+                    secret.signer_address, account.account_id
+                )
+            })
         } else {
-            false
+            Err(anyhow::anyhow!(
+                "vault must be unlocked to validate transfer signer {}",
+                transfer_secret_id(account)
+            ))
         }
     } else {
-        false
+        Err(anyhow::anyhow!("source account is missing from config"))
     };
     checks.push(ReadinessCheckResponse::blocker(
-        "api_wallet_secret_available",
-        secret_available,
-        "matching API wallet private key must be available in the unlocked vault",
+        "evm_transfer_signer_available",
+        transfer_secret_check.is_ok(),
+        transfer_secret_check.unwrap_or_else(|error| error.to_string()),
     ));
 
     let rate_limit = if let Some(account) = source_account {
@@ -11012,10 +11079,10 @@ fn usdc_transfer_readiness_next_actions(
         );
     }
     if failed_readiness_check(checks, "vault_unlocked")
-        || failed_readiness_check(checks, "api_wallet_secret_available")
+        || failed_readiness_check(checks, "evm_transfer_signer_available")
     {
         push_unique(
-            "Unlock the Vault in the current frontend process, then test the API wallet secret."
+            "Unlock the Vault in the current frontend process, then validate the EVM transfer signer for this account."
                 .to_string(),
         );
     }
@@ -12383,6 +12450,8 @@ struct VaultUpsertPayload {
     address: String,
     secret_id: String,
     private_key: String,
+    #[serde(default)]
+    secret_usage: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -12392,6 +12461,8 @@ struct VaultSecretCheckPayload {
     account_id: String,
     #[serde(default)]
     secret_id: String,
+    #[serde(default)]
+    secret_usage: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -12412,7 +12483,10 @@ impl VaultSecretCheckPayload {
         let secret_id = if !self.secret_id.trim().is_empty() {
             self.secret_id.trim().to_string()
         } else if let Some(account) = config.account(&self.account_id) {
-            account_secret_id(account)
+            match SecretUsage::parse(&self.secret_usage)? {
+                SecretUsage::Trading => account_secret_id(account),
+                SecretUsage::Transfer => transfer_secret_id(account),
+            }
         } else {
             self.account_id.clone()
         };
@@ -12428,12 +12502,27 @@ impl VaultSecretCheckPayload {
 }
 
 impl VaultUpsertPayload {
-    fn try_into_upsert(self, config: &AppConfig) -> Result<(String, SecretUpsert)> {
+    fn try_into_upsert(self, config: &AppConfig) -> Result<(String, SecretUsage, SecretUpsert)> {
+        let secret_usage = SecretUsage::parse(&self.secret_usage)?;
         let fallback_account = config.account(&self.account_id);
         let secret_id = if self.secret_id.trim().is_empty() {
-            fallback_account
-                .map(account_secret_id)
-                .unwrap_or_else(|| self.account_id.clone())
+            if let Some(account) = fallback_account {
+                match secret_usage {
+                    SecretUsage::Trading => account_secret_id(account),
+                    SecretUsage::Transfer => {
+                        if account.transfer_secret_id.trim().is_empty() {
+                            format!("{}_evm_wallet", account.account_id)
+                        } else {
+                            transfer_secret_id(account)
+                        }
+                    }
+                }
+            } else {
+                match secret_usage {
+                    SecretUsage::Trading => format!("{}_api_wallet", self.account_id),
+                    SecretUsage::Transfer => format!("{}_evm_wallet", self.account_id),
+                }
+            }
         } else {
             self.secret_id
         };
@@ -12446,6 +12535,7 @@ impl VaultUpsertPayload {
         };
         Ok((
             self.password,
+            secret_usage,
             SecretUpsert {
                 secret_id,
                 account_id: self.account_id,
@@ -12953,7 +13043,7 @@ mod tests {
         DashboardOpenOrderResponse, FibBasicConfig, FibBasicLevelPlan, FibBasicPlan,
         FibInstanceRecord, FibInstanceStatus, FibOrderRef, FibPositionSnapshot, FibProfitLossMode,
         FibTradeDirection, FrontendAppState, ManualSettingsPayload, OrderStatusPayload,
-        OrderStatusQuery, PerpFundingLayer, ReadinessCheckResponse, SpotFundingLayer,
+        OrderStatusQuery, PerpFundingLayer, ReadinessCheckResponse, SecretUsage, SpotFundingLayer,
         account_funding_next_actions, account_funding_summary, build_basic_plan,
         build_fib_strategy_pnl_summary, dashboard_cancel_stopped_without_open_orders_count,
         dashboard_cancel_strategy_ids, dashboard_order_is_cancelable_fib_entry,
@@ -13038,6 +13128,8 @@ mod tests {
                 address: "0x0000000000000000000000000000000000000001".to_string(),
                 secret_id: "addr_a_api_wallet".to_string(),
                 api_wallet_env: String::new(),
+                transfer_secret_id: String::new(),
+                transfer_wallet_env: String::new(),
                 enabled: true,
                 worker_enabled: true,
                 copy_ratio: 0.1,
@@ -13049,6 +13141,8 @@ mod tests {
                 address: "0x0000000000000000000000000000000000000002".to_string(),
                 secret_id: "addr_b_api_wallet".to_string(),
                 api_wallet_env: String::new(),
+                transfer_secret_id: String::new(),
+                transfer_wallet_env: String::new(),
                 enabled: true,
                 worker_enabled: false,
                 copy_ratio: 0.1,
@@ -13150,6 +13244,8 @@ mod tests {
                 address: "0x0000000000000000000000000000000000000001".to_string(),
                 secret_id: "addr_a_api_wallet".to_string(),
                 api_wallet_env: String::new(),
+                transfer_secret_id: String::new(),
+                transfer_wallet_env: String::new(),
                 enabled: true,
                 worker_enabled: true,
                 copy_ratio: 0.1,
@@ -13161,6 +13257,8 @@ mod tests {
                 address: "0x0000000000000000000000000000000000000002".to_string(),
                 secret_id: "addr_b_api_wallet".to_string(),
                 api_wallet_env: String::new(),
+                transfer_secret_id: String::new(),
+                transfer_wallet_env: String::new(),
                 enabled: true,
                 worker_enabled: true,
                 copy_ratio: 0.1,
@@ -13584,6 +13682,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn test_user_fill(
         oid: u64,
         coin: &str,
@@ -13771,6 +13870,8 @@ mod tests {
             address: "0x0000000000000000000000000000000000000001".to_string(),
             secret_id: "addr_a_api_wallet".to_string(),
             api_wallet_env: String::new(),
+            transfer_secret_id: String::new(),
+            transfer_wallet_env: String::new(),
             enabled: true,
             worker_enabled: true,
             copy_ratio: 0.1,
@@ -14428,6 +14529,8 @@ mod tests {
             address: "0x0000000000000000000000000000000000000001".to_string(),
             secret_id: "addr_a_api_wallet".to_string(),
             api_wallet_env: String::new(),
+            transfer_secret_id: String::new(),
+            transfer_wallet_env: String::new(),
             enabled: true,
             worker_enabled: true,
             copy_ratio: 0.1,
@@ -14454,13 +14557,17 @@ mod tests {
         };
 
         state
-            .upsert_config_account(&SecretUpsert {
-                secret_id: "addr_c_api_wallet".to_string(),
-                account_id: "addr_c".to_string(),
-                address: "0x0000000000000000000000000000000000000003".to_string(),
-                api_wallet_private_key: "0x3333333333333333333333333333333333333333333333333333333333333333"
-                    .to_string(),
-            })
+            .upsert_config_account(
+                &SecretUpsert {
+                    secret_id: "addr_c_api_wallet".to_string(),
+                    account_id: "addr_c".to_string(),
+                    address: "0x0000000000000000000000000000000000000003".to_string(),
+                    api_wallet_private_key:
+                        "0x3333333333333333333333333333333333333333333333333333333333333333"
+                            .to_string(),
+                },
+                SecretUsage::Trading,
+            )
             .expect("config account upsert");
 
         let config = crate::config::load_config(&config_path).expect("reload config");
@@ -14472,6 +14579,67 @@ mod tests {
         assert_eq!(account.secret_id, "addr_c_api_wallet");
         assert!(account.enabled);
         assert!(account.worker_enabled);
+    }
+
+    #[test]
+    fn vault_upsert_transfer_secret_does_not_replace_trading_secret() {
+        let dir = std::env::temp_dir().join(format!(
+            "trade_xyz_frontend_config_transfer_account_{}",
+            crate::domain::now_ms()
+        ));
+        fs::create_dir_all(&dir).expect("test dir");
+        let config_path = dir.join("dry-run.toml");
+        let mut config = AppConfig::default();
+        config.accounts = vec![crate::config::AccountConfig {
+            account_id: "addr_a".to_string(),
+            address: "0x0000000000000000000000000000000000000001".to_string(),
+            secret_id: "addr_a_api_wallet".to_string(),
+            api_wallet_env: String::new(),
+            transfer_secret_id: String::new(),
+            transfer_wallet_env: String::new(),
+            enabled: true,
+            worker_enabled: true,
+            copy_ratio: 0.1,
+            max_order_notional_usd: 100.0,
+            blocked_markets: Vec::new(),
+        }];
+        crate::config::save_config(&config_path, &config).expect("write test config");
+
+        let state = FrontendAppState {
+            config: Arc::new(std::sync::RwLock::new(config)),
+            config_path: config_path.clone(),
+            dry_run: true,
+            started_at_ms: crate::domain::now_ms(),
+            vault_session: Arc::new(std::sync::RwLock::new(None)),
+            fib_instances: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            fib_stop_requests: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            realtime: RealtimeState::new(),
+            account_funding_batch_cache: Arc::new(std::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            manual_protective_rules_cache: Arc::new(std::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+        };
+
+        state
+            .upsert_config_account(
+                &SecretUpsert {
+                    secret_id: "addr_a_evm_wallet".to_string(),
+                    account_id: "addr_a".to_string(),
+                    address: "0x0000000000000000000000000000000000000001".to_string(),
+                    api_wallet_private_key:
+                        "0x3333333333333333333333333333333333333333333333333333333333333333"
+                            .to_string(),
+                },
+                SecretUsage::Transfer,
+            )
+            .expect("transfer config upsert");
+
+        let config = crate::config::load_config(&config_path).expect("reload config");
+        let account = config.account("addr_a").expect("account in config");
+        assert_eq!(account.secret_id, "addr_a_api_wallet");
+        assert_eq!(account.transfer_secret_id, "addr_a_evm_wallet");
     }
 
     #[test]
@@ -14489,6 +14657,8 @@ mod tests {
             address: "0x0000000000000000000000000000000000000001".to_string(),
             secret_id: "addr_a_api_wallet".to_string(),
             api_wallet_env: String::new(),
+            transfer_secret_id: String::new(),
+            transfer_wallet_env: String::new(),
             enabled: true,
             worker_enabled: true,
             copy_ratio: 0.1,
@@ -14533,6 +14703,12 @@ mod tests {
                     address: "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd".to_string(),
                     updated_at_ms: 2,
                 },
+                VaultEntrySummary {
+                    secret_id: "addr_a_evm_wallet".to_string(),
+                    account_id: "addr_a".to_string(),
+                    address: "0x1234567890abcdef1234567890abcdef12345678".to_string(),
+                    updated_at_ms: 3,
+                },
             ],
         };
 
@@ -14545,6 +14721,8 @@ mod tests {
             .account("addr_a")
             .expect("existing account updated");
         assert_eq!(addr_a.address, "0x1234567890abcdef1234567890abcdef12345678");
+        assert_eq!(addr_a.secret_id, "addr_a_api_wallet");
+        assert_eq!(addr_a.transfer_secret_id, "addr_a_evm_wallet");
         assert_eq!(addr_a.max_order_notional_usd, 1.0);
         let addr_c = reloaded.account("addr_c").expect("vault account added");
         assert_eq!(addr_c.address, "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
@@ -14568,6 +14746,8 @@ mod tests {
                 address: "0x0000000000000000000000000000000000000001".to_string(),
                 secret_id: "addr_a_api_wallet".to_string(),
                 api_wallet_env: String::new(),
+                transfer_secret_id: String::new(),
+                transfer_wallet_env: String::new(),
                 enabled: true,
                 worker_enabled: true,
                 copy_ratio: 0.1,
@@ -14579,6 +14759,8 @@ mod tests {
                 address: "0x0000000000000000000000000000000000000002".to_string(),
                 secret_id: "addr_b_api_wallet".to_string(),
                 api_wallet_env: String::new(),
+                transfer_secret_id: String::new(),
+                transfer_wallet_env: String::new(),
                 enabled: true,
                 worker_enabled: true,
                 copy_ratio: 0.1,

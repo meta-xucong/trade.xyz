@@ -60,6 +60,8 @@ account_id = "addr_a"
 address = "0x0000000000000000000000000000000000000000"
 secret_id = "addr_a_api_wallet"
 api_wallet_env = "HL_API_WALLET_PRIVATE_KEY_ADDR_A"
+transfer_secret_id = "addr_a_evm_wallet"
+transfer_wallet_env = "HL_EVM_TRANSFER_PRIVATE_KEY_ADDR_A"
 enabled = true
 worker_enabled = true
 copy_ratio = 0.10
@@ -70,6 +72,8 @@ account_id = "addr_b"
 address = "0x1111111111111111111111111111111111111111"
 secret_id = "addr_b_api_wallet"
 api_wallet_env = "HL_API_WALLET_PRIVATE_KEY_ADDR_B"
+transfer_secret_id = "addr_b_evm_wallet"
+transfer_wallet_env = "HL_EVM_TRANSFER_PRIVATE_KEY_ADDR_B"
 enabled = true
 worker_enabled = true
 copy_ratio = 0.05
@@ -84,6 +88,10 @@ cargo run -- worker --account-id addr_b --config config/testnet.toml
 ```
 
 一个 worker 只能服务一个本地交易地址。
+
+`secret_id` / `api_wallet_env` 是交易 API wallet；`transfer_secret_id` /
+`transfer_wallet_env` 是资金划转 EVM signer。USDC 划转会校验 transfer signer
+派生地址必须等于 `address`，不能使用 API wallet 代替。
 
 通过前端 Vault 页面新增地址时，程序会把私钥写入 `secrets/trade_xyz.vault`，
 同时把非敏感账号信息追加或更新到当前启动时使用的配置文件 `[[accounts]]` 中。解锁

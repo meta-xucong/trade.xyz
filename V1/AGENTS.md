@@ -173,6 +173,10 @@ Hyperliquid. Last reviewed against official docs on 2026-06-02.
   deduplication do not depend only on server-generated order IDs.
 - For account queries, always pass the actual master/subaccount address, not the
   API wallet/agent address.
+- API wallet/agent wallet secrets are trading signers, not funding wallets.
+  USDC transfer submit paths must load the configured EVM transfer signer
+  (`transfer_secret_id` / `transfer_wallet_env`) and verify the derived signer
+  address equals the account `address`.
 
 ## Asset And Precision Rules
 
@@ -210,6 +214,10 @@ Hyperliquid. Last reviewed against official docs on 2026-06-02.
   Spot. Collateral in one account cannot be assumed available in another.
 - Use transfer actions deliberately when moving USDC between spot, default perps,
   and `xyz` perps. Log the source and destination account/Dex explicitly.
+- Keep trading and funding secrets separate. `secret_id` is the API wallet for
+  trading actions; `transfer_secret_id` is the EVM wallet signer for funding
+  transfers. If the transfer signer is missing or derives to any address other
+  than the account `address`, fail closed.
 - Treat USDC movement between default perps and `xyz` perps as a signed live
   action. It must pass dry-run/live gates, manual live gates, mainnet explicit
   confirmation, Vault availability, amount caps, and sanitized audit logging
