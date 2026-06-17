@@ -184,26 +184,50 @@ execution_mode = "taker"
 ```toml
 [strategies.smart_money_copy.main]
 enabled = true
+mode = "dry_run"
 max_signal_delay_ms = 1500
 default_copy_ratio = 0.10
-dedupe_window_secs = 600
+dedupe_window_secs = 3600
+conflict_window_ms = 500
+min_direction_score_ratio = 1.5
+close_overrides_open = true
+flip_open_enabled = false
 execution_mode = "taker"
+allow_short = true
+require_fresh_position_for_open = true
+pending_open_ttl_secs = 900
+post_close_reentry_guard_secs = 1800
+max_slippage_bps_open = 25
+max_slippage_bps_close = 75
 
 [[strategies.smart_money_copy.leaders]]
 leader_id = "leader_alpha"
 leader_group = "fund_alpha"
 account = "0x0000000000000000000000000000000000000000"
 enabled = true
+tier = "primary"
+weight = 2.0
 copy_ratio = 0.08
 max_notional_usd_per_trade = 300.0
 max_daily_notional_usd = 1000.0
+allow_open = true
+allow_close = true
 
 [[strategies.smart_money_copy.symbol_limits]]
 coin = "xyz:TSLA"
+market = "xyz_perp"
 enabled = true
+allow_short = true
+max_order_notional_usd = 300.0
 max_position_notional_usd = 1000.0
 max_daily_copy_notional_usd = 2000.0
+max_spread_bps_open = 25
+max_spread_bps_close = 75
 ```
+
+完整跟单开发规格见 [Smart Money Copy Development Spec](smart-money-copy-development.md)。
+配置校验必须拒绝重复 leader、非法地址、无启用 leader 的启用策略、spot 做空、负数限额、
+非法 ratio，以及主网 live 跟单缺少显式 live gate 的情况。
 
 ## 执行配置
 

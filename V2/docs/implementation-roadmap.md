@@ -150,21 +150,33 @@
 
 任务：
 
-- leader 配置。
-- leader event 标准化。
-- 去重。
-- 跟单比例。
-- symbol limit。
-- 多账号跟单设计。
-- 同一 leader signal 广播给多个 account workers 并行执行。
-- 策略专属风控。
-- 回放测试。
+- 按 [Smart Money Copy Development Spec](smart-money-copy-development.md) 实施。
+- leader watcher 只读探针：订阅 `userFills`、`userEvents`、`orderUpdates`、
+  `allDexsClearinghouseState`，记录 stream health 和 gap。
+- leader event 标准化：通过 fill + 仓位 delta 区分 open / increase / reduce /
+  close / flip；无法可靠识别时 fail-closed。
+- 持久化去重：覆盖 WS snapshot、重连 replay、REST backfill、leader group 重复和
+  worker 重复 signal。
+- 冲突裁决：同 symbol 多 leader 短窗口聚合，识别同向合并、反向冲突、close 优先。
+- 跟单比例和买量计算：按 leader ratio、本地 account ratio、leader/symbol/account/global
+  上限、pending exposure 和交易所最小开仓 notional 截断。
+- copy ledger：记录本地仓位与 leader/group/signal 的映射，支持 reduce/close 和重启恢复。
+- 策略专属风控：leader、symbol、signal delay、mapping、pending exposure、spread、stale
+  state、short permission 等检查。
+- 多账号跟单：同一 copy signal 广播给多个 account workers 并行执行，单 worker 异常不阻塞
+  其他 worker。
+- 回放测试、集成测试、主网 dry-run shadow。
 
 完成标准：
 
 - 同一 leader 事件不会重复跟单。
 - open / increase / reduce / close 可区分。
+- 反向冲突会跳过或按配置明确裁决，并写审计证据。
+- 任一启用 leader 的可靠 close 信号能触发本地 mapped exposure 的 reduce-only close。
+- leader flip 会拆成 close + 可选 open，分别过风控。
 - 跟单订单受 leader、symbol、account 限额约束。
+- pending open 会计入 exposure，不能在 fill 确认前重复超买。
+- 重启不会重复跟单，无法恢复 dedupe/ledger 时禁止新开仓。
 - 单个 worker 异常不影响其他 worker 跟单。
 
 ## Phase 7：实盘前加固

@@ -60,6 +60,10 @@
 - 平仓和减仓必须使用 reduce-only。
 - leader 行为无法可靠识别时必须保守拒绝。
 - leader 事件延迟超过阈值时不得追单。
+- 同一交易对多 leader 反方向信号必须经过冲突裁决；无明确优势时不跟。
+- 任一启用 leader 的可靠清仓信号可以触发本地 mapped exposure 清仓。
+- 本地跟单仓位必须记录 leader/group/signal 来源，便于 reduce/close、审计和重启恢复。
+- 具体开发规格见 [Smart Money Copy Development Spec](smart-money-copy-development.md)。
 
 ## 功能 3：前端控制台
 

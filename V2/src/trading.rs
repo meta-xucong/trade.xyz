@@ -1468,6 +1468,8 @@ pub struct SignedSmokePlanReport {
     pub reference_price: f64,
     pub limit_price: f64,
     pub size: f64,
+    pub effective_notional_usd: f64,
+    pub minimum_requested_notional_usd: Option<f64>,
     pub sz_decimals: u32,
     pub execution_mode: ExecutionMode,
     pub tif: String,
@@ -1815,7 +1817,7 @@ fn preflight_next_actions(checks: &[SignedPreflightCheck], reduce_only: bool) ->
     }
     if failed_preflight_check(checks, "exchange_min_order_notional_effective") {
         push_unique(
-            "Increase requested notional above the minimum so the precision-rounded order still stays >= 10 USD at submit time.",
+            "Increase requested notional to at least the recommendation in exchange_min_order_notional_effective, then verify it stays within account/manual caps.",
         );
     }
     if failed_preflight_check(checks, "symbol_allowed") {
@@ -2706,6 +2708,7 @@ pub async fn execute_signed_smoke(
     };
     let execution_policy = execution_policy_for_mode(options.execution_mode);
 
+    let effective_notional = effective_order_notional_usd(plan.limit_price, plan.size);
     let mut result = SignedSmokeResult {
         plan: SignedSmokePlanReport {
             environment: config.app.environment.clone(),
@@ -2715,6 +2718,13 @@ pub async fn execute_signed_smoke(
             reference_price: plan.reference_price,
             limit_price: plan.limit_price,
             size: plan.size,
+            effective_notional_usd: effective_notional,
+            minimum_requested_notional_usd: minimum_requested_notional_for_effective_min(
+                plan.limit_price,
+                plan.reference_price,
+                plan.sz_decimals,
+                HYPERLIQUID_MIN_ORDER_NOTIONAL_USD,
+            ),
             sz_decimals: plan.sz_decimals,
             execution_mode: options.execution_mode,
             tif: tif_for_policy(execution_policy),
@@ -2934,6 +2944,7 @@ pub async fn execute_fast_signed_order(
     let execution_policy = execution_policy_for_mode(options.execution_mode);
     let submit_requested = options.submit;
     let effective_submit = submit_requested && !dry_run;
+    let effective_notional = effective_order_notional_usd(plan.limit_price, plan.size);
     let plan_report = SignedSmokePlanReport {
         environment: config.app.environment.clone(),
         account_id: account.account_id.clone(),
@@ -2942,6 +2953,13 @@ pub async fn execute_fast_signed_order(
         reference_price: plan.reference_price,
         limit_price: plan.limit_price,
         size: plan.size,
+        effective_notional_usd: effective_notional,
+        minimum_requested_notional_usd: minimum_requested_notional_for_effective_min(
+            plan.limit_price,
+            plan.reference_price,
+            plan.sz_decimals,
+            HYPERLIQUID_MIN_ORDER_NOTIONAL_USD,
+        ),
         sz_decimals: plan.sz_decimals,
         execution_mode: options.execution_mode,
         tif: tif_for_policy(execution_policy),
@@ -3517,6 +3535,12 @@ pub async fn execute_signed_preflight(
                     ));
                     let effective_notional =
                         effective_order_notional_usd(plan.limit_price, plan.size);
+                    let minimum_requested_notional = minimum_requested_notional_for_effective_min(
+                        plan.limit_price,
+                        plan.reference_price,
+                        plan.sz_decimals,
+                        HYPERLIQUID_MIN_ORDER_NOTIONAL_USD,
+                    );
                     checks.push(SignedPreflightCheck::blocker(
                         "exchange_min_order_notional_effective",
                         effective_exchange_min_order_notional_ok(
@@ -3524,10 +3548,9 @@ pub async fn execute_signed_preflight(
                             plan.size,
                             close_gate,
                         ),
-                        format!(
-                            "planned order value after precision rounding is {:.6} USD; opening orders must be at least {} USD",
+                        exchange_min_effective_detail(
                             effective_notional,
-                            HYPERLIQUID_MIN_ORDER_NOTIONAL_USD
+                            minimum_requested_notional,
                         ),
                     ));
                     Some(SignedSmokePlanReport {
@@ -3538,6 +3561,8 @@ pub async fn execute_signed_preflight(
                         reference_price: plan.reference_price,
                         limit_price: plan.limit_price,
                         size: plan.size,
+                        effective_notional_usd: effective_notional,
+                        minimum_requested_notional_usd: minimum_requested_notional,
                         sz_decimals: plan.sz_decimals,
                         execution_mode: options.execution_mode,
                         tif: tif_for_execution_mode(options.execution_mode),
@@ -3588,6 +3613,12 @@ pub async fn execute_signed_preflight(
                     ));
                     let effective_notional =
                         effective_order_notional_usd(plan.limit_price, plan.size);
+                    let minimum_requested_notional = minimum_requested_notional_for_effective_min(
+                        plan.limit_price,
+                        plan.reference_price,
+                        plan.sz_decimals,
+                        HYPERLIQUID_MIN_ORDER_NOTIONAL_USD,
+                    );
                     checks.push(SignedPreflightCheck::blocker(
                         "exchange_min_order_notional_effective",
                         effective_exchange_min_order_notional_ok(
@@ -3595,10 +3626,9 @@ pub async fn execute_signed_preflight(
                             plan.size,
                             close_gate,
                         ),
-                        format!(
-                            "planned order value after precision rounding is {:.6} USD; opening orders must be at least {} USD",
+                        exchange_min_effective_detail(
                             effective_notional,
-                            HYPERLIQUID_MIN_ORDER_NOTIONAL_USD
+                            minimum_requested_notional,
                         ),
                     ));
                     Some(SignedSmokePlanReport {
@@ -3609,6 +3639,8 @@ pub async fn execute_signed_preflight(
                         reference_price: plan.reference_price,
                         limit_price: plan.limit_price,
                         size: plan.size,
+                        effective_notional_usd: effective_notional,
+                        minimum_requested_notional_usd: minimum_requested_notional,
                         sz_decimals: plan.sz_decimals,
                         execution_mode: options.execution_mode,
                         tif: tif_for_execution_mode(options.execution_mode),
@@ -6502,6 +6534,33 @@ pub fn effective_order_notional_usd(limit_price: f64, size: f64) -> f64 {
     limit_price.abs() * size.abs()
 }
 
+pub fn minimum_requested_notional_for_effective_min(
+    limit_price: f64,
+    reference_price: f64,
+    sz_decimals: u32,
+    min_effective_notional_usd: f64,
+) -> Option<f64> {
+    if !limit_price.is_finite()
+        || !reference_price.is_finite()
+        || !min_effective_notional_usd.is_finite()
+        || limit_price == 0.0
+        || reference_price == 0.0
+        || min_effective_notional_usd <= 0.0
+    {
+        return None;
+    }
+    let scale = 10_f64.powi(sz_decimals.try_into().ok()?);
+    if !scale.is_finite() || scale <= 0.0 {
+        return None;
+    }
+    let step = 1.0 / scale;
+    let required_size = ((min_effective_notional_usd / limit_price.abs()) / step).ceil() * step;
+    if !required_size.is_finite() || required_size <= 0.0 {
+        return None;
+    }
+    Some(required_size * reference_price.abs() + 0.000_001)
+}
+
 pub fn effective_exchange_min_order_notional_ok(
     limit_price: f64,
     size: f64,
@@ -6518,6 +6577,24 @@ pub fn validate_exchange_min_order_notional(notional_usd: f64, reduce_only: bool
         HYPERLIQUID_MIN_ORDER_NOTIONAL_USD
     );
     Ok(())
+}
+
+pub fn exchange_min_effective_detail(
+    effective_notional: f64,
+    minimum_requested_notional: Option<f64>,
+) -> String {
+    let base = format!(
+        "planned order value after precision rounding is {:.6} USD; opening orders must be at least {} USD",
+        effective_notional, HYPERLIQUID_MIN_ORDER_NOTIONAL_USD
+    );
+    if let Some(minimum_requested_notional) = minimum_requested_notional {
+        format!(
+            "{base}; request at least {:.6} USD for the current price and size precision",
+            minimum_requested_notional
+        )
+    } else {
+        base
+    }
 }
 
 fn is_spot_dex(dex: &str) -> bool {
@@ -7655,18 +7732,22 @@ mod tests {
         domain::{ApprovedOrder, ExecutionMode, ExecutionPolicy, OrderSide, WorkerReport, now_ms},
         hyperliquid::{
             ClearinghouseState, DexAssetContext, DexAssetMeta, DexMeta, SpotClearinghouseState,
-            XyzMarketSnapshot,
+            XyzMarketSnapshot, round_size_down,
         },
         trading::{
-            AccountExecutor, AccountFundingBatchReport, MainnetSmokePlanOptions, ManualMarginMode,
-            OrderStatusLookup, PerpFundingLayerReport, ProtectiveExitLeg, ProtectiveExitOptions,
-            ProtectiveExitPlanResult, SignedLiveWindowOptions, SignedPreflightCheck,
-            SignedSmokeOptions, SpotFundingLayerReport, UsdcDexTransferBatchPreflightResult,
+            AccountExecutor, AccountFundingBatchReport, HYPERLIQUID_MIN_ORDER_NOTIONAL_USD,
+            MainnetSmokePlanOptions, ManualMarginMode, OrderStatusLookup, PerpFundingLayerReport,
+            ProtectiveExitLeg, ProtectiveExitOptions, ProtectiveExitPlanResult,
+            SignedLiveWindowOptions, SignedPreflightCheck, SignedSmokeOptions,
+            SpotFundingLayerReport, UsdcDexTransferBatchPreflightResult,
             UsdcDexTransferLiveWindowOptions, UsdcDexTransferOptions, account_funding_account_ids,
             account_funding_report_next_actions, account_funding_report_summary,
             account_has_opening_collateral, asset_supports_cross_margin, build_mainnet_smoke_plan,
-            build_signed_order_plan, ensure_live_account_address, evaluate_protective_exit_trigger,
+            build_signed_order_plan, effective_exchange_min_order_notional_ok,
+            effective_order_notional_usd, ensure_live_account_address,
+            evaluate_protective_exit_trigger, exchange_min_effective_detail,
             failed_preflight_blockers, mainnet_smoke_plan_next_actions,
+            minimum_requested_notional_for_effective_min,
             normalized_transfer_destination_account_id, order_status_lookup,
             parse_manual_margin_mode, preflight_next_actions, preflight_readiness_summary,
             prepare_signed_live_window, prepare_usdc_dex_transfer_live_window,
@@ -8032,6 +8113,44 @@ mod tests {
             actions
                 .iter()
                 .any(|action| action.contains("at least 10 USD"))
+        );
+    }
+
+    #[test]
+    fn effective_min_notional_recommends_request_above_precision_floor() {
+        let reference_price = 28_829.0;
+        let limit_price = 28_887.0;
+        let sz_decimals = 4;
+        let requested_notional = 10.0;
+        let rounded_size = round_size_down(requested_notional / reference_price, sz_decimals);
+        let effective_notional = effective_order_notional_usd(limit_price, rounded_size);
+
+        assert_eq!(rounded_size, 0.0003);
+        assert!(!effective_exchange_min_order_notional_ok(
+            limit_price,
+            rounded_size,
+            false
+        ));
+        assert!((effective_notional - 8.6661).abs() < 0.000_001);
+
+        let recommended = minimum_requested_notional_for_effective_min(
+            limit_price,
+            reference_price,
+            sz_decimals,
+            HYPERLIQUID_MIN_ORDER_NOTIONAL_USD,
+        )
+        .expect("current market precision should produce a recommendation");
+        assert!(recommended > 11.53 && recommended < 11.54);
+
+        let next_size = round_size_down(12.0 / reference_price, sz_decimals);
+        assert!(effective_exchange_min_order_notional_ok(
+            limit_price,
+            next_size,
+            false
+        ));
+        assert!(
+            exchange_min_effective_detail(effective_notional, Some(recommended))
+                .contains("request at least 11.531601 USD")
         );
     }
 

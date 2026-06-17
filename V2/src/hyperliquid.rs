@@ -1045,6 +1045,45 @@ pub async fn fetch_user_fills(
         .collect())
 }
 
+pub async fn fetch_user_fills_by_time(
+    environment: &str,
+    dex: &str,
+    user_address: &str,
+    start_time_ms: u64,
+    end_time_ms: Option<u64>,
+) -> Result<Vec<UserFill>> {
+    let info_url = effective_info_url(environment)?;
+    let client = info_client()?;
+    let canonical_dex = dex.trim().to_ascii_lowercase();
+    let query_dex = if canonical_dex == "spot" {
+        String::new()
+    } else {
+        canonical_dex.clone()
+    };
+    let canonical_prefix = if query_dex.is_empty() {
+        None
+    } else {
+        Some(format!("{query_dex}:"))
+    };
+    let mut payload = info_payload_with_optional_dex("userFillsByTime", user_address, &query_dex);
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("startTime".to_string(), serde_json::json!(start_time_ms));
+        if let Some(end_time_ms) = end_time_ms {
+            object.insert("endTime".to_string(), serde_json::json!(end_time_ms));
+        }
+    }
+    let fills: Vec<UserFill> = post_info(&client, info_url, payload).await?;
+    Ok(fills
+        .into_iter()
+        .filter(|fill| {
+            canonical_prefix
+                .as_deref()
+                .map(|prefix| fill.coin.starts_with(prefix))
+                .unwrap_or(true)
+        })
+        .collect())
+}
+
 pub async fn fetch_user_rate_limit(environment: &str, user_address: &str) -> Result<UserRateLimit> {
     let key = user_rate_limit_cache_key(environment, user_address);
     if let Ok(cache) = USER_RATE_LIMIT_CACHE.lock()

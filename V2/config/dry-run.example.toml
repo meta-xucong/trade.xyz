@@ -25,25 +25,22 @@ allow_env_fallback = false
 audit_log_path = "logs/audit.jsonl"
 protective_rules_path = "logs/protective_rules.json"
 
-[risk.global]
-kill_switch = false
-allow_reduce_only_when_killed = true
-
 [[accounts]]
 account_id = "addr_a"
-address = "0x0000000000000000000000000000000000000001"
+address = "0xc583342d0dc3ed2d34c0a0e3fff57aa125d5572f"
 secret_id = "addr_a_api_wallet"
 api_wallet_env = "HL_API_WALLET_PRIVATE_KEY_ADDR_A"
 transfer_secret_id = "addr_a_evm_wallet"
 transfer_wallet_env = "HL_EVM_TRANSFER_PRIVATE_KEY_ADDR_A"
 enabled = true
 worker_enabled = true
-copy_ratio = 0.10
+copy_ratio = 0.1
 max_order_notional_usd = 100.0
+blocked_markets = []
 
 [[accounts]]
 account_id = "addr_b"
-address = "0x0000000000000000000000000000000000000002"
+address = "0x2d48559c8155a73782ddcd0694a3c15495b94f99"
 secret_id = "addr_b_api_wallet"
 api_wallet_env = "HL_API_WALLET_PRIVATE_KEY_ADDR_B"
 transfer_secret_id = "addr_b_evm_wallet"
@@ -52,6 +49,7 @@ enabled = true
 worker_enabled = true
 copy_ratio = 0.05
 max_order_notional_usd = 100.0
+blocked_markets = []
 
 [manual_ops]
 enabled = true
@@ -67,3 +65,7 @@ blocked_symbols = []
 manual_blocked_symbols = []
 fib_blocked_symbols = []
 copy_blocked_symbols = []
+
+[risk.global]
+kill_switch = false
+allow_reduce_only_when_killed = true

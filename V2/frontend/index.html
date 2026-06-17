@@ -689,7 +689,8 @@
       }
 
       input,
-      select {
+      select,
+      textarea {
         width: 100%;
         min-height: 38px;
         border: 1px solid var(--line);
@@ -699,8 +700,17 @@
         padding: 0 10px;
       }
 
+      textarea {
+        min-height: 128px;
+        resize: vertical;
+        padding: 10px;
+        line-height: 1.45;
+        font-family: inherit;
+      }
+
       input:disabled,
-      select:disabled {
+      select:disabled,
+      textarea:disabled {
         cursor: not-allowed;
         opacity: 0.62;
         color: var(--muted);
@@ -709,7 +719,8 @@
       }
 
       input:focus,
-      select:focus {
+      select:focus,
+      textarea:focus {
         outline: 1px solid var(--cyan);
         border-color: var(--cyan);
       }
@@ -1460,6 +1471,196 @@
       .fib-instance-kv strong {
         font-size: 13px;
         font-weight: 600;
+      }
+
+      .copy-overview-card {
+        display: grid;
+        gap: 12px;
+      }
+
+      .copy-overview-top {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 10px;
+      }
+
+      .copy-overview-title {
+        display: grid;
+        gap: 4px;
+        min-width: 0;
+      }
+
+      .copy-overview-title strong {
+        font-size: 14px;
+      }
+
+      .copy-overview-title span {
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.35;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: normal;
+      }
+
+      .copy-metric-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 8px;
+      }
+
+      .copy-metric {
+        display: grid;
+        gap: 4px;
+        min-width: 0;
+        padding: 10px;
+        border: 1px solid rgba(255,255,255,0.06);
+        border-radius: 8px;
+        background: rgba(255,255,255,0.025);
+      }
+
+      .copy-metric span {
+        color: var(--muted);
+        font-size: 11px;
+        font-weight: 700;
+        text-transform: uppercase;
+      }
+
+      .copy-metric strong {
+        font-size: 15px;
+        font-weight: 700;
+        word-break: break-word;
+      }
+
+      .copy-metric small {
+        color: var(--muted);
+        font-size: 11px;
+        line-height: 1.35;
+      }
+
+      .copy-pnl-positive {
+        color: #9de5bd;
+      }
+
+      .copy-pnl-negative {
+        color: #ffd0d0;
+      }
+
+      .copy-pnl-flat {
+        color: var(--text);
+      }
+
+      .copy-address-list {
+        display: flex;
+        gap: 6px;
+        flex-wrap: wrap;
+        min-width: 0;
+      }
+
+      .copy-address-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        max-width: 100%;
+        min-height: 26px;
+        padding: 0 8px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        background: rgba(0,0,0,0.16);
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .copy-address-chip strong,
+      .copy-address-chip span {
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .copy-address-chip strong {
+        color: var(--text);
+        font-weight: 650;
+      }
+
+      .copy-advanced-details {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: rgba(0,0,0,0.12);
+        overflow: hidden;
+      }
+
+      .copy-advanced-details > summary {
+        min-height: 40px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        padding: 9px 10px;
+        color: var(--muted);
+        cursor: pointer;
+        list-style: none;
+      }
+
+      .copy-advanced-details > summary::-webkit-details-marker {
+        display: none;
+      }
+
+      .copy-advanced-details[open] .fib-instance-chevron {
+        transform: rotate(90deg);
+      }
+
+      .copy-advanced-body {
+        display: grid;
+        gap: 10px;
+        padding: 0 10px 10px;
+      }
+
+      .copy-account-row,
+      .copy-position-row {
+        display: grid;
+        grid-template-columns: minmax(0, 1.2fr) repeat(3, minmax(68px, 0.7fr));
+        gap: 8px;
+        align-items: stretch;
+      }
+
+      .copy-account-cell,
+      .copy-position-cell {
+        min-width: 0;
+        display: grid;
+        gap: 2px;
+        padding: 7px 8px;
+        border: 1px solid rgba(255,255,255,0.06);
+        border-radius: 7px;
+        background: rgba(255,255,255,0.025);
+      }
+
+      .copy-account-cell span,
+      .copy-position-cell span {
+        color: var(--muted);
+        font-size: 11px;
+      }
+
+      .copy-account-cell strong,
+      .copy-position-cell strong {
+        min-width: 0;
+        font-size: 12px;
+        font-weight: 650;
+        overflow-wrap: anywhere;
+      }
+
+      @media (max-width: 520px) {
+        .copy-overview-top {
+          display: grid;
+        }
+
+        .copy-metric-grid,
+        .copy-account-row,
+        .copy-position-row {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
       }
 
       .fib-instance-section-title {
@@ -2765,25 +2966,24 @@
           </div>
           <div class="grid workspace-grid">
             <form class="panel" id="copyForm">
-              <div class="panel-head"><h3 data-i18n="copy.preview_head">Leader Event Preview</h3><span class="pill" data-i18n="copy.fanout">fan-out</span></div>
+              <div class="panel-head"><h3 data-i18n="copy.settings_title">Copy Settings</h3><span class="pill" data-i18n="copy.auto_mode">auto</span></div>
               <div class="panel-body form-grid">
-                <div class="field">
-                  <label for="copyLeaderId" data-i18n="copy.leader_id">Leader ID</label>
-                  <input id="copyLeaderId" value="leader_a" />
+                <div class="field wide">
+                  <label for="copyLeaderAccounts" data-i18n="copy.leader_accounts">Target copy accounts</label>
+                  <textarea id="copyLeaderAccounts" spellcheck="false" data-i18n-placeholder="copy.leader_accounts_placeholder" placeholder="0xabc..., 0xdef..."></textarea>
+                  <div class="quote-meta" data-i18n="copy.leader_accounts_help">Paste one or more wallet addresses. Use a new line, comma, or space to separate them.</div>
                 </div>
-                <div class="field">
-                  <label for="copyAddress" data-i18n="copy.leader_address">Leader Address</label>
-                  <input id="copyAddress" value="0xabc" />
-                </div>
-                <div class="field">
+                <input id="copyLeaderId" type="hidden" value="leader_a" />
+                <input id="copyAddress" type="hidden" value="0xabc" />
+                <input id="copyCoin" type="hidden" value="xyz:XYZ100" />
+                <input id="copyLeaderNotional" type="hidden" value="100" />
+                <input id="copyLeverage" type="hidden" value="5" />
+                <input id="copyReduce" type="checkbox" class="hidden" />
+                <div class="field copy-advanced hidden">
                   <label for="copyMarket" data-i18n="manual.market">Market</label>
                   <select id="copyMarket"></select>
                 </div>
-                <div class="field">
-                  <label for="copyCoin" data-i18n="table.coin">Coin</label>
-                  <input id="copyCoin" value="xyz:XYZ100" />
-                </div>
-                <div class="field">
+                <div class="field copy-advanced hidden">
                   <label for="copySide" data-i18n="manual.side">Side</label>
                   <select id="copySide">
                     <option value="buy" data-i18n="common.buy">Buy</option>
@@ -2791,23 +2991,17 @@
                   </select>
                 </div>
                 <div class="field">
-                  <label for="copyLeaderNotional" data-i18n="copy.leader_notional">Leader Notional</label>
-                  <input id="copyLeaderNotional" type="number" value="100" min="1" />
-                </div>
-                <div class="field">
                   <label for="copyRatio" data-i18n="copy.copy_ratio">Copy Ratio</label>
                   <input id="copyRatio" type="number" value="0.1" min="0" step="0.01" />
+                  <div class="quote-meta" data-i18n="copy.copy_ratio_help">Example: 0.1 means copy one tenth of the target account's position change.</div>
                 </div>
                 <div class="field">
-                  <label for="copyMax" data-i18n="copy.max_signal">Max Signal Notional</label>
-                  <input id="copyMax" type="number" value="20" min="1" />
-                </div>
-                <div class="field">
-                  <label data-i18n="manual.reduce_only">Reduce Only</label>
-                  <div class="check-row"><input id="copyReduce" type="checkbox" /><span data-i18n="copy.mirror_close">Mirror close</span></div>
+                  <label for="copyPrincipalCap" data-i18n="copy.principal_cap">Principal Cap / Pair</label>
+                  <input id="copyPrincipalCap" type="number" value="10" min="0.01" step="0.01" />
+                  <div class="quote-meta" data-i18n="copy.principal_cap_help">Actual principal cap per trading pair. The program handles leverage and exchange minimums automatically.</div>
                 </div>
                 <div class="footer-actions wide">
-                  <button class="action-button action-primary" type="submit"><i data-lucide="radar"></i><span data-i18n="copy.preview">Preview Copy</span></button>
+                  <button class="action-button action-primary" type="submit"><i data-lucide="save"></i><span data-i18n="copy.save_settings">Save Settings</span></button>
                 </div>
                 <div class="form-section copy-advanced hidden"><span data-i18n="manual.section.advanced">Advanced Settings</span></div>
                 <div class="field wide copy-advanced hidden">
@@ -2821,8 +3015,35 @@
               </div>
             </form>
             <div class="panel">
-              <div class="panel-head"><h3 data-i18n="copy.result">Copy Result</h3></div>
-              <div class="panel-body"><pre class="result tall" id="copyResult"></pre></div>
+              <div class="panel-head"><h3 data-i18n="copy.result">Copy Result</h3><span class="pill mono" id="copySummarySnapshotTime">--:--:--</span></div>
+              <div class="panel-body">
+                <div id="copySummary" class="fib-instance-list"></div>
+                <pre class="result hidden" id="copyResult"></pre>
+              </div>
+            </div>
+            <div class="panel fib-history-panel">
+              <div class="panel-head">
+                <h3 data-i18n="copy.live_soak_title">Live Copy Soak</h3>
+                <span class="pill mono" id="copyLiveSoakSnapshotTime">--:--:--</span>
+              </div>
+              <div class="panel-body">
+                <div class="footer-actions compact">
+                  <button class="action-button" type="button" id="copyLiveSoakRefreshAction"><i data-lucide="refresh-cw"></i><span data-i18n="common.refresh">Refresh</span></button>
+                </div>
+                <div id="copyLiveSoakStatus" class="fib-instance-list fib-history-list" tabindex="0"></div>
+              </div>
+            </div>
+            <div class="panel fib-history-panel">
+              <div class="panel-head">
+                <h3 data-i18n="copy.shadow_history_title">Shadow Copy History</h3>
+                <span class="pill mono" id="copyShadowHistorySnapshotTime">--:--:--</span>
+              </div>
+              <div class="panel-body">
+                <div class="footer-actions compact">
+                  <button class="action-button" type="button" id="copyShadowHistoryRefreshAction"><i data-lucide="refresh-cw"></i><span data-i18n="common.refresh">Refresh</span></button>
+                </div>
+                <div id="copyShadowHistory" class="fib-instance-list fib-history-list" tabindex="0"></div>
+              </div>
             </div>
           </div>
         </section>
@@ -2942,7 +3163,7 @@
       const QUOTE_WS_RETRY_MS = 1500;
       const DASHBOARD_SNAPSHOT_REFRESH_MS = 20000;
       const DASHBOARD_TPSL_RULES_CACHE_MS = 30000;
-      const UI_REVISION = "ui-2026-06-07-manual-submit-gate";
+      const UI_REVISION = "ui-2026-06-17-copy-overview-card";
       const MIN_OPENING_NOTIONAL_USD = 10;
       const FIB_MIN_PER_LEVEL_NOTIONAL_USD = 11;
       const SPOT_DASHBOARD_QUOTE_CACHE_MS = 5000;
@@ -3011,6 +3232,10 @@
         fibLastDetection: null,
         fibInstances: [],
         fibHistory: [],
+        copyShadowHistory: [],
+        copyLiveSoakStatus: null,
+        copySummary: null,
+        copySummaryAdvancedOpen: false,
         fibEditingStrategyId: "",
         fibEditingOrigin: "new",
         lastAutoSecretId: "",
@@ -3611,16 +3836,78 @@
           "fib.ai_generate": "Generate Proposal",
           "fib.ai_note": "AI advanced mode only produces suggestions in this release. It cannot submit live orders.",
           "copy.title": "Smart Money Copy",
+          "copy.settings_title": "Copy Settings",
+          "copy.auto_mode": "auto",
           "copy.preview_head": "Leader Event Preview",
           "copy.fanout": "fan-out",
+          "copy.leader_accounts": "Target copy accounts",
+          "copy.leader_accounts_placeholder": "Paste wallet addresses, one per line",
+          "copy.leader_accounts_help": "Paste one or more wallet addresses. Use a new line, comma, or space to separate them.",
           "copy.leader_id": "Leader ID",
           "copy.leader_address": "Leader Address",
           "copy.leader_notional": "Leader Notional",
           "copy.copy_ratio": "Copy Ratio",
-          "copy.max_signal": "Max Signal Notional",
+          "copy.copy_ratio_help": "Example: 0.1 means copy one tenth of the target account's position change.",
+          "copy.principal_cap": "Principal Cap / Pair",
+          "copy.principal_cap_help": "Actual principal cap per trading pair. The program handles leverage and exchange minimums automatically.",
+          "copy.leverage": "Leverage",
           "copy.mirror_close": "Mirror close",
           "copy.preview": "Preview Copy",
+          "copy.save_settings": "Save Settings",
           "copy.result": "Copy Result",
+          "copy.summary_empty": "No copy signals yet.",
+          "copy.summary_status": "Status",
+          "copy.summary_leaders": "Target Accounts",
+          "copy.summary_trades": "Copy Signals",
+          "copy.summary_submitted": "Submitted Orders",
+          "copy.summary_notional": "Copied Notional",
+          "copy.summary_realized_pnl": "Realized PnL",
+          "copy.summary_unrealized_pnl": "Unrealized PnL",
+          "copy.summary_rejected": "Rejected / Deduped",
+          "copy.summary_pnl_note": "PnL",
+          "copy.summary_recent": "Recent signals",
+          "copy.overview_title": "Copy Strategy",
+          "copy.overview_subtitle": "{leaders} target(s) · {orders} submitted · {signals} signals",
+          "copy.my_pnl": "My PnL",
+          "copy.target_pnl": "Target PnL",
+          "copy.target_accounts": "Target Accounts",
+          "copy.trade_count": "Trades",
+          "copy.open_positions": "Open Positions",
+          "copy.realized": "Realized",
+          "copy.unrealized": "Unrealized",
+          "copy.fees": "Fees",
+          "copy.notional": "Notional",
+          "copy.position_value": "Position Value",
+          "copy.last_signal": "Last Signal",
+          "copy.advanced_compare": "Advanced: PnL and account detail",
+          "copy.leader_detail": "Target account detail",
+          "copy.position_detail": "Position detail",
+          "copy.no_positions": "No open positions",
+          "copy.no_leaders": "No target accounts found yet",
+          "copy.pnl_report": "PnL Report",
+          "copy.waiting_pnl": "Waiting",
+          "copy.error_requires_leader": "Enter at least one target copy account.",
+          "copy.live_soak_title": "Live Copy Soak",
+          "copy.live_soak_empty": "No background copy soak was detected on this machine.",
+          "copy.live_soak_running": "Running",
+          "copy.live_soak_stopped": "Stopped",
+          "copy.live_soak_run_id": "Run ID",
+          "copy.live_soak_round": "Latest Round",
+          "copy.live_soak_submitted": "Submitted",
+          "copy.live_soak_evidence": "Order Evidence",
+          "copy.live_soak_cleanup_errors": "Cleanup Errors",
+          "copy.live_soak_final_flat": "Final Flat",
+          "copy.live_soak_hold": "Hold After Submit",
+          "copy.live_soak_watcher": "Watcher",
+          "copy.live_soak_message": "Latest Log",
+          "copy.shadow_history_title": "Shadow Copy History",
+          "copy.shadow_history_empty": "No shadow copy history",
+          "copy.shadow_status.would_copy": "Would copy",
+          "copy.shadow_status.rejected": "Rejected",
+          "copy.shadow_status.deduped": "Deduped",
+          "copy.shadow.live_gate": "Live gate",
+          "copy.shadow.risk": "Risk",
+          "copy.shadow.signal": "Signal",
           "vault.title": "Secret Vault",
           "vault.unlock": "Unlock Vault",
           "vault.password": "Password",
@@ -3659,6 +3946,9 @@
           "placeholder.market": "market",
           "placeholder.live": "live",
           "status.loading": "loading",
+          "status.runtime_summary": "Backend {backend} · Manual {manual} · Fib {fib} · Copy {copy}",
+          "status.copy_running": "running",
+          "status.copy_stopped": "stopped",
           "status.dry_run": "dry-run",
           "status.live": "live",
           "status.unlocked": "unlocked",
@@ -4186,16 +4476,78 @@
           "fib.ai_generate": "生成建议",
           "fib.ai_note": "当前版本 AI 进阶版只生成建议，不会提交实盘订单。",
           "copy.title": "聪明钱跟单",
+          "copy.settings_title": "跟单设置",
+          "copy.auto_mode": "自动",
           "copy.preview_head": "领单事件预览",
           "copy.fanout": "广播执行",
+          "copy.leader_accounts": "目标跟单账号",
+          "copy.leader_accounts_placeholder": "粘贴钱包地址，每行一个",
+          "copy.leader_accounts_help": "可以填多个钱包地址，用换行、逗号或空格分隔。",
           "copy.leader_id": "领单 ID",
           "copy.leader_address": "领单地址",
           "copy.leader_notional": "领单名义金额",
           "copy.copy_ratio": "跟单比例",
-          "copy.max_signal": "单信号最大金额",
+          "copy.copy_ratio_help": "例如 0.1 表示按目标账号仓位变化的十分之一跟随。",
+          "copy.principal_cap": "单交易对本金上限",
+          "copy.principal_cap_help": "这里填实际本金金额。杠杆、交易对识别、方向、去重和风控由后台自动完成。",
+          "copy.leverage": "杠杆倍率",
           "copy.mirror_close": "镜像平仓",
           "copy.preview": "预览跟单结果",
+          "copy.save_settings": "保存设置",
           "copy.result": "跟单结果",
+          "copy.summary_empty": "还没有跟单信号。",
+          "copy.summary_status": "运行状态",
+          "copy.summary_leaders": "目标账号数",
+          "copy.summary_trades": "跟单信号数",
+          "copy.summary_submitted": "已提交订单",
+          "copy.summary_notional": "累计跟单金额",
+          "copy.summary_realized_pnl": "已实现盈亏",
+          "copy.summary_unrealized_pnl": "未实现盈亏",
+          "copy.summary_rejected": "拒绝 / 去重",
+          "copy.summary_pnl_note": "盈亏说明",
+          "copy.summary_recent": "最近信号",
+          "copy.overview_title": "跟单策略",
+          "copy.overview_subtitle": "{leaders} 个目标 · {orders} 笔下单 · {signals} 条信号",
+          "copy.my_pnl": "我的盈亏",
+          "copy.target_pnl": "目标盈亏",
+          "copy.target_accounts": "目标账号",
+          "copy.trade_count": "交易次数",
+          "copy.open_positions": "持仓数",
+          "copy.realized": "已实现",
+          "copy.unrealized": "未实现",
+          "copy.fees": "手续费",
+          "copy.notional": "成交额",
+          "copy.position_value": "持仓价值",
+          "copy.last_signal": "最近信号",
+          "copy.advanced_compare": "高级：盈亏和账号明细",
+          "copy.leader_detail": "目标账号明细",
+          "copy.position_detail": "持仓明细",
+          "copy.no_positions": "暂无持仓",
+          "copy.no_leaders": "还没有识别到目标账号",
+          "copy.pnl_report": "盈亏报告",
+          "copy.waiting_pnl": "等待归因",
+          "copy.error_requires_leader": "请至少填写一个目标跟单账号。",
+          "copy.live_soak_title": "跟单实盘长测",
+          "copy.live_soak_empty": "当前机器未检测到后台跟单长测。",
+          "copy.live_soak_running": "运行中",
+          "copy.live_soak_stopped": "已停止",
+          "copy.live_soak_run_id": "运行 ID",
+          "copy.live_soak_round": "最近轮次",
+          "copy.live_soak_submitted": "已提交",
+          "copy.live_soak_evidence": "订单证据",
+          "copy.live_soak_cleanup_errors": "清理异常",
+          "copy.live_soak_final_flat": "最终空仓",
+          "copy.live_soak_hold": "提交后持仓",
+          "copy.live_soak_watcher": "监听状态",
+          "copy.live_soak_message": "最近日志",
+          "copy.shadow_history_title": "跟单 Shadow 历史",
+          "copy.shadow_history_empty": "暂无跟单 shadow 历史",
+          "copy.shadow_status.would_copy": "会跟单",
+          "copy.shadow_status.rejected": "已拒绝",
+          "copy.shadow_status.deduped": "已去重",
+          "copy.shadow.live_gate": "实盘门禁",
+          "copy.shadow.risk": "风控",
+          "copy.shadow.signal": "信号",
           "vault.title": "密钥库",
           "vault.unlock": "解锁密钥库",
           "vault.password": "密码",
@@ -4234,6 +4586,9 @@
           "placeholder.market": "市价",
           "placeholder.live": "实时",
           "status.loading": "加载中",
+          "status.runtime_summary": "后端{backend} · 手动{manual} · Fib{fib} · 跟单{copy}",
+          "status.copy_running": "运行",
+          "status.copy_stopped": "停止",
           "status.dry_run": "演练模式",
           "status.live": "实盘模式",
           "status.unlocked": "已解锁",
@@ -4322,6 +4677,20 @@
         return formatText(base, params);
       }
 
+      function formatDateTime(value) {
+        const timestamp = Number(value);
+        if (!Number.isFinite(timestamp) || timestamp <= 0) return "--";
+        return new Date(timestamp).toLocaleString(state.lang === "zh" ? "zh-CN" : "en-US", {
+          year: "numeric",
+          month: "2-digit",
+          day: "2-digit",
+          hour: "2-digit",
+          minute: "2-digit",
+          second: "2-digit",
+          hour12: false,
+        });
+      }
+
       function applyI18n() {
         document.documentElement.lang = state.lang === "zh" ? "zh-CN" : "en";
         document.querySelectorAll("[data-i18n]").forEach((node) => {
@@ -4351,6 +4720,9 @@
         updateFibBasicUxHints();
         renderDashboardOpenOrders(state.dashboardOpenOrders || []);
         renderFibActiveStrategies();
+        renderCopySummary();
+        renderCopyLiveSoakStatus();
+        updateRuntimeModeSummary();
         renderDashboardVaultStatus();
       }
 
@@ -5913,12 +6285,68 @@
           const fetchedAt = result?.data?.fetched_at_ms;
           const timeEl = $("fibHistorySnapshotTime");
           if (timeEl) {
-            timeEl.textContent = fetchedAt ? new Date(fetchedAt).toLocaleTimeString() : "--:--:--";
+            timeEl.textContent = fetchedAt ? formatDateTime(fetchedAt) : "--:--:--";
           }
           renderFibStrategyHistory();
         } catch (error) {
           if (!silent) {
             const root = $("fibStrategyHistory");
+            if (root) root.innerHTML = `<div class="quote-meta">${escapeHtml(error?.message || String(error))}</div>`;
+          }
+        }
+      }
+
+      async function loadCopyShadowHistory({ silent = true } = {}) {
+        try {
+          const result = await api("/api/copy/shadow/history");
+          const entries = Array.isArray(result?.data?.entries) ? result.data.entries : [];
+          state.copyShadowHistory = entries;
+          const fetchedAt = result?.data?.fetched_at_ms;
+          const timeEl = $("copyShadowHistorySnapshotTime");
+          if (timeEl) {
+            timeEl.textContent = fetchedAt ? formatDateTime(fetchedAt) : "--:--:--";
+          }
+          renderCopyShadowHistory();
+        } catch (error) {
+          if (!silent) {
+            const root = $("copyShadowHistory");
+            if (root) root.innerHTML = `<div class="quote-meta">${escapeHtml(error?.message || String(error))}</div>`;
+          }
+        }
+      }
+
+      async function loadCopyLiveSoakStatus({ silent = true } = {}) {
+        try {
+          const result = await api("/api/copy/live-soak/status");
+          state.copyLiveSoakStatus = result?.data || null;
+          const fetchedAt = state.copyLiveSoakStatus?.fetched_at_ms;
+          const timeEl = $("copyLiveSoakSnapshotTime");
+          if (timeEl) {
+            timeEl.textContent = fetchedAt ? formatDateTime(fetchedAt) : "--:--:--";
+          }
+          renderCopyLiveSoakStatus();
+          updateRuntimeModeSummary();
+        } catch (error) {
+          if (!silent) {
+            const root = $("copyLiveSoakStatus");
+            if (root) root.innerHTML = `<div class="quote-meta">${escapeHtml(error?.message || String(error))}</div>`;
+          }
+        }
+      }
+
+      async function loadCopySummary({ silent = true } = {}) {
+        try {
+          const result = await api("/api/copy/summary");
+          state.copySummary = result?.data || null;
+          const fetchedAt = state.copySummary?.fetched_at_ms;
+          const timeEl = $("copySummarySnapshotTime");
+          if (timeEl) {
+            timeEl.textContent = fetchedAt ? formatDateTime(fetchedAt) : "--:--:--";
+          }
+          renderCopySummary();
+        } catch (error) {
+          if (!silent) {
+            const root = $("copySummary");
             if (root) root.innerHTML = `<div class="quote-meta">${escapeHtml(error?.message || String(error))}</div>`;
           }
         }
@@ -6198,6 +6626,7 @@
           ? t("fib.mode.current_live")
           : t("fib.mode.current_dry_run");
         updateFibSniperActionVisual();
+        updateRuntimeModeSummary();
       }
 
       function setFibRunMode(mode) {
@@ -6933,6 +7362,7 @@
         if (state.activeView === "fib") {
           ensureFibQuoteSocket();
           subscribeFibQuoteStream();
+          loadFibInstancesForForm({ silent: true, autoLoadActive: false });
           loadFibQuote({ silent: true });
         }
       }
@@ -7072,6 +7502,7 @@
         if (tpslLabel) {
           tpslLabel.textContent = t("manual.action.tpsl_apply_dry");
         }
+        updateRuntimeModeSummary();
       }
 
       function setManualRunMode(mode) {
@@ -8389,9 +8820,27 @@
         renderPositions(state.dashboardPositions || [], { force: true });
       }
 
+      function compactModeLabel(mode) {
+        return mode === "live" ? t("status.live") : t("status.dry_run");
+      }
+
+      function updateRuntimeModeSummary() {
+        const app = state.app || {};
+        const backend = app.dry_run === false ? t("status.live") : t("status.dry_run");
+        const manual = compactModeLabel(state.manualRunMode);
+        const fib = compactModeLabel(state.fibRunMode);
+        const copy = state.copyLiveSoakStatus?.running ? t("status.copy_running") : t("status.copy_stopped");
+        const summary = t("status.runtime_summary", { backend, manual, fib, copy });
+        const node = $("dryRun");
+        if (node) {
+          node.textContent = summary;
+          node.title = summary;
+        }
+      }
+
       function applyRuntimePills(app) {
         setNodeText("env", `${app.environment} / ${app.dex}`);
-        setNodeText("dryRun", app.dry_run ? t("status.dry_run") : t("status.live"));
+        updateRuntimeModeSummary();
         setNodeText("manualBackendModePill", app.dry_run
           ? t("manual.mode.backend_dry_run")
           : t("manual.mode.backend_live"));
@@ -9834,6 +10283,7 @@
           const accountSyncHtml = fibAccountSyncStatusHtml(instance, relatedOrders);
           const protectionHtml = fibProtectionStatusHtml(instance, relatedOrders);
           const planHtml = fibStrategyPlanSummaryHtml(instance);
+          const pnlHtml = fibStrategyPnlHtml(instance);
           const protectionWarningHtml = fibProtectionWarningHtml(instance, relatedOrders);
           const lastMessage = String(instance.last_message || "").trim();
           const strategyId = String(instance.strategy_id || "");
@@ -9874,6 +10324,7 @@
                 <strong><span class="status-badge" data-status="${escapeHtml(insight.tone)}">${escapeHtml(insight.title)}</span></strong>
                 <span>${escapeHtml(insight.detail)}</span>
               </div>
+              ${pnlHtml}
               ${planHtml}
               ${accountSyncHtml}
               ${protectionWarningHtml}
@@ -9945,6 +10396,39 @@
         return message;
       }
 
+      function signedMoney(value) {
+        const n = Number(value);
+        if (!Number.isFinite(n) || Math.abs(n) < 0.005) return money(0);
+        return n > 0 ? `+${money(Math.abs(n))}` : `-${money(Math.abs(n))}`;
+      }
+
+      function fibStrategyPnlHtml(instance) {
+        const summary = instance?.pnl_summary;
+        if (!summary) {
+          return `
+            <div class="strategy-status-note">
+              <strong>${state.lang === "zh" ? "盈亏状态" : "PnL"}</strong>
+              <span>${state.lang === "zh" ? "等待本地历史恢复" : "waiting for local history recovery"}</span>
+            </div>
+          `;
+        }
+        const precise = summary.precise
+          ? (state.lang === "zh" ? "精确归因" : "precise attribution")
+          : (state.lang === "zh" ? "按账户/持仓估算" : "account/position estimate");
+        const updated = summary.updated_at_ms ? formatDateTime(summary.updated_at_ms) : "-";
+        const unrealized = summary.open_unrealized_pnl_usd == null ? "-" : signedMoney(summary.open_unrealized_pnl_usd);
+        return `
+          <div class="fib-instance-kv">
+            <div><span>${state.lang === "zh" ? "累计净盈亏" : "Total Net PnL"}</span><strong>${escapeHtml(signedMoney(summary.total_net_pnl_usd))}</strong></div>
+            <div><span>${state.lang === "zh" ? "上一轮净盈亏" : "Last Cycle Net"}</span><strong>${escapeHtml(signedMoney(summary.last_cycle_net_pnl_usd))}</strong></div>
+            <div><span>${state.lang === "zh" ? "未实现盈亏" : "Unrealized"}</span><strong>${escapeHtml(unrealized)}</strong></div>
+            <div><span>${state.lang === "zh" ? "成交数" : "Fills"}</span><strong>${escapeHtml(number(summary.total_fill_count || 0, 0))}</strong></div>
+            <div><span>${state.lang === "zh" ? "归因" : "Attribution"}</span><strong>${escapeHtml(precise)}</strong></div>
+            <div><span>${state.lang === "zh" ? "更新时间" : "Updated"}</span><strong>${escapeHtml(updated)}</strong></div>
+          </div>
+        `;
+      }
+
       function renderFibStrategyHistory({ force = false } = {}) {
         const root = $("fibStrategyHistory");
         if (!root) return;
@@ -9969,7 +10453,7 @@
           const recovered = entry?.recovered_from_audit
             ? `<span class="pill">${t("fib.history_recovered")}</span>`
             : `<span class="pill">${t("fib.history_current")}</span>`;
-          const occurred = entry?.occurred_at_ms ? new Date(entry.occurred_at_ms).toLocaleString() : "-";
+          const occurred = entry?.occurred_at_ms ? formatDateTime(entry.occurred_at_ms) : "-";
           return `
             <div class="fib-instance-card">
               <div class="fib-instance-top">
@@ -9986,6 +10470,373 @@
               </div>
               <div class="order-meta-line">${recovered}</div>
               <div class="order-meta-line">${escapeHtml(fibHistoryMessage(entry))}</div>
+            </div>
+          `;
+        }).join("");
+        root.scrollTop = previousScrollTop;
+      }
+
+      function copyShadowStatusText(status) {
+        const key = `copy.shadow_status.${String(status || "").toLowerCase()}`;
+        return t(key) === key ? (status || "-") : t(key);
+      }
+
+      function parseCopyLeaderAccounts(raw) {
+        const seen = new Set();
+        return String(raw || "")
+          .split(/[\s,;，；]+/)
+          .map((value) => value.trim())
+          .filter(Boolean)
+          .filter((value) => {
+            const key = value.toLowerCase();
+            if (seen.has(key)) return false;
+            seen.add(key);
+            return true;
+          });
+      }
+
+      function loadCopySimpleSettings() {
+        try {
+          const saved = JSON.parse(localStorage.getItem("trade_xyz_copy_simple_settings") || "{}");
+          if (saved && typeof saved === "object") {
+            if (Array.isArray(saved.leaders)) {
+              $("copyLeaderAccounts").value = saved.leaders.join("\n");
+            }
+            if (Number.isFinite(Number(saved.copy_ratio))) {
+              $("copyRatio").value = String(saved.copy_ratio);
+            }
+            if (Number.isFinite(Number(saved.principal_cap_usd))) {
+              $("copyPrincipalCap").value = String(saved.principal_cap_usd);
+            }
+          }
+        } catch {
+          // Ignore malformed local settings; the visible defaults remain usable.
+        }
+      }
+
+      function saveCopySimpleSettings(leaders, ratio, cap) {
+        localStorage.setItem("trade_xyz_copy_simple_settings", JSON.stringify({
+          leaders,
+          copy_ratio: ratio,
+          principal_cap_usd: cap,
+          saved_at_ms: Date.now(),
+        }));
+      }
+
+      function renderCopyConfigPreview() {
+        const root = $("copyResult");
+        if (!root) return;
+        const leaders = parseCopyLeaderAccounts($("copyLeaderAccounts")?.value || "");
+        const ratio = Number($("copyRatio")?.value);
+        const cap = Number($("copyPrincipalCap")?.value);
+        const ok = leaders.length > 0 && Number.isFinite(ratio) && ratio > 0 && Number.isFinite(cap) && cap > 0;
+        root.classList.toggle("hidden", !ok);
+        if (!ok) {
+          root.textContent = "";
+          return;
+        }
+        root.textContent = state.lang === "zh"
+          ? `已识别 ${leaders.length} 个目标账号。系统将按 ${number(ratio, 4)} 倍比例跟随，每个交易对最多使用 ${money(cap)} 本金；杠杆、交易对识别、买卖方向、去重和风控由后台自动处理。`
+          : `Detected ${leaders.length} target account(s). The bot will copy at ${number(ratio, 4)}x, cap each pair at ${money(cap)} principal, and handle leverage, symbols, side detection, dedupe, and risk automatically.`;
+      }
+
+      function shortAddress(value) {
+        const text = String(value || "").trim();
+        if (text.length <= 14) return text || "-";
+        return `${text.slice(0, 6)}...${text.slice(-4)}`;
+      }
+
+      function pnlClass(value) {
+        const n = Number(value);
+        if (!Number.isFinite(n) || Math.abs(n) < 0.005) return "copy-pnl-flat";
+        return n > 0 ? "copy-pnl-positive" : "copy-pnl-negative";
+      }
+
+      function nullableMoney(value) {
+        return value == null ? t("copy.waiting_pnl") : signedMoney(value);
+      }
+
+      function copyAccountLabel(account, fallbackIndex = 0) {
+        const id = String(account?.id || "").trim();
+        if (id) return id;
+        const kind = String(account?.kind || "").replace(/^target_/, "").trim();
+        if (kind) return kind;
+        return `${state.lang === "zh" ? "目标" : "Target"} ${fallbackIndex + 1}`;
+      }
+
+      function copyMetricHtml(label, value, subtext = "", toneValue = null) {
+        const cls = toneValue == null ? "" : ` class="${escapeHtml(pnlClass(toneValue))}"`;
+        return `
+          <div class="copy-metric">
+            <span>${escapeHtml(label)}</span>
+            <strong${cls}>${escapeHtml(value)}</strong>
+            ${subtext ? `<small>${escapeHtml(subtext)}</small>` : ""}
+          </div>
+        `;
+      }
+
+      function copyAccountRowsHtml(accounts) {
+        if (!accounts.length) {
+          return `<div class="quote-meta">${t("copy.no_leaders")}</div>`;
+        }
+        return accounts.map((account, index) => {
+          const total = account?.total_pnl_usd ?? (
+            account?.realized_pnl_usd == null && account?.unrealized_pnl_usd == null
+              ? null
+              : Number(account?.realized_pnl_usd || 0) + Number(account?.unrealized_pnl_usd || 0)
+          );
+          const lastSignal = account?.last_signal_at_ms ? formatDateTime(account.last_signal_at_ms) : "-";
+          return `
+            <div class="copy-account-row">
+              <div class="copy-account-cell">
+                <span>${t("copy.target_accounts")}</span>
+                <strong title="${escapeHtml(account?.address || "")}">${escapeHtml(copyAccountLabel(account, index))} · ${escapeHtml(shortAddress(account?.address))}</strong>
+              </div>
+              <div class="copy-account-cell">
+                <span>${t("copy.target_pnl")}</span>
+                <strong class="${escapeHtml(pnlClass(total))}">${escapeHtml(nullableMoney(total))}</strong>
+              </div>
+              <div class="copy-account-cell">
+                <span>${t("copy.trade_count")}</span>
+                <strong>${escapeHtml(number(account?.fill_count || 0, 0))}</strong>
+              </div>
+              <div class="copy-account-cell">
+                <span>${t("copy.last_signal")}</span>
+                <strong>${escapeHtml(lastSignal)}</strong>
+              </div>
+            </div>
+          `;
+        }).join("");
+      }
+
+      function copyPositionsHtml(accounts) {
+        const positions = [];
+        accounts.forEach((account, accountIndex) => {
+          (Array.isArray(account?.positions) ? account.positions : []).forEach((position) => {
+            positions.push({ account, accountIndex, position });
+          });
+        });
+        if (!positions.length) {
+          return `<div class="quote-meta">${t("copy.no_positions")}</div>`;
+        }
+        return positions.map(({ account, accountIndex, position }) => `
+          <div class="copy-position-row">
+            <div class="copy-position-cell">
+              <span>${t("copy.target_accounts")}</span>
+              <strong>${escapeHtml(copyAccountLabel(account, accountIndex))}</strong>
+            </div>
+            <div class="copy-position-cell">
+              <span>${t("table.coin")}</span>
+              <strong class="mono">${escapeHtml(coinDisplayPair(position?.coin) || position?.coin || "-")}</strong>
+            </div>
+            <div class="copy-position-cell">
+              <span>${t("copy.position_value")}</span>
+              <strong>${escapeHtml(position?.position_value_usd == null ? "-" : money(position.position_value_usd))}</strong>
+            </div>
+            <div class="copy-position-cell">
+              <span>${t("copy.unrealized")}</span>
+              <strong class="${escapeHtml(pnlClass(position?.unrealized_pnl_usd))}">${escapeHtml(position?.unrealized_pnl_usd == null ? "-" : signedMoney(position.unrealized_pnl_usd))}</strong>
+            </div>
+          </div>
+        `).join("");
+      }
+
+      function renderCopySummary() {
+        const root = $("copySummary");
+        if (!root) return;
+        const summary = state.copySummary || {};
+        const existingAdvanced = root.querySelector(".copy-advanced-details");
+        if (existingAdvanced) {
+          state.copySummaryAdvancedOpen = existingAdvanced.open;
+        }
+        const local = summary.local_summary || {};
+        const myTotal = local.total_pnl_usd ?? (
+          summary.realized_pnl_usd == null && summary.unrealized_pnl_usd == null
+            ? null
+            : Number(summary.realized_pnl_usd || 0) + Number(summary.unrealized_pnl_usd || 0)
+        );
+        const myRealized = local.realized_pnl_usd ?? summary.realized_pnl_usd;
+        const myUnrealized = local.unrealized_pnl_usd ?? summary.unrealized_pnl_usd;
+        const myFees = local.fees_usd ?? summary.total_fees_usd;
+        const targetTotal = summary.target_total_pnl_usd;
+        const targetRealized = summary.target_realized_pnl_usd;
+        const targetUnrealized = summary.target_unrealized_pnl_usd;
+        const runningText = summary.live_running
+          ? t("copy.live_soak_running")
+          : t("copy.live_soak_stopped");
+        const tone = summary.live_running ? "live" : "waiting";
+        const leaders = Array.isArray(summary.leader_summaries) ? summary.leader_summaries : [];
+        const addressFallback = Array.isArray(summary.leader_addresses) ? summary.leader_addresses : [];
+        const addressHtml = leaders.length
+          ? leaders.slice(0, 8).map((account, index) => `
+              <span class="copy-address-chip" title="${escapeHtml(account?.address || "")}">
+                <strong>${escapeHtml(copyAccountLabel(account, index))}</strong>
+                <span class="mono">${escapeHtml(shortAddress(account?.address))}</span>
+              </span>
+            `).join("")
+          : addressFallback.slice(0, 8).map((address) => `
+              <span class="copy-address-chip" title="${escapeHtml(address)}"><span class="mono">${escapeHtml(shortAddress(address))}</span></span>
+            `).join("");
+        const latestEntries = Array.isArray(summary.latest_entries) ? summary.latest_entries : [];
+        const latestHtml = latestEntries.length === 0
+          ? `<div class="quote-meta">${t("copy.summary_empty")}</div>`
+          : latestEntries.slice(0, 5).map((entry) => {
+            const notional = Number.isFinite(Number(entry?.notional_usd)) ? money(Number(entry.notional_usd)) : "-";
+            const occurred = entry?.occurred_at_ms ? formatDateTime(entry.occurred_at_ms) : "-";
+            return `
+              <div class="order-meta-line">
+                <span class="status-badge" data-status="${escapeHtml(String(entry?.status || "").toLowerCase())}">${escapeHtml(copyShadowStatusText(entry?.status))}</span>
+                <span class="mono">${escapeHtml(coinDisplayPair(entry?.coin) || entry?.coin || "-")}</span>
+                <strong>${escapeHtml(notional)}</strong>
+                <span>${escapeHtml(occurred)}</span>
+              </div>
+            `;
+          }).join("");
+        const subtitle = t("copy.overview_subtitle", {
+          leaders: number(summary.leader_count || 0, 0),
+          orders: number(summary.submitted_reports || 0, 0),
+          signals: number(summary.shadow_signal_count || 0, 0),
+        });
+        const mySub = `${t("copy.realized")} ${myRealized == null ? "-" : signedMoney(myRealized)} · ${t("copy.unrealized")} ${myUnrealized == null ? "-" : signedMoney(myUnrealized)}`;
+        const targetSub = `${t("copy.realized")} ${targetRealized == null ? "-" : signedMoney(targetRealized)} · ${t("copy.unrealized")} ${targetUnrealized == null ? "-" : signedMoney(targetUnrealized)}`;
+        const reportText = summary.pnl_report_path
+          ? `${t("copy.pnl_report")}: ${summary.pnl_report_path}`
+          : (summary.pnl_status || "-");
+        root.innerHTML = `
+          <div class="fib-instance-card copy-overview-card">
+            <div class="copy-overview-top">
+              <div class="copy-overview-title">
+                <strong>${t("copy.overview_title")}</strong>
+                <span>${escapeHtml(subtitle)}${summary.live_round ? ` · ${t("copy.live_soak_round")} ${escapeHtml(number(summary.live_round, 0))}` : ""}</span>
+              </div>
+              <span class="status-badge" data-status="${escapeHtml(tone)}">${escapeHtml(runningText)}</span>
+            </div>
+            <div class="copy-metric-grid">
+              ${copyMetricHtml(t("copy.my_pnl"), nullableMoney(myTotal), mySub, myTotal)}
+              ${copyMetricHtml(t("copy.target_pnl"), nullableMoney(targetTotal), targetSub, targetTotal)}
+              ${copyMetricHtml(t("copy.target_accounts"), number(summary.leader_count || 0, 0), `${t("copy.open_positions")} ${number(summary.target_open_position_count || 0, 0)}`)}
+              ${copyMetricHtml(t("copy.trade_count"), number(summary.submitted_reports || 0, 0), `${t("copy.summary_notional")} ${money(summary.copied_notional_usd || 0)}`)}
+            </div>
+            <div class="copy-address-list">
+              ${addressHtml || `<span class="quote-meta">${t("copy.no_leaders")}</span>`}
+            </div>
+            <details class="copy-advanced-details" ${state.copySummaryAdvancedOpen ? "open" : ""}>
+              <summary>
+                <span>${t("copy.advanced_compare")}</span>
+                <i class="fib-instance-chevron" data-lucide="chevron-right"></i>
+              </summary>
+              <div class="copy-advanced-body">
+                <div class="fib-instance-kv">
+                  <div><span>${t("copy.my_pnl")}</span><strong class="${escapeHtml(pnlClass(myTotal))}">${escapeHtml(nullableMoney(myTotal))}</strong></div>
+                  <div><span>${t("copy.target_pnl")}</span><strong class="${escapeHtml(pnlClass(targetTotal))}">${escapeHtml(nullableMoney(targetTotal))}</strong></div>
+                  <div><span>${t("copy.fees")}</span><strong>${escapeHtml(myFees == null ? "-" : money(myFees))}</strong></div>
+                  <div><span>${t("copy.summary_rejected")}</span><strong>${escapeHtml(number(summary.rejected_count || 0, 0))} / ${escapeHtml(number(summary.deduped_count || 0, 0))}</strong></div>
+                  <div><span>${t("copy.open_positions")}</span><strong>${escapeHtml(number(summary.target_open_position_count || 0, 0))}</strong></div>
+                  <div><span>${t("copy.position_value")}</span><strong>${escapeHtml(summary.target_position_value_usd == null ? "-" : money(summary.target_position_value_usd))}</strong></div>
+                </div>
+                <div class="strategy-status-note">
+                  <strong>${t("copy.summary_pnl_note")}</strong>
+                  <span>${escapeHtml(reportText)}</span>
+                </div>
+                <div class="fib-instance-section-title">${t("copy.leader_detail")}</div>
+                ${copyAccountRowsHtml(leaders)}
+                <div class="fib-instance-section-title">${t("copy.position_detail")}</div>
+                ${copyPositionsHtml(leaders)}
+                <div class="fib-instance-section-title">${t("copy.summary_recent")}</div>
+                ${latestHtml}
+              </div>
+            </details>
+          </div>
+        `;
+        const nextAdvanced = root.querySelector(".copy-advanced-details");
+        if (nextAdvanced) {
+          nextAdvanced.addEventListener("toggle", () => {
+            state.copySummaryAdvancedOpen = nextAdvanced.open;
+          });
+        }
+        if (window.lucide) lucide.createIcons();
+      }
+
+      function renderCopyLiveSoakStatus() {
+        const root = $("copyLiveSoakStatus");
+        if (!root) return;
+        const status = state.copyLiveSoakStatus;
+        if (!status || !status.detected) {
+          root.innerHTML = `<div class="quote-meta">${t("copy.live_soak_empty")}</div>`;
+          return;
+        }
+        const running = Boolean(status.running);
+        const tone = running ? "live" : "waiting";
+        const updatedAt = status.last_updated_at_ms ? formatDateTime(status.last_updated_at_ms) : "-";
+        const latestOk = status.latest_ok == null ? "-" : (status.latest_ok ? "OK" : "FAIL");
+        const boolText = (value) => value == null
+          ? "-"
+          : (value ? (state.lang === "zh" ? "是" : "yes") : (state.lang === "zh" ? "否" : "no"));
+        root.innerHTML = `
+          <div class="fib-instance-card">
+            <div class="fib-instance-body">
+              <div class="strategy-status-note">
+                <strong><span class="status-badge" data-status="${escapeHtml(tone)}">${escapeHtml(running ? t("copy.live_soak_running") : t("copy.live_soak_stopped"))}</span></strong>
+                <span class="mono">${escapeHtml(updatedAt)}</span>
+              </div>
+              <div class="fib-instance-kv">
+                <div><span>${t("copy.live_soak_run_id")}</span><strong class="mono">${escapeHtml(status.run_id || "-")}</strong></div>
+                <div><span>${t("copy.live_soak_round")}</span><strong>${escapeHtml(status.latest_round ?? "-")}</strong></div>
+                <div><span>OK</span><strong>${escapeHtml(latestOk)}</strong></div>
+                <div><span>PID</span><strong class="mono">${escapeHtml(status.pid || "-")}</strong></div>
+                <div><span>${t("copy.live_soak_submitted")}</span><strong>${escapeHtml(status.submitted_reports ?? "-")}</strong></div>
+                <div><span>${t("copy.live_soak_evidence")}</span><strong>${escapeHtml(status.order_evidence ?? "-")}</strong></div>
+                <div><span>${t("copy.live_soak_cleanup_errors")}</span><strong>${escapeHtml(status.cleanup_errors ?? "-")}</strong></div>
+                <div><span>${t("copy.live_soak_final_flat")}</span><strong>${escapeHtml(boolText(status.final_flat))}</strong></div>
+                <div><span>${t("copy.live_soak_hold")}</span><strong>${escapeHtml(boolText(status.hold_positions_after_submit))}</strong></div>
+                <div><span>${t("copy.live_soak_watcher")}</span><strong>${escapeHtml(status.watcher_status || "-")}</strong></div>
+              </div>
+              <div class="order-meta-line"><strong>${t("copy.live_soak_message")}：</strong>${escapeHtml(status.message || "-")}</div>
+            </div>
+          </div>
+        `;
+        if (window.lucide) lucide.createIcons();
+      }
+
+      function renderCopyShadowHistory({ force = false } = {}) {
+        const root = $("copyShadowHistory");
+        if (!root) return;
+        if (!force && sectionRenderBusy(root)) {
+          deferSectionRender("copy-shadow-history", root, () => renderCopyShadowHistory({ force: true }));
+          return;
+        }
+        const previousScrollTop = root.scrollTop || 0;
+        const entries = Array.isArray(state.copyShadowHistory) ? state.copyShadowHistory : [];
+        if (entries.length === 0) {
+          root.innerHTML = `<div class="quote-meta">${t("copy.shadow_history_empty")}</div>`;
+          root.scrollTop = previousScrollTop;
+          return;
+        }
+        root.innerHTML = entries.slice(0, 24).map((entry) => {
+          const status = String(entry?.status || "").toLowerCase();
+          const occurred = entry?.occurred_at_ms ? formatDateTime(entry.occurred_at_ms) : "-";
+          const side = entry?.side ? String(entry.side) : "-";
+          const notional = Number.isFinite(Number(entry?.notional_usd)) ? money(Number(entry.notional_usd)) : "-";
+          const reduceOnly = entry?.reduce_only === true ? (state.lang === "zh" ? "仅减仓" : "reduce-only") : "";
+          const risk = entry?.risk_reject_reason || (state.lang === "zh" ? "通过" : "approved");
+          const signal = entry?.signal_id || "-";
+          return `
+            <div class="fib-instance-card">
+              <div class="fib-instance-top">
+                <div class="fib-instance-title">${escapeHtml(entry?.leader_id || entry?.leader_address || "-")}</div>
+                <span class="status-badge" data-status="${escapeHtml(status)}">${escapeHtml(copyShadowStatusText(status))}</span>
+              </div>
+              <div class="fib-instance-kv">
+                <div><span>${t("table.coin")}</span><strong class="mono">${escapeHtml(coinDisplayPair(entry?.coin) || entry?.coin || "-")}</strong></div>
+                <div><span>${t("manual.side")}</span><strong>${escapeHtml(side)} ${escapeHtml(reduceOnly)}</strong></div>
+                <div><span>${t("manual.notional")}</span><strong>${escapeHtml(notional)}</strong></div>
+                <div><span>${state.lang === "zh" ? "动作" : "Action"}</span><strong>${escapeHtml(entry?.action_kind || "-")}</strong></div>
+                <div><span>${t("copy.shadow.live_gate")}</span><strong>${escapeHtml(entry?.live_gate || "-")}</strong></div>
+                <div><span>${state.lang === "zh" ? "时间" : "Time"}</span><strong>${escapeHtml(occurred)}</strong></div>
+              </div>
+              <div class="order-meta-line">${t("copy.shadow.risk")}: ${escapeHtml(risk)}</div>
+              <div class="order-meta-line">${t("copy.shadow.signal")}: <span class="mono">${escapeHtml(signal)}</span></div>
+              <div class="order-meta-line mono">${escapeHtml(entry?.action_event_id || "-")}</div>
             </div>
           `;
         }).join("");
@@ -10688,7 +11539,7 @@
             `
             : subset.map((event) => `
               <tr>
-                <td class="mono">${new Date(event.occurred_at_ms).toLocaleTimeString()}</td>
+                <td class="mono">${formatDateTime(event.occurred_at_ms)}</td>
                 <td><span class="event-type-badge">${escapeHtml(event.event_type || event.source || "-")}</span></td>
                 <td class="mono">${escapeHtml(event.account_id || "-")}</td>
                 <td class="mono">${escapeHtml(event.coin || "-")}</td>
@@ -11491,6 +12342,8 @@
         }, QUOTE_FALLBACK_POLL_MS);
         state.dashboardPollTimer = setInterval(() => {
           loadDashboardSnapshot({ silent: true });
+          loadCopyLiveSoakStatus({ silent: true });
+          loadCopySummary({ silent: true });
         }, DASHBOARD_SNAPSHOT_REFRESH_MS);
       }
 
@@ -11571,6 +12424,7 @@
         await loadManualQuote({ silent: false });
         await loadFibQuote({ silent: false });
         await loadDashboardOpenOrdersSnapshot({ silent: false });
+        await loadCopyLiveSoakStatus({ silent: false });
       });
       $("dashboardCancelOpenOrdersAction").addEventListener("click", dashboardCancelOpenOrdersAction);
       $("manualForm").addEventListener("submit", (event) => event.preventDefault());
@@ -12595,28 +13449,49 @@
       $("copyMarket").addEventListener("change", () => {
         setModuleMarket("copy", $("copyMarket").value);
       });
+      ["copyLeaderAccounts", "copyRatio", "copyPrincipalCap"].forEach((id) => {
+        $(id)?.addEventListener("input", renderCopyConfigPreview);
+      });
       $("copySaveWhitelistAction").addEventListener("click", async () => {
         await saveModuleSymbolPolicy("copyResult", "copy", "copySymbolWhitelist", "copySaveWhitelistAction", "copy");
+      });
+      $("copyShadowHistoryRefreshAction").addEventListener("click", async () => {
+        await loadCopyShadowHistory({ silent: false });
+        await loadCopySummary({ silent: false });
+      });
+      $("copyLiveSoakRefreshAction").addEventListener("click", async () => {
+        await loadCopyLiveSoakStatus({ silent: false });
+        await loadCopySummary({ silent: false });
       });
 
       $("copyForm").addEventListener("submit", async (event) => {
         event.preventDefault();
-        const payload = {
-          leader_id: $("copyLeaderId").value,
-          leader_address: $("copyAddress").value,
-          market: activeCopyMarket(),
-          coin: $("copyCoin").value,
-          side: $("copySide").value,
-          leader_notional_usd: Number($("copyLeaderNotional").value),
-          copy_ratio: Number($("copyRatio").value),
-          max_signal_notional_usd: Number($("copyMax").value),
-          reduce_only: $("copyReduce").checked,
-        };
-        await showApiResult("copyResult", () => api("/api/smart-money/preview", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify(payload),
-        }));
+        const leaders = parseCopyLeaderAccounts($("copyLeaderAccounts").value);
+        const ratio = Number($("copyRatio").value);
+        const cap = Number($("copyPrincipalCap").value);
+        if (leaders.length === 0) {
+          showResult("copyResult", { ok: false, error: t("copy.error_requires_leader") });
+          $("copyResult").classList.remove("hidden");
+          return;
+        }
+        if (!(Number.isFinite(ratio) && ratio > 0)) {
+          showResult("copyResult", { ok: false, error: t("validate.min", { label: t("copy.copy_ratio"), min: 0.0001 }) });
+          $("copyResult").classList.remove("hidden");
+          return;
+        }
+        if (!(Number.isFinite(cap) && cap > 0)) {
+          showResult("copyResult", { ok: false, error: t("validate.min", { label: t("copy.principal_cap"), min: 0.01 }) });
+          $("copyResult").classList.remove("hidden");
+          return;
+        }
+        $("copyLeaderId").value = "leader_1";
+        $("copyAddress").value = leaders[0];
+        $("copyLeaderNotional").value = String(Math.max(cap / Math.max(ratio, 0.0001), 1));
+        $("copyLeverage").value = "5";
+        $("copyReduce").checked = false;
+        saveCopySimpleSettings(leaders, ratio, cap);
+        renderCopyConfigPreview();
+        await loadCopySummary({ silent: true });
       });
 
       $("vaultForm").addEventListener("submit", async (event) => {
@@ -12691,16 +13566,26 @@
       renderFibQuote(null);
       syncFibQuoteFieldVisibility(activeFibMarket());
       renderFibDetected(null);
+      loadCopySimpleSettings();
+      renderCopySummary();
+      renderCopyLiveSoakStatus();
+      renderCopyShadowHistory();
       $("uiRev").textContent = UI_REVISION;
       $("manualQuoteStatus").textContent = t("manual.quote.status_loading");
       $("fibQuoteStatus").textContent = t("manual.quote.status_loading");
-      loadState({ withVaultStatus: true, silent: false })
+      Promise.allSettled([
+        loadFibInstancesForForm({ silent: true }),
+        loadCopySummary({ silent: true }),
+        loadCopyLiveSoakStatus({ silent: true }),
+        loadCopyShadowHistory({ silent: true }),
+      ]);
+      const bootSequence = loadState({ withVaultStatus: true, silent: false })
         .then(() => loadMarketCapabilities({ silent: false }))
         .then(() => loadManualMarketUniverse({ silent: false }))
         .then(() => loadManualQuote({ silent: true }))
         .then(() => loadFibMarketUniverse({ silent: false }))
-        .then(() => loadFibInstancesForForm({ silent: true }))
-        .then(() => loadFibQuote({ silent: true }))
+        .then(() => loadFibQuote({ silent: true }));
+      bootSequence
         .finally(() => {
           startAutoRefreshLoops();
           if (window.lucide) lucide.createIcons();

@@ -38,6 +38,11 @@ TradeIntent
 - 跟单比例是否超过上限。
 - 单 leader / 单 symbol / 单账户跟单数量是否超过限制。
 - 平仓是否能映射到本地跟单仓位。
+- leader 行为是否能通过 fill + 仓位变化可靠识别。
+- 多 leader 同 symbol 反向信号是否已被冲突裁决器明确处理。
+- pending open 是否已经占用本地 exposure 上限。
+- close / reduce 是否为 reduce-only，且不会扩大仓位。
+- post-close reentry guard 是否要求等待新鲜买入信号。
 
 ### ManualOpsRisk
 
@@ -143,6 +148,21 @@ MANUAL_TRADING_DISABLED
 MANUAL_LIVE_DISABLED
 MANUAL_CONFIRMATION_REQUIRED
 BATCH_ACCOUNT_LIMIT_EXCEEDED
+COPY_STRATEGY_DISABLED
+LEADER_DISABLED
+LEADER_NOT_CONFIGURED
+LEADER_EVENT_DUPLICATE
+LEADER_EVENT_TOO_OLD
+LEADER_POSITION_STALE
+LEADER_ACTION_AMBIGUOUS
+COPY_CONFLICT_NO_DECISION
+COPY_SYMBOL_BLOCKED
+COPY_MARKET_DISABLED
+COPY_SHORT_NOT_ALLOWED
+COPY_NOTIONAL_TOO_SMALL
+COPY_MAPPING_MISSING
+COPY_REDUCE_WOULD_EXPAND
+COPY_PENDING_EXPOSURE_LIMIT
 ```
 
 ## Kill switch
@@ -175,7 +195,11 @@ kill switch 激活后：
 
 - leader 减仓和平仓映射为本账户 reduce-only。
 - 不允许为了跟随 leader 平仓而扩大本账户仓位。
-- 本地跟单仓位和 leader 仓位映射不清晰时，优先保守减仓或拒绝。
+- 本地跟单仓位和 leader 仓位映射不清晰时必须拒绝 submit-capable
+  reduce-only intent；不能平手动仓位、V1 仓位或其他未被 V2 copy ledger
+  证明归属的仓位。
+- partial reduce 和 full close 使用同一条 owned-exposure 规则；计划减仓
+  notional 必须被本地映射剩余仓位封顶。
 
 ## 风控状态一致性
 

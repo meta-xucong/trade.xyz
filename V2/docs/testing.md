@@ -21,7 +21,10 @@ unit tests
 - fib 入场、止盈、止损信号。
 - smart-money 事件标准化。
 - smart-money 去重。
+- smart-money fill + 仓位 delta 行为分类：open / increase / reduce / close / flip。
+- smart-money 反向冲突裁决：跳过、权重胜出、close 优先。
 - 跟单比例和 notional 截断。
+- copy ledger 仓位映射、pending exposure、post-close reentry guard。
 - manual order request 到 `ManualTradeIntent` 的转换。
 - manual batch request 的逐账号拆分。
 - signed preflight / frontend readiness 对交易所最低开仓 notional 的拦截，且不阻断
@@ -51,6 +54,9 @@ MarketEvent + LeaderEvent + AccountEvent
 - 重启恢复后不会重复跟单。
 - WebSocket 重放事件不会重复下单。
 - 策略状态能从快照和事件日志恢复。
+- leader reconnect + REST backfill 不会重复跟单。
+- 任一 leader close 信号会生成 mapped exposure 的 reduce-only close。
+- leader flip 拆成 close + 可选 open，且两条意图分别过风控。
 
 ## 集成测试
 
@@ -199,6 +205,40 @@ MarketEvent + LeaderEvent + AccountEvent
 - 策略生成 intent。
 - 风控裁决。
 - executor 只记录，不下单。
+- CLI `copy-shadow-smoke`：
+
+```powershell
+cargo run --manifest-path V2\Cargo.toml -- copy-shadow-smoke `
+  --config config/dry-run.example.toml `
+  --leader leader_a=0xLEADER_ADDRESS `
+  --coin xyz:XYZ100 `
+  --shadow-history logs/copy_shadow_history.jsonl `
+  --synthetic-event true
+```
+
+该命令必须在 `app.dry_run=true` 下运行；它只生成 read-only watcher 订阅计划并可选跑一条本地
+synthetic shadow 管线，不读取 Vault、不签名、不提交订单。输出 JSON 中 `checks[].ok` 应全为
+`true`，`synthetic_records_written` 应大于 0。
+
+真实 leader 的限时 read-only watch 可使用：
+
+```powershell
+cargo run --manifest-path V2\Cargo.toml -- copy-shadow-watch `
+  --config V2\config\dry-run.example.toml `
+  --leader scalp_1=0x6d6d7c05ef7f31b31b618400495b4ce4092a5089 `
+  --leader scalp_2=0x6ac0b46b32dc429dbd129a503292f88649d2b8a0 `
+  --leader scalp_3=0x117a7c349b953d54154312d97a20c9a2769adbd4 `
+  --leader swing_1=0x9dead8fffcbf130e7658f672d2c081d91178d617 `
+  --leader swing_2=0xd8c5228c515db3043dfa0c8cd6f22450ee9a99b0 `
+  --environment mainnet `
+  --shadow-history .codex-longrun\copy-shadow-watch-leaders.jsonl `
+  --duration-secs 300 `
+  --max-events 5000
+```
+
+`copy-shadow-watch` 只连接 read-only WebSocket 订阅并把事件喂给 dry-run shadow pipeline。
+首包 `userFills` snapshot 只作为上下文观测，不触发跟单信号；只有实时增量 fill 且有匹配
+position snapshot 时才可能生成 shadow record。
 
 验证：
 
@@ -207,6 +247,244 @@ MarketEvent + LeaderEvent + AccountEvent
 - 不存在重复跟单。
 - 不存在明显过大订单。
 - 不存在 stale price 下单意图。
+
+## Unattended copy live daemon acceptance
+
+在启动任何无人值守 live copy daemon 或长时间 live window 前，先跑 gate：
+
+```powershell
+cargo run --manifest-path V2\Cargo.toml -- copy-live-daemon-acceptance `
+  --config V2\config\dry-run.example.toml `
+  --leader scalp_1=0x6d6d7c05ef7f31b31b618400495b4ce4092a5089 `
+  --leader scalp_2=0x6ac0b46b32dc429dbd129a503292f88649d2b8a0 `
+  --leader scalp_3=0x117a7c349b953d54154312d97a20c9a2769adbd4 `
+  --leader swing_1=0x9dead8fffcbf130e7658f672d2c081d91178d617 `
+  --leader swing_2=0xd8c5228c515db3043dfa0c8cd6f22450ee9a99b0 `
+  --account-id addr_a `
+  --coin xyz:XYZ100 `
+  --side buy `
+  --persistence .codex-longrun\copy-live-daemon-acceptance-dryrun-snapshot.json `
+  --shadow-history .codex-longrun\copy-live-daemon-acceptance-dryrun-shadow.jsonl `
+  --leader-notional-usd 120 `
+  --leader-size 1 `
+  --max-duration-secs 300 `
+  --max-live-orders 1 `
+  --max-total-notional-usd 50 `
+  --max-total-fees-usd 0.10 `
+  --max-slippage-bps 50
+```
+
+该命令只做准入验收，不读取 Vault、不签名、不提交订单。输出必须满足：
+
+- `ok=true`。
+- `checks[].ok` 全部为 `true`。
+- `would_submit_orders` 非空且每笔都有 `cloid`。
+- `restart_dedupe_probe.replay_emit_count=0`。
+- `max_live_orders`、`max_total_notional_usd`、`max_total_fees_usd`、
+  `max_slippage_bps` 均是显式有界值。这里的 `max_total_*` 是测试窗口熔断，
+  不是 Smart Money Copy 的正式 sizing 规则。
+
+对 live-capable config 复跑时需要额外传：
+
+```powershell
+--live true --allow-live-submit true --confirm-mainnet-live true
+```
+
+这仍然是 no-submit gate。它只确认 live 配置、主网确认、cleanup policy、
+flat reconcile policy、kill-switch reduce-only policy 和 replay dedupe 都齐备。
+真正 live daemon 长跑必须另有最大时长、最大订单数、异常清仓、kill switch 和最终对账证据。
+正式跟单 sizing 按每交易对 `10U` 本金上限、最多 `5x` 杠杆计算；测试命令里的
+`max_total_notional_usd` / `max_total_fees_usd` 仅作为测试窗口熔断。
+
+通过 daemon acceptance gate 后，先跑 persistent daemon supervisor 的 no-submit
+观察窗口：
+
+```powershell
+cargo run --manifest-path V2\Cargo.toml -- copy-live-daemon-supervisor `
+  --config V2\config\local.toml `
+  --leader scalp_1=0x6d6d7c05ef7f31b31b618400495b4ce4092a5089 `
+  --leader scalp_2=0x6ac0b46b32dc429dbd129a503292f88649d2b8a0 `
+  --leader scalp_3=0x117a7c349b953d54154312d97a20c9a2769adbd4 `
+  --leader swing_1=0x9dead8fffcbf130e7658f672d2c081d91178d617 `
+  --leader swing_2=0xd8c5228c515db3043dfa0c8cd6f22450ee9a99b0 `
+  --account-id addr_a `
+  --coin xyz:XYZ100 `
+  --side buy `
+  --persistence .codex-longrun\copy-live-daemon-supervisor-snapshot.json `
+  --shadow-history .codex-longrun\copy-live-daemon-supervisor-shadow.jsonl `
+  --leader-notional-usd 120 `
+  --leader-size 1 `
+  --duration-secs 300 `
+  --max-events 5000 `
+  --max-live-orders 1 `
+  --max-total-notional-usd 50 `
+  --max-total-fees-usd 0.10 `
+  --max-slippage-bps 50 `
+  --live-gate true `
+  --allow-live-submit true `
+  --confirm-mainnet-live true
+```
+
+该 supervisor 阶段仍然没有 live submit 路径：它不读取 Vault、不签名、不提交订单。
+输出必须满足：
+
+- `mode=copy_live_daemon_supervisor_no_submit`。
+- `no_submit=true`。
+- `acceptance.ok=true`。
+- `checks[].ok` 全部为 `true`。
+- `would_submit_orders` 只表示观察到的全部候选计划，不是已提交订单。
+- `executable_would_submit_orders` 是当前 `max_live_orders`、
+  `max_total_notional_usd`、`max_total_fees_usd` 测试窗口熔断内的候选集合。
+  `max_live_orders` 约束的是可执行开仓/加仓候选数量；`reduce_only=true` 的 mapped close
+  信号不得仅因为开仓 cap 已满而被 suppress。
+- `suppressed_would_submit_orders` 保留超出 cap 的候选及原因；这些候选只作为
+  observation evidence，不得进入未来 unattended submit。
+- `executable_submit_plan_refs` 必须和 `executable_would_submit_orders` 一一对应，并保留
+  `record_index`、`signal_id`、`leader_id`、`leader_address`，供未来 submit path 追溯到
+  原始 shadow record。
+- `suppressed_submit_plan_refs` 必须和 `suppressed_would_submit_orders` 一一对应；这些 refs
+  仍然只是观察证据，不得提交。
+- `submit_plan_contract.ok=true`，且 checks 必须证明 submit 只来自
+  `executable_submit_plan_refs`、suppressed refs 与 executable refs 没有 cloid 重叠、
+  signal/record refs 唯一、开仓数量和测试窗口 notional/fee 熔断均通过、pre-submit reconcile flat。
+- `persistent_submit_dry_run.ok=true`；该字段只模拟 future persistent submit queue：
+  逐条 executable ref 重新过 dry-run Risk Gateway，生成 `planned_reports`，且
+  `dry_run_only=true`。它不得读取 Vault、签名或提交交易所订单。
+- `planned_notional_usd <= max_total_notional_usd`，作为测试窗口熔断。
+- `estimated_fees_usd <= max_total_fees_usd`，作为测试窗口熔断。
+- `persistence_seen_keys_after >= persistence_seen_keys_before`。
+- `persistence_ledger_entries_after >= persistence_ledger_entries_before`。
+- `final_reconciliations[].ok=true`。
+- `submit_evidence_contract.ready_for_unattended_submit=false` until the
+  persistent daemon submit path records the same strict evidence as the bounded
+  canary path.
+- `submit_evidence_contract.checks` must include
+  `persistent_live_submit_path_connected=false` in the current no-submit phase.
+
+如果 `shadow_records_written=0` 但其他 checks 通过，只能说明窗口内没有捕捉到可跟单
+leader 动作；需要拉长 no-submit soak，不得因此直接进入无人值守 live submit。
+
+The daemon supervisor can pass as a no-submit observation window while still
+blocking unattended submit. That is intentional. The submit evidence contract
+lists the live evidence that must exist before widening: deterministic cloid,
+orderStatus by oid/cloid, matching `userFills`/`userFillsByTime`, cleanup or
+mapped close handling, formal per-pair principal/leverage caps, optional
+test-window circuit breakers, and final flat reconcile.
+
+通过 daemon acceptance gate 后，先跑 bounded live window 的 no-submit 包装验收：
+
+```powershell
+cargo run --manifest-path V2\Cargo.toml -- copy-bounded-live-window `
+  --config V2\config\local.toml `
+  --leader scalp_1=0x6d6d7c05ef7f31b31b618400495b4ce4092a5089 `
+  --leader scalp_2=0x6ac0b46b32dc429dbd129a503292f88649d2b8a0 `
+  --leader scalp_3=0x117a7c349b953d54154312d97a20c9a2769adbd4 `
+  --leader swing_1=0x9dead8fffcbf130e7658f672d2c081d91178d617 `
+  --leader swing_2=0xd8c5228c515db3043dfa0c8cd6f22450ee9a99b0 `
+  --account-id addr_a `
+  --coin xyz:XYZ100 `
+  --side buy `
+  --persistence .codex-longrun\copy-bounded-live-window-no-submit-snapshot.json `
+  --shadow-history .codex-longrun\copy-bounded-live-window-no-submit-shadow.jsonl `
+  --leader-notional-usd 120 `
+  --leader-size 1 `
+  --max-duration-secs 300 `
+  --max-live-orders 1 `
+  --max-total-notional-usd 50 `
+  --max-total-fees-usd 0.10 `
+  --max-slippage-bps 50 `
+  --cleanup-max-slippage-bps 50 `
+  --allow-live-submit true `
+  --confirm-mainnet-live true
+```
+
+No-submit window must return `execution=null`, `preflight.submitted_reports=[]`,
+`final_reconciliations[].ok=true`, and `ok=true`.
+
+Only after that may a real bounded canary-live submit add `--submit true`. The
+submit report must include:
+
+- exactly one live submitted report;
+- a passed `cleanup_notional_limit` preflight check proving the reduce-only
+  cleanup path can cover the largest planned opening notional before anything
+  is submitted;
+- bundled cleanup runbook with no cleanup errors;
+- final reconciliation for every target account with `open_order_count=0`,
+  `asset_positions=0`, `total_ntl_pos=0`, and `total_margin_used=0`;
+- `ok=true` before any wider live window is considered.
+
+After the one-order canary is clean, use `copy-live-stability-soak` before
+increasing account count, duration, or notional. This command repeats the
+bounded live window under test-window circuit breakers; it still allows only
+one target account and one live order per bounded round. It must stop if any
+round fails, if the next round would exceed the configured test-window
+notional/fee breaker, or if final reconciliation is not flat.
+
+No-submit stability gate:
+
+```powershell
+cargo run --manifest-path V2\Cargo.toml -- copy-live-stability-soak `
+  --config V2\config\local.toml `
+  --leader scalp_1=0x6d6d7c05ef7f31b31b618400495b4ce4092a5089 `
+  --leader scalp_2=0x6ac0b46b32dc429dbd129a503292f88649d2b8a0 `
+  --leader scalp_3=0x117a7c349b953d54154312d97a20c9a2769adbd4 `
+  --leader swing_1=0x9dead8fffcbf130e7658f672d2c081d91178d617 `
+  --leader swing_2=0xd8c5228c515db3043dfa0c8cd6f22450ee9a99b0 `
+  --account-id addr_a `
+  --coin xyz:XYZ100 `
+  --side buy `
+  --duration-secs 300 `
+  --interval-secs 60 `
+  --max-rounds 2 `
+  --max-live-orders 1 `
+  --max-total-notional-usd 50 `
+  --max-total-fees-usd 0.10 `
+  --max-slippage-bps 50 `
+  --cleanup-max-slippage-bps 50 `
+  --allow-live-submit true `
+  --confirm-mainnet-live true `
+  --submit false
+```
+
+Submit stability gate:
+
+```powershell
+$env:TRADE_XYZ_VAULT_PASSWORD = "<operator-provided transient password>"
+cargo run --manifest-path V2\Cargo.toml -- copy-live-stability-soak `
+  --config V2\config\local.toml `
+  --leader scalp_1=0x6d6d7c05ef7f31b31b618400495b4ce4092a5089 `
+  --leader scalp_2=0x6ac0b46b32dc429dbd129a503292f88649d2b8a0 `
+  --leader scalp_3=0x117a7c349b953d54154312d97a20c9a2769adbd4 `
+  --leader swing_1=0x9dead8fffcbf130e7658f672d2c081d91178d617 `
+  --leader swing_2=0xd8c5228c515db3043dfa0c8cd6f22450ee9a99b0 `
+  --account-id addr_a `
+  --coin xyz:XYZ100 `
+  --side buy `
+  --duration-secs 900 `
+  --interval-secs 60 `
+  --max-rounds 2 `
+  --max-live-orders 1 `
+  --max-total-notional-usd 100 `
+  --max-total-fees-usd 0.50 `
+  --max-slippage-bps 50 `
+  --cleanup-max-slippage-bps 50 `
+  --allow-live-submit true `
+  --confirm-mainnet-live true `
+  --submit true
+Remove-Item Env:TRADE_XYZ_VAULT_PASSWORD
+```
+
+The stability report must include:
+
+- `ok=true`.
+- `rounds_attempted == rounds_passed`.
+- `total_submitted_orders == rounds_attempted` in submit mode.
+- `total_submitted_notional_usd <= max_total_notional_usd`.
+- `estimated_fees_usd <= max_total_fees_usd`, using conservative open and
+  cleanup fee estimation.
+- Each round has `execution.ok=true`, orderStatus/userFills evidence, no
+  cleanup errors, and flat final reconciliation.
+- Top-level `final_reconciliations[].ok=true`.
 
 ## 性能测试
 
