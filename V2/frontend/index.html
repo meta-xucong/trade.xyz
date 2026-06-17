@@ -2977,7 +2977,7 @@
                 <input id="copyAddress" type="hidden" value="0xabc" />
                 <input id="copyCoin" type="hidden" value="xyz:XYZ100" />
                 <input id="copyLeaderNotional" type="hidden" value="100" />
-                <input id="copyLeverage" type="hidden" value="5" />
+                <input id="copyLeverage" type="hidden" value="5" min="1" max="5" step="1" />
                 <input id="copyReduce" type="checkbox" class="hidden" />
                 <div class="field copy-advanced hidden">
                   <label for="copyMarket" data-i18n="manual.market">Market</label>
@@ -3871,7 +3871,7 @@
           "copy.my_pnl": "My PnL",
           "copy.target_pnl": "Target PnL",
           "copy.target_raw_pnl": "Target Raw PnL",
-          "copy.target_accounts": "Target Accounts",
+          "copy.target_accounts": "Target Copy Accounts",
           "copy.trade_count": "Trades",
           "copy.open_positions": "Open Positions",
           "copy.realized": "Realized",
@@ -3881,7 +3881,7 @@
           "copy.position_value": "Position Value",
           "copy.last_signal": "Last Signal",
           "copy.advanced_compare": "Advanced: PnL and account detail",
-          "copy.leader_detail": "Target account detail",
+          "copy.leader_detail": "Target copy account detail",
           "copy.position_detail": "Position detail",
           "copy.no_positions": "No open positions",
           "copy.no_leaders": "No target accounts found yet",
@@ -3893,6 +3893,7 @@
           "copy.pnl_scope_note": "Target values are raw account scale; My PnL is actual copied account scale.",
           "copy.waiting_pnl": "Waiting",
           "copy.error_requires_leader": "Enter at least one target copy account.",
+          "copy.error_invalid_leader": "Invalid target copy account: {address}",
           "copy.live_soak_title": "Live Copy Soak",
           "copy.live_soak_empty": "No background copy soak was detected on this machine.",
           "copy.live_soak_running": "Running",
@@ -4503,7 +4504,7 @@
           "copy.result": "跟单结果",
           "copy.summary_empty": "还没有跟单信号。",
           "copy.summary_status": "运行状态",
-          "copy.summary_leaders": "目标账号数",
+          "copy.summary_leaders": "目标跟单账号数",
           "copy.summary_trades": "跟单信号数",
           "copy.summary_submitted": "已提交订单",
           "copy.summary_notional": "累计跟单金额",
@@ -4517,7 +4518,7 @@
           "copy.my_pnl": "我的盈亏",
           "copy.target_pnl": "目标盈亏",
           "copy.target_raw_pnl": "目标原始盈亏",
-          "copy.target_accounts": "目标账号",
+          "copy.target_accounts": "目标跟单账户",
           "copy.trade_count": "交易次数",
           "copy.open_positions": "持仓数",
           "copy.realized": "已实现",
@@ -4527,10 +4528,10 @@
           "copy.position_value": "持仓价值",
           "copy.last_signal": "最近信号",
           "copy.advanced_compare": "高级：盈亏和账号明细",
-          "copy.leader_detail": "目标账号明细",
+          "copy.leader_detail": "目标跟单账户明细",
           "copy.position_detail": "持仓明细",
           "copy.no_positions": "暂无持仓",
-          "copy.no_leaders": "还没有识别到目标账号",
+          "copy.no_leaders": "还没有识别到目标跟单账号",
           "copy.pnl_report": "盈亏报告",
           "copy.pnl_report_time": "报告时间",
           "copy.pnl_report_missing": "暂未找到盈亏报告。",
@@ -4539,6 +4540,7 @@
           "copy.pnl_scope_note": "目标为目标账号原始规模；我的盈亏为本账户实际跟单规模。",
           "copy.waiting_pnl": "等待归因",
           "copy.error_requires_leader": "请至少填写一个目标跟单账号。",
+          "copy.error_invalid_leader": "目标跟单账号格式不正确：{address}",
           "copy.live_soak_title": "跟单实盘长测",
           "copy.live_soak_empty": "当前机器未检测到后台跟单长测。",
           "copy.live_soak_running": "运行中",
@@ -7376,6 +7378,11 @@
           subscribeFibQuoteStream();
           loadFibInstancesForForm({ silent: true, autoLoadActive: false });
           loadFibQuote({ silent: true });
+        }
+        if (state.activeView === "copy") {
+          loadCopySummary({ silent: true });
+          loadCopyLiveSoakStatus({ silent: true });
+          loadCopyShadowHistory({ silent: true });
         }
       }
 
@@ -10507,6 +10514,10 @@
           });
       }
 
+      function invalidCopyLeaderAccount(leaders) {
+        return leaders.find((leader) => !isEvmAddress(leader)) || null;
+      }
+
       function loadCopySimpleSettings() {
         try {
           const saved = JSON.parse(localStorage.getItem("trade_xyz_copy_simple_settings") || "{}");
@@ -10541,15 +10552,15 @@
         const leaders = parseCopyLeaderAccounts($("copyLeaderAccounts")?.value || "");
         const ratio = Number($("copyRatio")?.value);
         const cap = Number($("copyPrincipalCap")?.value);
-        const ok = leaders.length > 0 && Number.isFinite(ratio) && ratio > 0 && Number.isFinite(cap) && cap > 0;
+        const ok = leaders.length > 0 && !invalidCopyLeaderAccount(leaders) && Number.isFinite(ratio) && ratio > 0 && Number.isFinite(cap) && cap > 0;
         root.classList.toggle("hidden", !ok);
         if (!ok) {
           root.textContent = "";
           return;
         }
         root.textContent = state.lang === "zh"
-          ? `已识别 ${leaders.length} 个目标账号。系统将按 ${number(ratio, 4)} 倍比例跟随，每个交易对最多使用 ${money(cap)} 本金；杠杆、交易对识别、买卖方向、去重和风控由后台自动处理。`
-          : `Detected ${leaders.length} target account(s). The bot will copy at ${number(ratio, 4)}x, cap each pair at ${money(cap)} principal, and handle leverage, symbols, side detection, dedupe, and risk automatically.`;
+          ? `已识别 ${leaders.length} 个目标跟单账号。系统将按 ${number(ratio, 4)} 倍比例跟随，每个交易对最多使用 ${money(cap)} 本金；杠杆、交易对识别、买卖方向、去重和风控由后台自动处理。`
+          : `Detected ${leaders.length} target copy account(s). The bot will copy at ${number(ratio, 4)}x, cap each pair at ${money(cap)} principal, and handle leverage, symbols, side detection, dedupe, and risk automatically.`;
       }
 
       function shortAddress(value) {
@@ -13497,6 +13508,12 @@
         const cap = Number($("copyPrincipalCap").value);
         if (leaders.length === 0) {
           showResult("copyResult", { ok: false, error: t("copy.error_requires_leader") });
+          $("copyResult").classList.remove("hidden");
+          return;
+        }
+        const invalidLeader = invalidCopyLeaderAccount(leaders);
+        if (invalidLeader) {
+          showResult("copyResult", { ok: false, error: t("copy.error_invalid_leader", { address: invalidLeader }) });
           $("copyResult").classList.remove("hidden");
           return;
         }
