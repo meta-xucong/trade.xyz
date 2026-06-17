@@ -7279,7 +7279,7 @@ fn build_copy_summary_response_from_entries(
     let submitted_reports = submitted_reports.max(pnl_summary.submitted_reports);
     let order_evidence = order_evidence.max(pnl_summary.order_evidence);
     let live_realized_pnl_usd = pnl_summary.realized_pnl_usd();
-    let live_unrealized_pnl_usd = pnl_summary.unrealized_pnl_usd();
+    let live_unrealized_pnl_usd = None;
     let live_total_fees_usd = pnl_summary.total_fees_usd();
     let mut local_summary = pnl_report
         .accounts
@@ -7303,9 +7303,6 @@ fn build_copy_summary_response_from_entries(
     if let Some(local) = local_summary.as_mut() {
         if live_realized_pnl_usd.is_some() {
             local.realized_pnl_usd = live_realized_pnl_usd;
-        }
-        if live_unrealized_pnl_usd.is_some() {
-            local.unrealized_pnl_usd = live_unrealized_pnl_usd;
         }
         if live_total_fees_usd.is_some() {
             local.fees_usd = live_total_fees_usd;
@@ -7377,6 +7374,9 @@ fn build_copy_summary_response_from_entries(
         .iter()
         .map(|leader| leader.open_position_count as u64)
         .sum();
+    let pnl_report_age_minutes = copy_pnl_report_age_minutes(&pnl_report, fetched_at_ms);
+    let pnl_report_stale = copy_pnl_report_is_stale(&pnl_report, fetched_at_ms);
+    let pnl_report_status = copy_pnl_report_status_text(&pnl_report, fetched_at_ms);
 
     CopySummaryResponse {
         fetched_at_ms,
@@ -7396,6 +7396,10 @@ fn build_copy_summary_response_from_entries(
         live_round,
         latest_signal_at_ms,
         pnl_report_path: pnl_report.path,
+        pnl_report_modified_at_ms: pnl_report.modified_at_ms,
+        pnl_report_age_minutes,
+        pnl_report_stale,
+        pnl_report_status,
         local_summary,
         leader_summaries,
         target_realized_pnl_usd,
@@ -7427,10 +7431,6 @@ impl CopyLiveSoakPnlSummary {
     fn realized_pnl_usd(&self) -> Option<f64> {
         (self.matching_fill_count > 0)
             .then(|| normalize_display_usd(self.closed_pnl_usd - self.fees_usd))
-    }
-
-    fn unrealized_pnl_usd(&self) -> Option<f64> {
-        (self.matching_fill_count > 0).then_some(0.0)
     }
 
     fn total_fees_usd(&self) -> Option<f64> {
@@ -7511,6 +7511,7 @@ fn read_copy_live_soak_pnl_summary(dir: &Path) -> Result<CopyLiveSoakPnlSummary>
 #[derive(Debug, Default)]
 struct CopyPnlReportSummary {
     path: Option<String>,
+    modified_at_ms: Option<u64>,
     accounts: Vec<CopyPnlAccountSummary>,
 }
 
@@ -7537,8 +7538,40 @@ fn read_latest_copy_pnl_report_summary(dir: &Path) -> Result<CopyPnlReportSummar
         .unwrap_or_default();
     Ok(CopyPnlReportSummary {
         path: Some(path.display().to_string()),
+        modified_at_ms: file_modified_at_ms(&path).ok(),
         accounts,
     })
+}
+
+fn copy_pnl_report_status_text(report: &CopyPnlReportSummary, fetched_at_ms: u64) -> String {
+    let Some(modified_at_ms) = report.modified_at_ms else {
+        return "copy PnL report not found; target and local comparison will appear after a PnL report is generated".to_string();
+    };
+    let age_ms = fetched_at_ms.saturating_sub(modified_at_ms);
+    let age_minutes = age_ms / 60_000;
+    if age_minutes <= 30 {
+        format!(
+            "copy PnL report loaded; report age {} minute(s)",
+            age_minutes
+        )
+    } else {
+        format!(
+            "copy PnL report loaded but stale; report age {} minute(s)",
+            age_minutes
+        )
+    }
+}
+
+fn copy_pnl_report_age_minutes(report: &CopyPnlReportSummary, fetched_at_ms: u64) -> Option<u64> {
+    report
+        .modified_at_ms
+        .map(|modified_at_ms| fetched_at_ms.saturating_sub(modified_at_ms) / 60_000)
+}
+
+fn copy_pnl_report_is_stale(report: &CopyPnlReportSummary, fetched_at_ms: u64) -> bool {
+    copy_pnl_report_age_minutes(report, fetched_at_ms)
+        .map(|age_minutes| age_minutes > 30)
+        .unwrap_or(true)
 }
 
 fn latest_copy_pnl_report_file(dir: &Path) -> Result<Option<PathBuf>> {
@@ -13173,6 +13206,10 @@ struct CopySummaryResponse {
     live_round: Option<u64>,
     latest_signal_at_ms: Option<u64>,
     pnl_report_path: Option<String>,
+    pnl_report_modified_at_ms: Option<u64>,
+    pnl_report_age_minutes: Option<u64>,
+    pnl_report_stale: bool,
+    pnl_report_status: String,
     local_summary: Option<CopyPnlAccountSummary>,
     leader_summaries: Vec<CopyPnlAccountSummary>,
     target_realized_pnl_usd: Option<f64>,
@@ -14378,6 +14415,7 @@ mod tests {
         };
         let pnl_report = CopyPnlReportSummary {
             path: Some(".codex-longrun/pnl-since-test.json".to_string()),
+            modified_at_ms: Some(390),
             accounts: vec![
                 CopyPnlAccountSummary {
                     id: "me_addr_a".to_string(),
@@ -14424,6 +14462,32 @@ mod tests {
             summary.pnl_report_path.as_deref(),
             Some(".codex-longrun/pnl-since-test.json")
         );
+        assert_eq!(summary.pnl_report_modified_at_ms, Some(390));
+        assert!(summary.pnl_report_status.contains("report age 0 minute"));
+    }
+
+    #[test]
+    fn copy_summary_preserves_report_unrealized_local_pnl() {
+        let pnl_report = CopyPnlReportSummary {
+            path: Some(".codex-longrun/pnl-since-test.json".to_string()),
+            modified_at_ms: Some(400),
+            accounts: vec![CopyPnlAccountSummary {
+                id: "me_addr_a".to_string(),
+                kind: "local".to_string(),
+                realized_pnl_usd: Some(-0.25),
+                unrealized_pnl_usd: Some(-1.75),
+                total_pnl_usd: Some(-2.0),
+                fees_usd: Some(0.02),
+                ..CopyPnlAccountSummary::default()
+            }],
+        };
+
+        let summary = build_copy_summary_response_from_entries(Vec::new(), None, 400, pnl_report);
+
+        let local = summary.local_summary.expect("local summary");
+        assert_eq!(local.realized_pnl_usd, Some(-0.25));
+        assert_eq!(local.unrealized_pnl_usd, Some(-1.75));
+        assert_eq!(local.total_pnl_usd, Some(-2.0));
     }
 
     #[test]

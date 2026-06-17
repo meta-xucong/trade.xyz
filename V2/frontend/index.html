@@ -3870,6 +3870,7 @@
           "copy.overview_subtitle": "{leaders} target(s) · {orders} submitted · {signals} signals",
           "copy.my_pnl": "My PnL",
           "copy.target_pnl": "Target PnL",
+          "copy.target_raw_pnl": "Target Raw PnL",
           "copy.target_accounts": "Target Accounts",
           "copy.trade_count": "Trades",
           "copy.open_positions": "Open Positions",
@@ -3885,6 +3886,11 @@
           "copy.no_positions": "No open positions",
           "copy.no_leaders": "No target accounts found yet",
           "copy.pnl_report": "PnL Report",
+          "copy.pnl_report_time": "Report Time",
+          "copy.pnl_report_missing": "PnL report not found yet.",
+          "copy.pnl_report_fresh": "PnL report loaded · age {minutes} min",
+          "copy.pnl_report_stale": "PnL report loaded but stale · age {minutes} min",
+          "copy.pnl_scope_note": "Target values are raw account scale; My PnL is actual copied account scale.",
           "copy.waiting_pnl": "Waiting",
           "copy.error_requires_leader": "Enter at least one target copy account.",
           "copy.live_soak_title": "Live Copy Soak",
@@ -4510,6 +4516,7 @@
           "copy.overview_subtitle": "{leaders} 个目标 · {orders} 笔下单 · {signals} 条信号",
           "copy.my_pnl": "我的盈亏",
           "copy.target_pnl": "目标盈亏",
+          "copy.target_raw_pnl": "目标原始盈亏",
           "copy.target_accounts": "目标账号",
           "copy.trade_count": "交易次数",
           "copy.open_positions": "持仓数",
@@ -4525,6 +4532,11 @@
           "copy.no_positions": "暂无持仓",
           "copy.no_leaders": "还没有识别到目标账号",
           "copy.pnl_report": "盈亏报告",
+          "copy.pnl_report_time": "报告时间",
+          "copy.pnl_report_missing": "暂未找到盈亏报告。",
+          "copy.pnl_report_fresh": "已读取盈亏报告 · 距今 {minutes} 分钟",
+          "copy.pnl_report_stale": "已读取盈亏报告，但数据已过期 · 距今 {minutes} 分钟",
+          "copy.pnl_scope_note": "目标为目标账号原始规模；我的盈亏为本账户实际跟单规模。",
           "copy.waiting_pnl": "等待归因",
           "copy.error_requires_leader": "请至少填写一个目标跟单账号。",
           "copy.live_soak_title": "跟单实盘长测",
@@ -10575,6 +10587,16 @@
         `;
       }
 
+      function copyPnlReportStatusText(summary) {
+        if (!summary?.pnl_report_path) return t("copy.pnl_report_missing");
+        const minutes = summary.pnl_report_age_minutes == null
+          ? "-"
+          : number(summary.pnl_report_age_minutes, 0);
+        return summary.pnl_report_stale
+          ? t("copy.pnl_report_stale", { minutes })
+          : t("copy.pnl_report_fresh", { minutes });
+      }
+
       function copyAccountRowsHtml(accounts) {
         if (!accounts.length) {
           return `<div class="quote-meta">${t("copy.no_leaders")}</div>`;
@@ -10593,7 +10615,7 @@
                 <strong title="${escapeHtml(account?.address || "")}">${escapeHtml(copyAccountLabel(account, index))} · ${escapeHtml(shortAddress(account?.address))}</strong>
               </div>
               <div class="copy-account-cell">
-                <span>${t("copy.target_pnl")}</span>
+                <span>${t("copy.target_raw_pnl")}</span>
                 <strong class="${escapeHtml(pnlClass(total))}">${escapeHtml(nullableMoney(total))}</strong>
               </div>
               <div class="copy-account-cell">
@@ -10699,6 +10721,7 @@
         });
         const mySub = `${t("copy.realized")} ${myRealized == null ? "-" : signedMoney(myRealized)} · ${t("copy.unrealized")} ${myUnrealized == null ? "-" : signedMoney(myUnrealized)}`;
         const targetSub = `${t("copy.realized")} ${targetRealized == null ? "-" : signedMoney(targetRealized)} · ${t("copy.unrealized")} ${targetUnrealized == null ? "-" : signedMoney(targetUnrealized)}`;
+        const reportTime = summary.pnl_report_modified_at_ms ? formatDateTime(summary.pnl_report_modified_at_ms) : "-";
         const reportText = summary.pnl_report_path
           ? `${t("copy.pnl_report")}: ${summary.pnl_report_path}`
           : (summary.pnl_status || "-");
@@ -10713,7 +10736,7 @@
             </div>
             <div class="copy-metric-grid">
               ${copyMetricHtml(t("copy.my_pnl"), nullableMoney(myTotal), mySub, myTotal)}
-              ${copyMetricHtml(t("copy.target_pnl"), nullableMoney(targetTotal), targetSub, targetTotal)}
+              ${copyMetricHtml(t("copy.target_raw_pnl"), nullableMoney(targetTotal), targetSub, targetTotal)}
               ${copyMetricHtml(t("copy.target_accounts"), number(summary.leader_count || 0, 0), `${t("copy.open_positions")} ${number(summary.target_open_position_count || 0, 0)}`)}
               ${copyMetricHtml(t("copy.trade_count"), number(summary.submitted_reports || 0, 0), `${t("copy.summary_notional")} ${money(summary.copied_notional_usd || 0)}`)}
             </div>
@@ -10728,15 +10751,18 @@
               <div class="copy-advanced-body">
                 <div class="fib-instance-kv">
                   <div><span>${t("copy.my_pnl")}</span><strong class="${escapeHtml(pnlClass(myTotal))}">${escapeHtml(nullableMoney(myTotal))}</strong></div>
-                  <div><span>${t("copy.target_pnl")}</span><strong class="${escapeHtml(pnlClass(targetTotal))}">${escapeHtml(nullableMoney(targetTotal))}</strong></div>
+                  <div><span>${t("copy.target_raw_pnl")}</span><strong class="${escapeHtml(pnlClass(targetTotal))}">${escapeHtml(nullableMoney(targetTotal))}</strong></div>
                   <div><span>${t("copy.fees")}</span><strong>${escapeHtml(myFees == null ? "-" : money(myFees))}</strong></div>
                   <div><span>${t("copy.summary_rejected")}</span><strong>${escapeHtml(number(summary.rejected_count || 0, 0))} / ${escapeHtml(number(summary.deduped_count || 0, 0))}</strong></div>
                   <div><span>${t("copy.open_positions")}</span><strong>${escapeHtml(number(summary.target_open_position_count || 0, 0))}</strong></div>
                   <div><span>${t("copy.position_value")}</span><strong>${escapeHtml(summary.target_position_value_usd == null ? "-" : money(summary.target_position_value_usd))}</strong></div>
+                  <div><span>${t("copy.pnl_report_time")}</span><strong>${escapeHtml(reportTime)}</strong></div>
                 </div>
                 <div class="strategy-status-note">
                   <strong>${t("copy.summary_pnl_note")}</strong>
+                  <span>${escapeHtml(copyPnlReportStatusText(summary))}</span>
                   <span>${escapeHtml(reportText)}</span>
+                  <span>${escapeHtml(t("copy.pnl_scope_note"))}</span>
                 </div>
                 <div class="fib-instance-section-title">${t("copy.leader_detail")}</div>
                 ${copyAccountRowsHtml(leaders)}
