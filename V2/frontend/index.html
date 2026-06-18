@@ -27,6 +27,12 @@
         box-sizing: border-box;
       }
 
+      html,
+      body {
+        width: 100%;
+        overflow-x: hidden;
+      }
+
       body {
         margin: 0;
         min-width: 320px;
@@ -66,6 +72,8 @@
         min-height: 100vh;
         display: grid;
         grid-template-rows: auto auto 1fr;
+        min-width: 0;
+        overflow-x: hidden;
       }
 
       .topbar {
@@ -244,12 +252,15 @@
 
       main {
         padding: 24px;
+        min-width: 0;
       }
 
       .view {
         display: none;
+        width: 100%;
         max-width: 1440px;
         margin: 0 auto;
+        min-width: 0;
       }
 
       .view.active {
@@ -3012,6 +3023,11 @@
                 <div class="footer-actions compact wide copy-advanced hidden">
                   <button class="action-button action-primary" type="button" id="copySaveWhitelistAction"><i data-lucide="save"></i><span data-i18n="manual.action.save_blacklist">Save Blacklist</span></button>
                 </div>
+                <div class="form-section wide"><span data-i18n="copy.operator_controls">Operator Controls</span></div>
+                <div class="footer-actions compact wide">
+                  <button class="action-button action-primary" type="button" id="copyLiveSoakStartAction"><i data-lucide="play"></i><span data-i18n="copy.start_live_soak">Start Live Soak</span></button>
+                  <button class="action-button" type="button" id="copyLiveSoakStopAction"><i data-lucide="square"></i><span data-i18n="copy.stop_live_soak">Stop Live Soak</span></button>
+                </div>
               </div>
             </form>
             <div class="panel">
@@ -3854,6 +3870,10 @@
           "copy.mirror_close": "Mirror close",
           "copy.preview": "Preview Copy",
           "copy.save_settings": "Save Settings",
+          "copy.operator_controls": "Operator Controls",
+          "copy.start_live_soak": "Start Live Soak",
+          "copy.stop_live_soak": "Stop Live Soak",
+          "copy.settings_saved": "Settings saved to backend. {leaders} target(s), ratio {ratio}, principal cap {cap}; live soak will use these settings.",
           "copy.result": "Copy Result",
           "copy.summary_empty": "No copy signals yet.",
           "copy.summary_status": "Status",
@@ -4501,6 +4521,10 @@
           "copy.mirror_close": "镜像平仓",
           "copy.preview": "预览跟单结果",
           "copy.save_settings": "保存设置",
+          "copy.operator_controls": "运行控制",
+          "copy.start_live_soak": "开始实盘长测",
+          "copy.stop_live_soak": "停止实盘长测",
+          "copy.settings_saved": "设置已写入后台。{leaders} 个目标账号，跟单比例 {ratio}，单交易对本金上限 {cap}；实盘长测会使用这组设置。",
           "copy.result": "跟单结果",
           "copy.summary_empty": "还没有跟单信号。",
           "copy.summary_status": "运行状态",
@@ -4876,6 +4900,49 @@
           return;
         }
         $(id).textContent = pretty(payload);
+      }
+
+      function showCopyResult(payload) {
+        const data = payload?.data || {};
+        const settings = data?.settings || {};
+        const status = data?.status || {};
+        const lines = [];
+        if (payload?.ok === false) {
+          lines.push(payload?.error || (state.lang === "zh" ? "执行失败" : "Failed"));
+        } else if (Array.isArray(settings.leaders)) {
+          lines.push(t("copy.settings_saved", {
+            leaders: number(settings.leaders.length, 0),
+            ratio: number(settings.copy_ratio, 4),
+            cap: money(settings.principal_cap_usd),
+          }));
+          if (data.path) lines.push(data.path);
+        } else if (data.action) {
+          lines.push(data.message || (state.lang === "zh" ? "执行完成" : "Done"));
+          lines.push(`${state.lang === "zh" ? "运行状态" : "Status"}: ${status.running ? t("copy.live_soak_running") : t("copy.live_soak_stopped")}`);
+          if (status.run_id) lines.push(`${t("copy.live_soak_run_id")}: ${status.run_id}`);
+          if (status.latest_round != null) lines.push(`${t("copy.live_soak_round")}: ${status.latest_round}`);
+        } else {
+          lines.push(state.lang === "zh" ? "执行完成" : "Done");
+        }
+        $("copyResult").textContent = lines.join("\n");
+        $("copyResult").classList.remove("hidden");
+      }
+
+      function showCopyPolicyResult(payload) {
+        if (payload?.ok === false) {
+          showResult("copyResult", payload);
+          $("copyResult").classList.remove("hidden");
+          return;
+        }
+        const symbols = Array.isArray(payload?.data?.blocked_symbols)
+          ? payload.data.blocked_symbols
+          : [];
+        $("copyResult").textContent = symbols.length === 0
+          ? (state.lang === "zh" ? "已清空跟单黑名单。" : "Copy blacklist cleared.")
+          : (state.lang === "zh"
+            ? `已保存 ${symbols.length} 个跟单黑名单交易对：${symbols.join(", ")}`
+            : `Saved ${symbols.length} copy blacklist symbol(s): ${symbols.join(", ")}`);
+        $("copyResult").classList.remove("hidden");
       }
 
       function formatManualReadableResult(payload) {
@@ -5530,16 +5597,20 @@
         if (resultId) {
           $(resultId).textContent = state.lang === "zh" ? "提交中，请稍候..." : "Submitting, please wait...";
         }
+        let payload = {};
         try {
-          showResult(resultId, await request());
+          payload = await request();
+          showResult(resultId, payload);
         } catch (error) {
-          showResult(resultId, { ok: false, error: error.message || String(error) });
+          payload = { ok: false, error: error.message || String(error) };
+          showResult(resultId, payload);
         } finally {
           await loadState({ withVaultStatus: false, silent: true });
           await loadManualQuote({ silent: true });
           await loadFibQuote({ silent: true });
           setButtonBusy(buttonId, false);
         }
+        return payload;
       }
 
       function failManual(error, extra = {}) {
@@ -10537,6 +10608,33 @@
         }
       }
 
+      async function loadCopyBackendSettings({ silent = true } = {}) {
+        try {
+          const result = await api("/api/copy/settings");
+          const settings = result?.data?.settings || {};
+          if (Array.isArray(settings.leaders) && settings.leaders.length > 0) {
+            $("copyLeaderAccounts").value = settings.leaders.join("\n");
+          }
+          if (Number.isFinite(Number(settings.copy_ratio))) {
+            $("copyRatio").value = String(settings.copy_ratio);
+          }
+          if (Number.isFinite(Number(settings.principal_cap_usd))) {
+            $("copyPrincipalCap").value = String(settings.principal_cap_usd);
+          }
+          saveCopySimpleSettings(
+            parseCopyLeaderAccounts($("copyLeaderAccounts")?.value || ""),
+            Number($("copyRatio")?.value),
+            Number($("copyPrincipalCap")?.value),
+          );
+          renderCopyConfigPreview();
+        } catch (error) {
+          if (!silent) {
+            showResult("copyResult", { ok: false, error: error?.message || String(error) });
+            $("copyResult").classList.remove("hidden");
+          }
+        }
+      }
+
       function saveCopySimpleSettings(leaders, ratio, cap) {
         localStorage.setItem("trade_xyz_copy_simple_settings", JSON.stringify({
           leaders,
@@ -10798,6 +10896,10 @@
         const root = $("copyLiveSoakStatus");
         if (!root) return;
         const status = state.copyLiveSoakStatus;
+        const startButton = $("copyLiveSoakStartAction");
+        const stopButton = $("copyLiveSoakStopAction");
+        if (startButton) startButton.disabled = Boolean(status?.running);
+        if (stopButton) stopButton.disabled = !Boolean(status?.running);
         if (!status || !status.detected) {
           root.innerHTML = `<div class="quote-meta">${t("copy.live_soak_empty")}</div>`;
           return;
@@ -13019,9 +13121,9 @@
         syncManualSettingsInputs({ force: true });
       }
 
-      async function saveModuleSymbolPolicy(resultId, module, inputId, buttonId, dirtyKey) {
+      async function saveModuleSymbolPolicy(resultId, module, inputId, buttonId, dirtyKey, renderResult = null) {
         const symbols = parseSymbolPolicyInput($(inputId).value);
-        await showActionResult(resultId, buttonId, () => api("/api/module-symbol-policy", {
+        const payload = await showActionResult(resultId, buttonId, () => api("/api/module-symbol-policy", {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({
@@ -13029,6 +13131,7 @@
             blocked_symbols: symbols,
           }),
         }));
+        if (typeof renderResult === "function") renderResult(payload);
         state.symbolPolicyDirty[dirtyKey] = false;
         syncModuleSymbolPolicyInputs({ force: true });
       }
@@ -13490,7 +13593,7 @@
         $(id)?.addEventListener("input", renderCopyConfigPreview);
       });
       $("copySaveWhitelistAction").addEventListener("click", async () => {
-        await saveModuleSymbolPolicy("copyResult", "copy", "copySymbolWhitelist", "copySaveWhitelistAction", "copy");
+        await saveModuleSymbolPolicy("copyResult", "copy", "copySymbolWhitelist", "copySaveWhitelistAction", "copy", showCopyPolicyResult);
       });
       $("copyShadowHistoryRefreshAction").addEventListener("click", async () => {
         await loadCopyShadowHistory({ silent: false });
@@ -13499,6 +13602,53 @@
       $("copyLiveSoakRefreshAction").addEventListener("click", async () => {
         await loadCopyLiveSoakStatus({ silent: false });
         await loadCopySummary({ silent: false });
+      });
+      $("copyLiveSoakStartAction").addEventListener("click", async () => {
+        const button = $("copyLiveSoakStartAction");
+        try {
+          const ok = window.confirm(state.lang === "zh"
+            ? "确认开始聪明钱跟单实盘长测？这会使用当前目标账号、跟单比例和本金上限，并可能真实下单。"
+            : "Start live smart-money copy soak with the current target accounts, ratio, and cap? This may place real orders.");
+          if (!ok) return;
+          button.disabled = true;
+          const result = await api("/api/copy/live-soak/start", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              window_secs: 600,
+              max_rounds: 0,
+              hold_positions_after_submit: true,
+              confirm_mainnet_live: true,
+            }),
+          });
+          showCopyResult(result);
+          await loadCopyLiveSoakStatus({ silent: false });
+          await loadCopySummary({ silent: false });
+        } catch (error) {
+          showResult("copyResult", { ok: false, error: error?.message || String(error) });
+          $("copyResult").classList.remove("hidden");
+        } finally {
+          button.disabled = false;
+        }
+      });
+      $("copyLiveSoakStopAction").addEventListener("click", async () => {
+        const button = $("copyLiveSoakStopAction");
+        try {
+          button.disabled = true;
+          const result = await api("/api/copy/live-soak/stop", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({}),
+          });
+          showCopyResult(result);
+          await loadCopyLiveSoakStatus({ silent: false });
+          await loadCopySummary({ silent: false });
+        } catch (error) {
+          showResult("copyResult", { ok: false, error: error?.message || String(error) });
+          $("copyResult").classList.remove("hidden");
+        } finally {
+          button.disabled = false;
+        }
       });
 
       $("copyForm").addEventListener("submit", async (event) => {
@@ -13533,7 +13683,18 @@
         $("copyLeverage").value = "5";
         $("copyReduce").checked = false;
         saveCopySimpleSettings(leaders, ratio, cap);
-        renderCopyConfigPreview();
+        const result = await api("/api/copy/settings", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            leaders,
+            copy_ratio: ratio,
+            principal_cap_usd: cap,
+            account_id: "addr_a",
+          }),
+        });
+        const saved = result?.data?.settings || {};
+        showCopyResult(result);
         await loadCopySummary({ silent: true });
       });
 
@@ -13610,6 +13771,8 @@
       syncFibQuoteFieldVisibility(activeFibMarket());
       renderFibDetected(null);
       loadCopySimpleSettings();
+      loadCopyBackendSettings({ silent: true });
+      renderCopyConfigPreview();
       renderCopySummary();
       renderCopyLiveSoakStatus();
       renderCopyShadowHistory();
@@ -13618,6 +13781,7 @@
       $("fibQuoteStatus").textContent = t("manual.quote.status_loading");
       Promise.allSettled([
         loadFibInstancesForForm({ silent: true }),
+        loadCopyBackendSettings({ silent: true }),
         loadCopySummary({ silent: true }),
         loadCopyLiveSoakStatus({ silent: true }),
         loadCopyShadowHistory({ silent: true }),

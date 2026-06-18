@@ -60,8 +60,9 @@ use crate::{
             fib_take_profit_price, normalized_level_set,
         },
         smart_money::{
-            CopyShadowHistoryEntry, LeaderRule, SmartMoneyCopyConfig, SmartMoneyCopyStrategy,
-            SymbolCopyLimit, read_recent_copy_shadow_history_entries,
+            COPY_DEFAULT_PRINCIPAL_CAP_USD, COPY_MAX_LEVERAGE, CopyShadowHistoryEntry, LeaderRule,
+            SmartMoneyCopyConfig, SmartMoneyCopyStrategy, SymbolCopyLimit,
+            read_recent_copy_shadow_history_entries,
         },
     },
     strategy::{LeaderFillEvent, Strategy, StrategyContext, StrategyEvent},
@@ -109,6 +110,7 @@ const FIB_INSTANCES_PATH: &str = "logs/fib_instances.json";
 const FIB_INSTANCE_HISTORY_PATH: &str = "logs/fib_instance_history.jsonl";
 const COPY_SHADOW_HISTORY_PATH: &str = "logs/copy_shadow_history.jsonl";
 const COPY_LIVE_SOAK_DIR: &str = ".codex-longrun";
+const COPY_UI_SETTINGS_PATH: &str = ".codex-longrun/copy-ui-settings.json";
 const COPY_LIVE_SOAK_STALE_MS: u64 = 25 * 60 * 1000;
 const FIB_HISTORY_RESPONSE_LIMIT: usize = 80;
 const COPY_SHADOW_HISTORY_RESPONSE_LIMIT: usize = 80;
@@ -432,6 +434,47 @@ impl FrontendAppState {
             module: module.to_string(),
             blocked_symbols: next_config.module_blocked_symbols(module).to_vec(),
             block_none: next_config.module_blocked_symbols(module).is_empty(),
+        })
+    }
+
+    fn apply_copy_settings(&self, payload: CopySettingsPayload) -> Result<CopySettingsResponse> {
+        let mut settings = payload.normalized()?;
+        settings.updated_at_ms = now_ms();
+        fs::create_dir_all(COPY_LIVE_SOAK_DIR)
+            .with_context(|| format!("failed to create {}", COPY_LIVE_SOAK_DIR))?;
+        write_json_pretty(Path::new(COPY_UI_SETTINGS_PATH), &settings)?;
+
+        let mut next_config = self.config_snapshot()?;
+        let mut changed = false;
+        for account in next_config
+            .accounts
+            .iter_mut()
+            .filter(|account| account.enabled && account.worker_enabled)
+        {
+            if account.account_id == settings.account_id {
+                let desired_cap = settings.principal_cap_usd * COPY_MAX_LEVERAGE;
+                if (account.max_order_notional_usd - desired_cap).abs() > f64::EPSILON {
+                    account.max_order_notional_usd = desired_cap;
+                    changed = true;
+                }
+                if (account.copy_ratio - 1.0).abs() > f64::EPSILON {
+                    account.copy_ratio = 1.0;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            save_config(&self.config_path, &next_config)?;
+            let mut guard = self
+                .config
+                .write()
+                .map_err(|_| anyhow::anyhow!("config lock is poisoned"))?;
+            *guard = next_config;
+        }
+
+        Ok(CopySettingsResponse {
+            settings,
+            path: COPY_UI_SETTINGS_PATH.to_string(),
         })
     }
 
@@ -770,7 +813,13 @@ pub async fn run(options: FrontendOptions) -> Result<()> {
         .route("/api/fib/history", get(fib_history))
         .route("/api/copy/shadow/history", get(copy_shadow_history))
         .route("/api/copy/live-soak/status", get(copy_live_soak_status))
+        .route("/api/copy/live-soak/start", post(copy_live_soak_start))
+        .route("/api/copy/live-soak/stop", post(copy_live_soak_stop))
         .route("/api/copy/summary", get(copy_summary))
+        .route(
+            "/api/copy/settings",
+            get(copy_settings).post(copy_settings_update),
+        )
         .route("/api/fib/instances/start", post(fib_instance_start))
         .route(
             "/api/fib/instances/refresh-params",
@@ -3115,6 +3164,54 @@ async fn copy_live_soak_status() -> Json<ApiResult<CopyLiveSoakStatusResponse>> 
 
 async fn copy_summary() -> Json<ApiResult<CopySummaryResponse>> {
     Json(ApiResult::from_result(build_copy_summary_response()))
+}
+
+async fn copy_settings(
+    State(state): State<FrontendAppState>,
+) -> Json<ApiResult<CopySettingsResponse>> {
+    Json(ApiResult::from_result(build_copy_settings_response(&state)))
+}
+
+async fn copy_settings_update(
+    State(state): State<FrontendAppState>,
+    Json(payload): Json<CopySettingsPayload>,
+) -> Json<ApiResult<CopySettingsResponse>> {
+    let audit_details = json!({
+        "leaders": payload.leaders.clone(),
+        "copy_ratio": payload.copy_ratio,
+        "principal_cap_usd": payload.principal_cap_usd,
+        "account_id": payload.account_id.clone(),
+    });
+    let result = state.apply_copy_settings(payload);
+    let response = ApiResult::from_result(result);
+    state.audit_api_result("copy_settings_update", None, None, audit_details, &response);
+    Json(response)
+}
+
+async fn copy_live_soak_start(
+    State(state): State<FrontendAppState>,
+    Json(payload): Json<CopyLiveSoakStartPayload>,
+) -> Json<ApiResult<CopyLiveSoakActionResponse>> {
+    let audit_details = json!({
+        "window_secs": payload.window_secs,
+        "max_rounds": payload.max_rounds,
+        "max_total_notional_usd": payload.max_total_notional_usd,
+        "max_total_fees_usd": payload.max_total_fees_usd,
+        "hold_positions_after_submit": payload.hold_positions_after_submit,
+    });
+    let result = start_copy_live_soak_from_frontend(&state, payload);
+    let response = ApiResult::from_result(result);
+    state.audit_api_result("copy_live_soak_start", None, None, audit_details, &response);
+    Json(response)
+}
+
+async fn copy_live_soak_stop(
+    State(state): State<FrontendAppState>,
+) -> Json<ApiResult<CopyLiveSoakActionResponse>> {
+    let result = stop_copy_live_soak_from_frontend();
+    let response = ApiResult::from_result(result);
+    state.audit_api_result("copy_live_soak_stop", None, None, json!({}), &response);
+    Json(response)
 }
 
 async fn fib_instance_create(
@@ -7140,12 +7237,236 @@ fn build_copy_summary_response() -> Result<CopySummaryResponse> {
     let entries = read_recent_copy_shadow_history_entries_from_active_paths(1_000)?;
     let live_soak = build_copy_live_soak_status_response().ok();
     let pnl_report = read_latest_copy_pnl_report_summary(&copy_live_soak_dir()).unwrap_or_default();
+    let copy_settings = read_copy_ui_settings().ok();
     Ok(build_copy_summary_response_from_entries(
         entries,
         live_soak,
         now_ms(),
         pnl_report,
+        copy_settings.as_ref(),
     ))
+}
+
+fn build_copy_settings_response(state: &FrontendAppState) -> Result<CopySettingsResponse> {
+    let mut settings = read_copy_ui_settings().unwrap_or_else(|_| CopyUiSettings::default());
+    if settings.updated_at_ms == 0 {
+        if let Some(account) = state.config_snapshot()?.account(&settings.account_id) {
+            settings.copy_ratio = account.copy_ratio.max(settings.copy_ratio);
+            settings.principal_cap_usd = (account.max_order_notional_usd / COPY_MAX_LEVERAGE)
+                .max(settings.principal_cap_usd);
+        }
+    }
+    Ok(CopySettingsResponse {
+        settings,
+        path: COPY_UI_SETTINGS_PATH.to_string(),
+    })
+}
+
+fn read_copy_ui_settings() -> Result<CopyUiSettings> {
+    let path = Path::new(COPY_UI_SETTINGS_PATH);
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("failed to read copy settings {}", path.display()))?;
+    let mut settings = serde_json::from_str::<CopyUiSettings>(&raw)
+        .with_context(|| format!("failed to parse copy settings {}", path.display()))?;
+    settings.leaders = normalize_copy_leaders(settings.leaders)?;
+    anyhow::ensure!(
+        settings.copy_ratio.is_finite() && settings.copy_ratio > 0.0,
+        "copy_ratio must be positive"
+    );
+    anyhow::ensure!(
+        settings.principal_cap_usd.is_finite() && settings.principal_cap_usd > 0.0,
+        "principal_cap_usd must be positive"
+    );
+    settings.leverage = COPY_MAX_LEVERAGE;
+    if settings.account_id.trim().is_empty() {
+        settings.account_id = "addr_a".to_string();
+    }
+    Ok(settings)
+}
+
+fn normalize_copy_leaders(raw: Vec<String>) -> Result<Vec<String>> {
+    let mut leaders = Vec::new();
+    let mut seen = HashSet::new();
+    for item in raw {
+        for token in item
+            .split(|ch: char| {
+                ch.is_whitespace() || ch == ',' || ch == ';' || ch == '，' || ch == '；'
+            })
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+        {
+            anyhow::ensure!(
+                is_evm_address(token),
+                "invalid target copy account: {}",
+                token
+            );
+            let key = token.to_ascii_lowercase();
+            if seen.insert(key.clone()) {
+                leaders.push(key);
+            }
+        }
+    }
+    anyhow::ensure!(
+        !leaders.is_empty(),
+        "at least one target copy account is required"
+    );
+    Ok(leaders)
+}
+
+fn default_copy_leaders() -> Vec<String> {
+    vec![
+        "0x6d6d7c05ef7f31b31b618400495b4ce4092a5089".to_string(),
+        "0x6ac0b46b32dc429dbd129a503292f88649d2b8a0".to_string(),
+        "0x117a7c349b953d54154312d97a20c9a2769adbd4".to_string(),
+        "0x9dead8fffcbf130e7658f672d2c081d91178d617".to_string(),
+        "0xd8c5228c515db3043dfa0c8cd6f22450ee9a99b0".to_string(),
+    ]
+}
+
+fn is_evm_address(value: &str) -> bool {
+    let text = value.trim();
+    text.len() == 42 && text.starts_with("0x") && text[2..].chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
+fn write_json_pretty<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let raw = serde_json::to_string_pretty(value).context("failed to serialize json")?;
+    fs::write(path, format!("{raw}\n"))
+        .with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn start_copy_live_soak_from_frontend(
+    state: &FrontendAppState,
+    payload: CopyLiveSoakStartPayload,
+) -> Result<CopyLiveSoakActionResponse> {
+    let current = build_copy_live_soak_status_response()?;
+    anyhow::ensure!(!current.running, "copy live soak is already running");
+    let settings = read_copy_ui_settings()
+        .or_else(|_| build_copy_settings_response(state).map(|response| response.settings))?;
+    let config = state.config_snapshot()?;
+    let account_exists = config.account(&settings.account_id).is_some();
+    anyhow::ensure!(
+        account_exists,
+        "copy account {} is not configured",
+        settings.account_id
+    );
+    anyhow::ensure!(payload.window_secs > 0, "window_secs must be positive");
+    if config.app.environment == "mainnet" && !payload.confirm_mainnet_live {
+        anyhow::bail!("mainnet live copy soak requires confirm_mainnet_live=true");
+    }
+    let vault_password = state
+        .vault_session
+        .read()
+        .map_err(|_| anyhow::anyhow!("vault session lock is poisoned"))?
+        .as_ref()
+        .map(|session| session.password.clone())
+        .context("vault must be unlocked before starting live copy soak")?;
+    let max_total_notional_usd = payload
+        .max_total_notional_usd
+        .unwrap_or(settings.principal_cap_usd * settings.leverage * 4.0)
+        .max(settings.principal_cap_usd * settings.leverage);
+    let max_total_fees_usd = payload.max_total_fees_usd.unwrap_or(2.0).max(0.1);
+    let script_path = copy_live_soak_script_path();
+    anyhow::ensure!(
+        script_path.exists(),
+        "copy live soak script not found at {}",
+        script_path.display()
+    );
+    let mut command = Command::new("powershell");
+    command
+        .arg("-NoProfile")
+        .arg("-ExecutionPolicy")
+        .arg("Bypass")
+        .arg("-File")
+        .arg(&script_path)
+        .arg("-WindowSecs")
+        .arg(payload.window_secs.to_string())
+        .arg("-MaxRounds")
+        .arg(payload.max_rounds.to_string())
+        .arg("-MaxTotalNotionalUsd")
+        .arg(format!("{max_total_notional_usd}"))
+        .arg("-MaxTotalFeesUsd")
+        .arg(format!("{max_total_fees_usd}"))
+        .arg("-SettingsPath")
+        .arg(COPY_UI_SETTINGS_PATH);
+    if payload.hold_positions_after_submit {
+        command.arg("-HoldPositionsAfterSubmit");
+    }
+    command.env("TRADE_XYZ_VAULT_PASSWORD", vault_password);
+    command
+        .spawn()
+        .context("failed to start copy live soak process")?;
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let status = build_copy_live_soak_status_response()?;
+    Ok(CopyLiveSoakActionResponse {
+        action: "start".to_string(),
+        pid: status.pid,
+        message: "copy live soak start requested".to_string(),
+        status,
+    })
+}
+
+fn copy_live_soak_script_path() -> PathBuf {
+    let local_override = PathBuf::from(COPY_LIVE_SOAK_DIR).join("run-persistent-live-soak.ps1");
+    if local_override.exists() {
+        return local_override;
+    }
+    PathBuf::from("V2")
+        .join("scripts")
+        .join("run-persistent-live-soak.ps1")
+}
+
+fn stop_copy_live_soak_from_frontend() -> Result<CopyLiveSoakActionResponse> {
+    let before = build_copy_live_soak_status_response()?;
+    if !before.running {
+        return Ok(CopyLiveSoakActionResponse {
+            action: "stop".to_string(),
+            status: before,
+            message: "copy live soak is not running".to_string(),
+            pid: None,
+        });
+    }
+    let Some(pid) = before.pid else {
+        return Ok(CopyLiveSoakActionResponse {
+            action: "stop".to_string(),
+            status: before,
+            message: "no copy live soak pid was recorded".to_string(),
+            pid: None,
+        });
+    };
+    if process_id_is_running(pid) {
+        #[cfg(windows)]
+        {
+            let status = Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .status()
+                .context("failed to run taskkill for copy live soak")?;
+            anyhow::ensure!(status.success(), "taskkill failed for pid {}", pid);
+        }
+        #[cfg(not(windows))]
+        {
+            let status = Command::new("kill")
+                .arg(pid.to_string())
+                .status()
+                .context("failed to run kill for copy live soak")?;
+            anyhow::ensure!(status.success(), "kill failed for pid {}", pid);
+        }
+    }
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let status = build_copy_live_soak_status_response()?;
+    Ok(CopyLiveSoakActionResponse {
+        action: "stop".to_string(),
+        status,
+        message: format!("copy live soak stop requested for pid {}", pid),
+        pid: Some(pid),
+    })
+}
+
+fn default_copy_soak_window_secs() -> u64 {
+    600
 }
 
 fn read_recent_copy_shadow_history_entries_from_active_paths(
@@ -7218,6 +7539,7 @@ fn build_copy_summary_response_from_entries(
     live_soak: Option<CopyLiveSoakStatusResponse>,
     fetched_at_ms: u64,
     pnl_report: CopyPnlReportSummary,
+    copy_settings: Option<&CopyUiSettings>,
 ) -> CopySummaryResponse {
     let mut leader_addresses = HashSet::new();
     let mut leader_event_meta = HashMap::<String, CopyLeaderEventMeta>::new();
@@ -7226,8 +7548,23 @@ fn build_copy_summary_response_from_entries(
     let mut deduped_count = 0_u64;
     let mut copied_notional_usd = 0.0_f64;
     let mut latest_signal_at_ms = None;
+    let configured_addresses = copy_settings
+        .map(|settings| settings.leaders.clone())
+        .unwrap_or_default();
+    let configured_address_set = configured_addresses
+        .iter()
+        .map(|address| address.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    let filter_to_configured_leaders = !configured_address_set.is_empty();
+    let summary_entries = entries
+        .iter()
+        .filter(|entry| {
+            !filter_to_configured_leaders
+                || configured_address_set.contains(&entry.leader_address.to_ascii_lowercase())
+        })
+        .collect::<Vec<_>>();
 
-    for entry in &entries {
+    for entry in &summary_entries {
         if !entry.leader_address.trim().is_empty() {
             let key = entry.leader_address.to_ascii_lowercase();
             leader_addresses.insert(key.clone());
@@ -7261,7 +7598,11 @@ fn build_copy_summary_response_from_entries(
         }
     }
 
-    let latest_entries = entries.into_iter().take(8).collect::<Vec<_>>();
+    let latest_entries = summary_entries
+        .iter()
+        .take(8)
+        .map(|entry| (*entry).clone())
+        .collect::<Vec<_>>();
     let live_running = live_soak
         .as_ref()
         .map(|status| status.running)
@@ -7317,8 +7658,11 @@ fn build_copy_summary_response_from_entries(
         .iter()
         .filter(|account| copy_pnl_account_is_target(account))
     {
+        let key = account.address.to_ascii_lowercase();
+        if !configured_address_set.is_empty() && !configured_address_set.contains(&key) {
+            continue;
+        }
         let mut leader = account.clone();
-        let key = leader.address.to_ascii_lowercase();
         if !key.is_empty() {
             leader_addresses.insert(key.clone());
             leader_summary_keys.insert(key.clone());
@@ -7332,18 +7676,42 @@ fn build_copy_summary_response_from_entries(
         }
         leader_summaries.push(leader);
     }
-    for (address, meta) in &leader_event_meta {
-        if leader_summary_keys.contains(address) {
-            continue;
-        }
+    let missing_configured_addresses = configured_addresses
+        .iter()
+        .filter(|address| !leader_summary_keys.contains(&address.to_ascii_lowercase()))
+        .cloned()
+        .collect::<Vec<_>>();
+    for (index, address) in missing_configured_addresses.iter().enumerate() {
+        let key = address.to_ascii_lowercase();
+        let meta = leader_event_meta.get(&key);
+        leader_addresses.insert(key.clone());
         leader_summaries.push(CopyPnlAccountSummary {
-            id: meta.leader_id.clone(),
-            kind: "target".to_string(),
-            address: address.clone(),
-            signal_count: meta.signal_count,
-            last_signal_at_ms: meta.last_signal_at_ms,
+            id: meta
+                .map(|meta| meta.leader_id.clone())
+                .filter(|id| !id.trim().is_empty())
+                .unwrap_or_else(|| format!("leader_{}", index + 1)),
+            kind: "target_current".to_string(),
+            address: key,
+            signal_count: meta.map(|meta| meta.signal_count).unwrap_or_default(),
+            last_signal_at_ms: meta.and_then(|meta| meta.last_signal_at_ms),
             ..CopyPnlAccountSummary::default()
         });
+    }
+    if configured_address_set.is_empty() {
+        for (address, meta) in &leader_event_meta {
+            if leader_summary_keys.contains(address) {
+                continue;
+            }
+            leader_addresses.insert(address.clone());
+            leader_summaries.push(CopyPnlAccountSummary {
+                id: meta.leader_id.clone(),
+                kind: "target".to_string(),
+                address: address.clone(),
+                signal_count: meta.signal_count,
+                last_signal_at_ms: meta.last_signal_at_ms,
+                ..CopyPnlAccountSummary::default()
+            });
+        }
     }
     leader_summaries.sort_by(|left, right| {
         left.kind
@@ -7351,7 +7719,11 @@ fn build_copy_summary_response_from_entries(
             .then_with(|| left.id.cmp(&right.id))
             .then_with(|| left.address.cmp(&right.address))
     });
-    let mut leader_addresses = leader_addresses.into_iter().collect::<Vec<_>>();
+    let mut leader_addresses = if configured_address_set.is_empty() {
+        leader_addresses.into_iter().collect::<Vec<_>>()
+    } else {
+        configured_address_set.iter().cloned().collect::<Vec<_>>()
+    };
     leader_addresses.sort();
     let target_realized_pnl_usd = copy_sum_optional(
         leader_summaries
@@ -13158,6 +13530,97 @@ struct CopyLiveSoakStatusResponse {
     fetched_at_ms: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CopyUiSettings {
+    leaders: Vec<String>,
+    copy_ratio: f64,
+    principal_cap_usd: f64,
+    leverage: f64,
+    account_id: String,
+    updated_at_ms: u64,
+}
+
+impl Default for CopyUiSettings {
+    fn default() -> Self {
+        Self {
+            leaders: default_copy_leaders(),
+            copy_ratio: 0.1,
+            principal_cap_usd: COPY_DEFAULT_PRINCIPAL_CAP_USD,
+            leverage: crate::strategies::smart_money::COPY_MAX_LEVERAGE,
+            account_id: "addr_a".to_string(),
+            updated_at_ms: 0,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CopySettingsPayload {
+    #[serde(default)]
+    leaders: Vec<String>,
+    copy_ratio: f64,
+    principal_cap_usd: f64,
+    #[serde(default)]
+    account_id: Option<String>,
+}
+
+impl CopySettingsPayload {
+    fn normalized(self) -> Result<CopyUiSettings> {
+        let leaders = normalize_copy_leaders(self.leaders)?;
+        anyhow::ensure!(
+            self.copy_ratio.is_finite() && self.copy_ratio > 0.0,
+            "copy_ratio must be positive"
+        );
+        anyhow::ensure!(
+            self.principal_cap_usd.is_finite() && self.principal_cap_usd > 0.0,
+            "principal_cap_usd must be positive"
+        );
+        let account_id = self
+            .account_id
+            .unwrap_or_else(|| "addr_a".to_string())
+            .trim()
+            .to_string();
+        anyhow::ensure!(!account_id.is_empty(), "account_id cannot be empty");
+        Ok(CopyUiSettings {
+            leaders,
+            copy_ratio: self.copy_ratio,
+            principal_cap_usd: self.principal_cap_usd,
+            leverage: crate::strategies::smart_money::COPY_MAX_LEVERAGE,
+            account_id,
+            updated_at_ms: 0,
+        })
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct CopySettingsResponse {
+    settings: CopyUiSettings,
+    path: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CopyLiveSoakStartPayload {
+    #[serde(default = "default_copy_soak_window_secs")]
+    window_secs: u64,
+    #[serde(default)]
+    max_rounds: u64,
+    #[serde(default)]
+    max_total_notional_usd: Option<f64>,
+    #[serde(default)]
+    max_total_fees_usd: Option<f64>,
+    #[serde(default = "default_true")]
+    hold_positions_after_submit: bool,
+    #[serde(default)]
+    confirm_mainnet_live: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct CopyLiveSoakActionResponse {
+    action: String,
+    status: CopyLiveSoakStatusResponse,
+    message: String,
+    pid: Option<u32>,
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 struct CopyPnlPositionSummary {
     coin: String,
@@ -14216,9 +14679,9 @@ mod tests {
     };
 
     use super::{
-        CopyPnlAccountSummary, CopyPnlReportSummary, DashboardOpenOrderResponse, FibBasicConfig,
-        FibBasicLevelPlan, FibBasicPlan, FibInstanceRecord, FibInstanceStatus, FibOrderRef,
-        FibPositionSnapshot, FibProfitLossMode, FibTradeDirection, FrontendAppState,
+        CopyPnlAccountSummary, CopyPnlReportSummary, CopyUiSettings, DashboardOpenOrderResponse,
+        FibBasicConfig, FibBasicLevelPlan, FibBasicPlan, FibInstanceRecord, FibInstanceStatus,
+        FibOrderRef, FibPositionSnapshot, FibProfitLossMode, FibTradeDirection, FrontendAppState,
         ManualSettingsPayload, OrderStatusPayload, OrderStatusQuery, PerpFundingLayer,
         ReadinessCheckResponse, SecretUsage, SpotFundingLayer, account_funding_next_actions,
         account_funding_summary, build_basic_plan, build_copy_live_soak_status_response_from_dir,
@@ -14383,6 +14846,7 @@ mod tests {
             None,
             400,
             CopyPnlReportSummary::default(),
+            None,
         );
 
         assert_eq!(summary.leader_count, 2);
@@ -14441,7 +14905,8 @@ mod tests {
             ],
         };
 
-        let summary = build_copy_summary_response_from_entries(vec![copied], None, 400, pnl_report);
+        let summary =
+            build_copy_summary_response_from_entries(vec![copied], None, 400, pnl_report, None);
 
         assert_eq!(summary.leader_count, 1);
         assert_eq!(summary.leader_addresses.len(), 1);
@@ -14467,6 +14932,113 @@ mod tests {
     }
 
     #[test]
+    fn copy_summary_prefers_current_configured_leaders_over_stale_pnl_accounts() {
+        let configured = CopyUiSettings {
+            leaders: vec![
+                "0x6d6d7c05ef7f31b31b618400495b4ce4092a5089".to_string(),
+                "0x6ac0b46b32dc429dbd129a503292f88649d2b8a0".to_string(),
+            ],
+            copy_ratio: 0.2,
+            principal_cap_usd: 25.0,
+            leverage: crate::strategies::smart_money::COPY_MAX_LEVERAGE,
+            account_id: "addr_a".to_string(),
+            updated_at_ms: 123,
+        };
+        let pnl_report = CopyPnlReportSummary {
+            path: Some(".codex-longrun/pnl-since-test.json".to_string()),
+            modified_at_ms: Some(400),
+            accounts: vec![
+                CopyPnlAccountSummary {
+                    id: "scalp_1".to_string(),
+                    kind: "target_scalp".to_string(),
+                    address: configured.leaders[0].clone(),
+                    total_pnl_usd: Some(1.0),
+                    ..CopyPnlAccountSummary::default()
+                },
+                CopyPnlAccountSummary {
+                    id: "old_swing".to_string(),
+                    kind: "target_swing".to_string(),
+                    address: "0x9dead8fffcbf130e7658f672d2c081d91178d617".to_string(),
+                    total_pnl_usd: Some(999.0),
+                    ..CopyPnlAccountSummary::default()
+                },
+            ],
+        };
+
+        let summary = build_copy_summary_response_from_entries(
+            Vec::new(),
+            None,
+            400,
+            pnl_report,
+            Some(&configured),
+        );
+
+        assert_eq!(summary.leader_count, 2);
+        let mut expected = configured.leaders.clone();
+        expected.sort();
+        assert_eq!(summary.leader_addresses, expected);
+        assert_eq!(summary.leader_summaries.len(), 2);
+        assert!(
+            summary
+                .leader_summaries
+                .iter()
+                .all(|leader| configured.leaders.contains(&leader.address))
+        );
+    }
+
+    #[test]
+    fn copy_summary_filters_signal_metrics_to_current_configured_leaders() {
+        let configured = CopyUiSettings {
+            leaders: vec!["0xcurrent".to_string()],
+            copy_ratio: 0.2,
+            principal_cap_usd: 25.0,
+            leverage: crate::strategies::smart_money::COPY_MAX_LEVERAGE,
+            account_id: "addr_a".to_string(),
+            updated_at_ms: 123,
+        };
+        let current = crate::strategies::smart_money::CopyShadowHistoryEntry {
+            schema_version: 1,
+            occurred_at_ms: 100,
+            status: "would_copy".to_string(),
+            leader_id: "current_leader".to_string(),
+            leader_address: "0xcurrent".to_string(),
+            coin: "BTC".to_string(),
+            action_kind: "Open".to_string(),
+            action_event_id: "evt_current".to_string(),
+            live_gate: "live_allowed".to_string(),
+            risk_reject_reason: None,
+            signal_id: Some("sig_current".to_string()),
+            side: Some(OrderSide::Buy),
+            reduce_only: Some(false),
+            notional_usd: Some(12.5),
+            ledger_status: None,
+        };
+        let stale = crate::strategies::smart_money::CopyShadowHistoryEntry {
+            occurred_at_ms: 200,
+            leader_id: "stale_leader".to_string(),
+            leader_address: "0xstale".to_string(),
+            action_event_id: "evt_stale".to_string(),
+            notional_usd: Some(999.0),
+            ..current.clone()
+        };
+
+        let summary = build_copy_summary_response_from_entries(
+            vec![stale, current],
+            None,
+            300,
+            CopyPnlReportSummary::default(),
+            Some(&configured),
+        );
+
+        assert_eq!(summary.leader_count, 1);
+        assert_eq!(summary.shadow_signal_count, 1);
+        assert_eq!(summary.copied_notional_usd, 12.5);
+        assert_eq!(summary.latest_signal_at_ms, Some(100));
+        assert_eq!(summary.latest_entries.len(), 1);
+        assert_eq!(summary.latest_entries[0].leader_address, "0xcurrent");
+    }
+
+    #[test]
     fn copy_summary_preserves_report_unrealized_local_pnl() {
         let pnl_report = CopyPnlReportSummary {
             path: Some(".codex-longrun/pnl-since-test.json".to_string()),
@@ -14482,7 +15054,8 @@ mod tests {
             }],
         };
 
-        let summary = build_copy_summary_response_from_entries(Vec::new(), None, 400, pnl_report);
+        let summary =
+            build_copy_summary_response_from_entries(Vec::new(), None, 400, pnl_report, None);
 
         let local = summary.local_summary.expect("local summary");
         assert_eq!(local.realized_pnl_usd, Some(-0.25));
