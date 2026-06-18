@@ -236,6 +236,18 @@ impl CopyLedger {
                 "COPY_LEDGER_ORDER_SIDE_UNKNOWN",
             );
         };
+        if matches!(self.entries[index].status, CopyLedgerStatus::Closed)
+            && self.entries[index].order_oid == Some(order.oid)
+        {
+            return CopyLedgerReconcileResult {
+                applied: true,
+                signal_id: self.entries[index].signal_id.clone(),
+                status: Some(CopyLedgerStatus::Closed),
+                filled_notional_usd: self.entries[index].filled_notional_usd,
+                consumed_notional_usd: 0.0,
+                reason_code: Some("COPY_LEDGER_ALREADY_RECONCILED".to_string()),
+            };
+        }
         if side != expected_order_side_for_entry(&self.entries[index]) {
             return copy_ledger_reconcile_ignored_signal(
                 &self.entries[index].signal_id,

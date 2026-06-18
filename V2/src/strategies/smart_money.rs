@@ -2766,6 +2766,61 @@ mod tests {
     }
 
     #[test]
+    fn copy_ledger_order_status_replay_for_closed_reduce_is_idempotent() {
+        let mut ledger = CopyLedger::new();
+        ledger.push(ledger_entry(
+            "sig-open",
+            OrderSide::Buy,
+            30.0,
+            0.0,
+            30.0,
+            30.0,
+            CopyLedgerStatus::Open,
+        ));
+        let mut close_entry = ledger_entry(
+            "sig-close-status",
+            OrderSide::Buy,
+            30.0,
+            30.0,
+            0.0,
+            0.0,
+            CopyLedgerStatus::PendingReduce,
+        );
+        close_entry.order_oid = Some(4501);
+        ledger.push(close_entry);
+
+        let report = order_submitted("sig-close-status", OrderSide::Sell, 30.0, true);
+        let first = ledger.apply_order_submission(&report);
+        assert!(first.applied);
+        assert_eq!(first.status, Some(CopyLedgerStatus::Closed));
+
+        let replay_status = order_status_response(
+            "filled",
+            "xyz:XYZ100",
+            "A",
+            "10.0",
+            "3.0",
+            report.oid.expect("submitted oid"),
+            4_000,
+            4_010,
+            Some("0x".to_string() + &report.cloid.replace('-', "")),
+        );
+        let replay =
+            ledger.apply_order_status_evidence("addr_a", "worker-addr_a", &replay_status, &[]);
+
+        assert!(replay.applied);
+        assert_eq!(replay.status, Some(CopyLedgerStatus::Closed));
+        assert_eq!(
+            replay.reason_code.as_deref(),
+            Some("COPY_LEDGER_ALREADY_RECONCILED")
+        );
+        assert_eq!(
+            ledger.effective_exposure_usd("addr_a", "xyz:XYZ100", OrderSide::Buy),
+            0.0
+        );
+    }
+
+    #[test]
     fn copy_ledger_order_status_ignores_unowned_or_wrong_side_evidence() {
         let mut ledger = CopyLedger::new();
         let mut entry = ledger_entry(
