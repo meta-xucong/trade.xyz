@@ -19,6 +19,7 @@ use axum::{
     response::{Html, IntoResponse},
     routing::{any, get, post},
 };
+use base64::Engine;
 use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
@@ -111,6 +112,8 @@ const FIB_INSTANCE_HISTORY_PATH: &str = "logs/fib_instance_history.jsonl";
 const COPY_SHADOW_HISTORY_PATH: &str = "logs/copy_shadow_history.jsonl";
 const COPY_LIVE_SOAK_DIR: &str = ".codex-longrun";
 const COPY_UI_SETTINGS_PATH: &str = ".codex-longrun/copy-ui-settings.json";
+const VAULT_SESSION_CACHE_PATH: &str = ".codex-longrun/vault-session-cache.json";
+const VAULT_SESSION_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 const COPY_LIVE_SOAK_STALE_MS: u64 = 25 * 60 * 1000;
 const FIB_HISTORY_RESPONSE_LIMIT: usize = 80;
 const COPY_SHADOW_HISTORY_RESPONSE_LIMIT: usize = 80;
@@ -142,6 +145,17 @@ struct UnlockedVaultSession {
     path: PathBuf,
     password: String,
     summary: VaultSummary,
+    expires_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedVaultSession {
+    version: u32,
+    vault_path: String,
+    vault_modified_at_ms: u64,
+    unlocked_at_ms: u64,
+    expires_at_ms: u64,
+    protected_password_b64: String,
 }
 
 #[derive(Debug, Clone)]
@@ -160,6 +174,201 @@ impl Drop for UnlockedVaultSession {
     fn drop(&mut self) {
         self.password.zeroize();
     }
+}
+
+fn vault_session_cache_path() -> PathBuf {
+    PathBuf::from(VAULT_SESSION_CACHE_PATH)
+}
+
+fn persist_vault_session_cache(
+    vault_path: &Path,
+    password: &str,
+    unlocked_at_ms: u64,
+    expires_at_ms: u64,
+) -> Result<()> {
+    let cache_path = vault_session_cache_path();
+    persist_vault_session_cache_to_path(
+        &cache_path,
+        vault_path,
+        password,
+        unlocked_at_ms,
+        expires_at_ms,
+    )
+}
+
+fn persist_vault_session_cache_to_path(
+    cache_path: &Path,
+    vault_path: &Path,
+    password: &str,
+    unlocked_at_ms: u64,
+    expires_at_ms: u64,
+) -> Result<()> {
+    let parent = cache_path
+        .parent()
+        .with_context(|| format!("cache path {} has no parent", cache_path.display()))?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create cache directory {}", parent.display()))?;
+    let vault_modified_at_ms = file_modified_at_ms(vault_path).unwrap_or(0);
+    let protected_password = protect_local_secret(password.as_bytes())
+        .context("failed to protect cached Vault session password")?;
+    let cache = PersistedVaultSession {
+        version: 1,
+        vault_path: vault_path.display().to_string(),
+        vault_modified_at_ms,
+        unlocked_at_ms,
+        expires_at_ms,
+        protected_password_b64: base64::engine::general_purpose::STANDARD_NO_PAD
+            .encode(protected_password),
+    };
+    let encoded =
+        serde_json::to_vec_pretty(&cache).context("failed to serialize Vault session cache")?;
+    fs::write(cache_path, encoded).with_context(|| {
+        format!(
+            "failed to write Vault session cache {}",
+            cache_path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn read_cached_vault_password(vault_path: &Path, now_ms_value: u64) -> Result<Option<String>> {
+    let cache_path = vault_session_cache_path();
+    read_cached_vault_password_from_path(&cache_path, vault_path, now_ms_value)
+}
+
+fn read_cached_vault_password_from_path(
+    cache_path: &Path,
+    vault_path: &Path,
+    now_ms_value: u64,
+) -> Result<Option<String>> {
+    if !cache_path.exists() || !vault_path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read(&cache_path).with_context(|| {
+        format!(
+            "failed to read Vault session cache {}",
+            cache_path.display()
+        )
+    })?;
+    let cache = serde_json::from_slice::<PersistedVaultSession>(&raw)
+        .context("failed to parse Vault session cache")?;
+    if cache.version != 1
+        || PathBuf::from(&cache.vault_path) != vault_path
+        || now_ms_value > cache.expires_at_ms
+    {
+        return Ok(None);
+    }
+    if file_modified_at_ms(vault_path).unwrap_or(0) != cache.vault_modified_at_ms {
+        return Ok(None);
+    }
+    let protected = base64::engine::general_purpose::STANDARD_NO_PAD
+        .decode(cache.protected_password_b64)
+        .context("failed to decode cached Vault session password")?;
+    let mut plain =
+        unprotect_local_secret(&protected).context("failed to unprotect cached Vault session")?;
+    let password =
+        String::from_utf8(plain.clone()).context("cached Vault session password is not UTF-8")?;
+    plain.zeroize();
+    Ok(Some(password))
+}
+
+#[cfg(windows)]
+fn protect_local_secret(secret: &[u8]) -> Result<Vec<u8>> {
+    use std::ptr;
+    use windows_sys::Win32::Security::Cryptography::{
+        CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData,
+    };
+
+    let mut input = CRYPT_INTEGER_BLOB {
+        cbData: secret
+            .len()
+            .try_into()
+            .context("secret is too large for DPAPI")?,
+        pbData: secret.as_ptr() as *mut u8,
+    };
+    let mut output = CRYPT_INTEGER_BLOB::default();
+    // SAFETY: input points to `secret` for the duration of the call; output is freed with LocalFree.
+    let ok = unsafe {
+        CryptProtectData(
+            &mut input,
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut output,
+        )
+    };
+    if ok == 0 {
+        anyhow::bail!("CryptProtectData failed");
+    }
+    let bytes = unsafe { protected_blob_to_vec_and_free(output) };
+    Ok(bytes)
+}
+
+#[cfg(windows)]
+fn unprotect_local_secret(secret: &[u8]) -> Result<Vec<u8>> {
+    use std::ptr;
+    use windows_sys::Win32::Security::Cryptography::{
+        CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptUnprotectData,
+    };
+
+    let mut input = CRYPT_INTEGER_BLOB {
+        cbData: secret
+            .len()
+            .try_into()
+            .context("secret is too large for DPAPI")?,
+        pbData: secret.as_ptr() as *mut u8,
+    };
+    let mut output = CRYPT_INTEGER_BLOB::default();
+    // SAFETY: input points to `secret` for the duration of the call; output is freed with LocalFree.
+    let ok = unsafe {
+        CryptUnprotectData(
+            &mut input,
+            ptr::null_mut(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut output,
+        )
+    };
+    if ok == 0 {
+        anyhow::bail!("CryptUnprotectData failed");
+    }
+    let bytes = unsafe { protected_blob_to_vec_and_free(output) };
+    Ok(bytes)
+}
+
+#[cfg(windows)]
+unsafe fn protected_blob_to_vec_and_free(
+    blob: windows_sys::Win32::Security::Cryptography::CRYPT_INTEGER_BLOB,
+) -> Vec<u8> {
+    use windows_sys::Win32::Foundation::LocalFree;
+
+    let bytes = if blob.pbData.is_null() || blob.cbData == 0 {
+        Vec::new()
+    } else {
+        // SAFETY: DPAPI returned `pbData` with `cbData` bytes; caller frees it below.
+        unsafe { std::slice::from_raw_parts(blob.pbData, blob.cbData as usize) }.to_vec()
+    };
+    if !blob.pbData.is_null() {
+        // SAFETY: DPAPI buffers must be released with LocalFree.
+        unsafe {
+            LocalFree(blob.pbData.cast());
+        }
+    }
+    bytes
+}
+
+#[cfg(not(windows))]
+fn protect_local_secret(_secret: &[u8]) -> Result<Vec<u8>> {
+    anyhow::bail!("persistent Vault session cache is only supported on Windows")
+}
+
+#[cfg(not(windows))]
+fn unprotect_local_secret(_secret: &[u8]) -> Result<Vec<u8>> {
+    anyhow::bail!("persistent Vault session cache is only supported on Windows")
 }
 
 impl FrontendAppState {
@@ -513,7 +722,22 @@ impl FrontendAppState {
         password: String,
         summary: VaultSummary,
     ) -> Result<VaultSummary> {
+        self.store_vault_session_with_cache(path, password, summary, true)
+    }
+
+    fn store_vault_session_with_cache(
+        &self,
+        path: PathBuf,
+        password: String,
+        summary: VaultSummary,
+        persist_cache: bool,
+    ) -> Result<VaultSummary> {
         self.sync_vault_entries_into_config(&summary)?;
+        let unlocked_at_ms = now_ms();
+        let expires_at_ms = unlocked_at_ms.saturating_add(VAULT_SESSION_TTL_MS);
+        if persist_cache {
+            persist_vault_session_cache(&path, &password, unlocked_at_ms, expires_at_ms)?;
+        }
         let mut guard = self
             .vault_session
             .write()
@@ -522,8 +746,20 @@ impl FrontendAppState {
             path,
             password,
             summary: summary.clone(),
+            expires_at_ms,
         });
         Ok(summary)
+    }
+
+    fn restore_vault_session_from_cache(&self) -> Result<bool> {
+        let config = self.config_snapshot()?;
+        let path = PathBuf::from(&config.secrets.vault_path);
+        let Some(password) = read_cached_vault_password(&path, now_ms())? else {
+            return Ok(false);
+        };
+        let summary = unlock_vault(&path, &password)?;
+        self.store_vault_session_with_cache(path, password, summary, false)?;
+        Ok(true)
     }
 
     fn vault_summary(&self, path: &Path) -> Result<VaultSummary> {
@@ -534,6 +770,7 @@ impl FrontendAppState {
         if let Some(session) = guard.as_ref()
             && session.path == path
             && path.exists()
+            && now_ms() <= session.expires_at_ms
         {
             let mut summary = session.summary.clone();
             summary.exists = true;
@@ -554,7 +791,7 @@ impl FrontendAppState {
             .map_err(|_| anyhow::anyhow!("vault session lock is poisoned"))?;
         let session = guard
             .as_ref()
-            .filter(|session| session.path == path)
+            .filter(|session| session.path == path && now_ms() <= session.expires_at_ms)
             .context("vault is locked; unlock before this action or enter password")?;
         Ok(session.password.clone())
     }
@@ -566,7 +803,9 @@ impl FrontendAppState {
             .map_err(|_| anyhow::anyhow!("vault session lock is poisoned"))?;
         Ok(guard
             .as_ref()
-            .filter(|session| session.path == path && path.exists())
+            .filter(|session| {
+                session.path == path && path.exists() && now_ms() <= session.expires_at_ms
+            })
             .map(|session| session.password.clone()))
     }
 
@@ -726,6 +965,9 @@ pub async fn run(options: FrontendOptions) -> Result<()> {
         account_funding_batch_cache: Arc::new(RwLock::new(HashMap::new())),
         manual_protective_rules_cache: Arc::new(RwLock::new(HashMap::new())),
     };
+    if let Err(error) = state.restore_vault_session_from_cache() {
+        tracing::warn!(%error, path = VAULT_SESSION_CACHE_PATH, "failed to restore cached Vault session");
+    }
     spawn_realtime_runtime(state.config_snapshot()?, realtime);
     tokio::spawn(fib_reconciliation_loop(state.clone()));
     let app = Router::new()
@@ -7357,12 +7599,9 @@ fn start_copy_live_soak_from_frontend(
     if config.app.environment == "mainnet" && !payload.confirm_mainnet_live {
         anyhow::bail!("mainnet live copy soak requires confirm_mainnet_live=true");
     }
+    let vault_path = PathBuf::from(&config.secrets.vault_path);
     let vault_password = state
-        .vault_session
-        .read()
-        .map_err(|_| anyhow::anyhow!("vault session lock is poisoned"))?
-        .as_ref()
-        .map(|session| session.password.clone())
+        .resolve_vault_password(&vault_path, "")
         .context("vault must be unlocked before starting live copy soak")?;
     let max_total_notional_usd = payload
         .max_total_notional_usd
@@ -8413,7 +8652,7 @@ fn read_last_json_line(path: &Path) -> Result<Option<Value>> {
     let raw = fs::read_to_string(path)
         .with_context(|| format!("failed to read live soak summary {}", path.display()))?;
     for line in raw.lines().rev() {
-        let line = line.trim();
+        let line = line.trim().trim_start_matches('\u{feff}');
         if line.is_empty() {
             continue;
         }
@@ -14683,8 +14922,9 @@ mod tests {
         FibBasicConfig, FibBasicLevelPlan, FibBasicPlan, FibInstanceRecord, FibInstanceStatus,
         FibOrderRef, FibPositionSnapshot, FibProfitLossMode, FibTradeDirection, FrontendAppState,
         ManualSettingsPayload, OrderStatusPayload, OrderStatusQuery, PerpFundingLayer,
-        ReadinessCheckResponse, SecretUsage, SpotFundingLayer, account_funding_next_actions,
-        account_funding_summary, build_basic_plan, build_copy_live_soak_status_response_from_dir,
+        ReadinessCheckResponse, SecretUsage, SpotFundingLayer, VAULT_SESSION_TTL_MS,
+        account_funding_next_actions, account_funding_summary, build_basic_plan,
+        build_copy_live_soak_status_response_from_dir,
         build_copy_shadow_history_response_from_path, build_copy_summary_response_from_entries,
         build_fib_strategy_pnl_summary, dashboard_cancel_stopped_without_open_orders_count,
         dashboard_cancel_strategy_ids, dashboard_order_is_cancelable_fib_entry,
@@ -14695,7 +14935,8 @@ mod tests {
         fib_restart_cooldown_secs, fib_should_stop_after_cycle, fib_waiting_for_entry_message,
         fill_event_type, live_readiness_next_actions, live_readiness_summary,
         mark_fib_record_auto_loop_retry_wait, mark_fib_record_incomplete_entry_submission,
-        normalize_recovered_fib_instance, read_copy_live_soak_pnl_summary,
+        normalize_recovered_fib_instance, persist_vault_session_cache_to_path,
+        read_cached_vault_password_from_path, read_copy_live_soak_pnl_summary,
         read_recent_copy_shadow_history_entries_from_paths, selected_enabled_account_ids,
         trade_record_event_type, transfer_amount_label, usdc_transfer_readiness_next_actions,
         usdc_transfer_readiness_summary, validate_batch_account_count,
@@ -14759,6 +15000,96 @@ mod tests {
                 .expect("missing optional session password"),
             None
         );
+    }
+
+    #[test]
+    fn vault_session_cache_restores_password_before_expiry() {
+        let dir = std::env::temp_dir().join(format!(
+            "trade_xyz_frontend_vault_cache_restore_{}",
+            crate::domain::now_ms()
+        ));
+        fs::create_dir_all(&dir).expect("test dir");
+        let vault_path = dir.join("trade_xyz.vault");
+        let cache_path = dir.join("vault-session-cache.json");
+        fs::write(&vault_path, b"encrypted-placeholder").expect("vault placeholder");
+        let now = 1_000_000;
+
+        persist_vault_session_cache_to_path(
+            &cache_path,
+            &vault_path,
+            "persistent password",
+            now,
+            now + VAULT_SESSION_TTL_MS,
+        )
+        .expect("write cache");
+
+        let restored = read_cached_vault_password_from_path(&cache_path, &vault_path, now + 1)
+            .expect("read cache")
+            .expect("cached password");
+
+        assert_eq!(restored, "persistent password");
+        let raw = fs::read_to_string(&cache_path).expect("cache text");
+        assert!(!raw.contains("persistent password"));
+    }
+
+    #[test]
+    fn vault_session_cache_expires_after_ttl() {
+        let dir = std::env::temp_dir().join(format!(
+            "trade_xyz_frontend_vault_cache_expiry_{}",
+            crate::domain::now_ms()
+        ));
+        fs::create_dir_all(&dir).expect("test dir");
+        let vault_path = dir.join("trade_xyz.vault");
+        let cache_path = dir.join("vault-session-cache.json");
+        fs::write(&vault_path, b"encrypted-placeholder").expect("vault placeholder");
+        let now = 2_000_000;
+
+        persist_vault_session_cache_to_path(
+            &cache_path,
+            &vault_path,
+            "persistent password",
+            now,
+            now + VAULT_SESSION_TTL_MS,
+        )
+        .expect("write cache");
+
+        let restored = read_cached_vault_password_from_path(
+            &cache_path,
+            &vault_path,
+            now + VAULT_SESSION_TTL_MS + 1,
+        )
+        .expect("read cache");
+
+        assert_eq!(restored, None);
+    }
+
+    #[test]
+    fn vault_session_cache_invalidates_when_vault_file_changes() {
+        let dir = std::env::temp_dir().join(format!(
+            "trade_xyz_frontend_vault_cache_mtime_{}",
+            crate::domain::now_ms()
+        ));
+        fs::create_dir_all(&dir).expect("test dir");
+        let vault_path = dir.join("trade_xyz.vault");
+        let cache_path = dir.join("vault-session-cache.json");
+        fs::write(&vault_path, b"encrypted-placeholder").expect("vault placeholder");
+        let now = 3_000_000;
+
+        persist_vault_session_cache_to_path(
+            &cache_path,
+            &vault_path,
+            "persistent password",
+            now,
+            now + VAULT_SESSION_TTL_MS,
+        )
+        .expect("write cache");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        fs::write(&vault_path, b"changed-placeholder").expect("change vault");
+
+        let restored = read_cached_vault_password_from_path(&cache_path, &vault_path, now + 1)
+            .expect("read cache");
+
+        assert_eq!(restored, None);
     }
 
     #[test]
@@ -15260,6 +15591,37 @@ mod tests {
             status.watcher_status.as_deref(),
             Some("completed_duration_watcher_open")
         );
+    }
+
+    #[test]
+    fn copy_live_soak_status_ignores_summary_bom() {
+        let dir = std::env::temp_dir().join(format!(
+            "trade_xyz_copy_live_soak_bom_{}",
+            crate::domain::now_ms()
+        ));
+        fs::create_dir_all(&dir).expect("test dir");
+        fs::write(
+            dir.join("persistent-live-soak-20260619-021831-run.log"),
+            "2026-06-19T02:28:40+08:00 round=2 starting report=.codex-longrun\\persistent-live-soak-20260619-021831-round-0002.json\n",
+        )
+        .expect("run log");
+        fs::write(
+            dir.join("persistent-live-soak-20260619-021831-summary.jsonl"),
+            "\u{feff}{\"run_id\":\"20260619-021831\",\"round\":1,\"ok\":true,\"submitted_reports\":0,\"order_evidence\":0,\"cleanup_errors\":0,\"watcher_status\":\"completed_duration_watcher_open\",\"final_flat\":true,\"final_reconcile_health\":true,\"hold_positions_after_submit\":true,\"report_path\":\".codex-longrun\\\\persistent-live-soak-20260619-021831-round-0001.json\"}\n",
+        )
+        .expect("summary");
+        fs::write(
+            dir.join("persistent-live-soak-detached-current.pid"),
+            format!("{}\n", std::process::id()),
+        )
+        .expect("pid");
+
+        let status = build_copy_live_soak_status_response_from_dir(&dir, crate::domain::now_ms())
+            .expect("status");
+
+        assert!(status.running);
+        assert_eq!(status.latest_round, Some(1));
+        assert_eq!(status.final_reconcile_health, Some(true));
     }
 
     #[test]

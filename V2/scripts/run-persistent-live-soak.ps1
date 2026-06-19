@@ -43,7 +43,7 @@ function Write-SoakLog {
     param([string]$Message)
     $line = "$(Get-Date -Format o) $Message"
     Add-Content -LiteralPath $logPath -Value $line -Encoding utf8
-    Write-Output $line
+    Write-Host $line
 }
 
 Write-SoakLog "starting persistent live soak window_secs=$WindowSecs max_rounds=$MaxRounds max_notional=$MaxTotalNotionalUsd max_fees=$MaxTotalFeesUsd hold_positions_after_submit=$([bool]$HoldPositionsAfterSubmit) settings=$SettingsPath persistence=$persistencePath shadow=$shadowPath"
@@ -114,6 +114,15 @@ function Invoke-BotRound {
         return 124
     }
 
+    $process.Refresh()
+    if ($null -eq $process.ExitCode) {
+        Start-Sleep -Milliseconds 200
+        $process.Refresh()
+    }
+    if ($null -eq $process.ExitCode) {
+        Write-SoakLog "round child exited but ExitCode was unavailable pid=$($process.Id); treating as success only if report validation passes"
+        return 0
+    }
     return $process.ExitCode
 }
 
@@ -266,7 +275,8 @@ while ($true) {
         report_path = $reportPath
         timestamp = (Get-Date -Format o)
     }
-    $summary | ConvertTo-Json -Compress | Add-Content -LiteralPath $summaryPath -Encoding utf8
+    $summaryLine = $summary | ConvertTo-Json -Compress
+    [System.IO.File]::AppendAllText($summaryPath, "$summaryLine`n", [System.Text.UTF8Encoding]::new($false))
     Write-SoakLog "round=$round ok=$($summary.ok) submitted=$submittedCount evidence=$evidenceCount cleanup_errors=$cleanupErrors final_reconcile_health=$finalReconcileHealth hold_positions_after_submit=$($summary.hold_positions_after_submit) ready=$($summary.ready_for_unattended_submit)"
     if ($failedChecks.Count -gt 0) {
         Write-SoakLog "round=$round failed_checks=$($failedChecks -join ' | ')"

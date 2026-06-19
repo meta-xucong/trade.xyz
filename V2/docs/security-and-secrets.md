@@ -64,7 +64,11 @@ vault 文件格式由程序维护：
 - 文件中保存 salt、nonce 和密文，不保存密码。
 - 解锁成功后只返回 `secret_id`、`account_id`、地址和更新时间，不回显私钥。
 - 前端控制台解锁成功后，后端进程会保留一个本机内存解锁会话；刷新页面或点击刷新
-  状态不需要重复输入密码。该会话不写入磁盘，控制台服务重启后必须重新解锁。
+  状态不需要重复输入密码。
+- 解锁成功会同时写入一个本机 30 天有效的会话缓存
+  `.codex-longrun/vault-session-cache.json`。缓存内的 Vault 密码只保存为 Windows
+  DPAPI 当前用户保护后的密文；缓存过期、Vault 文件修改、DPAPI 解密失败或换到其他
+  用户/机器时，后端会自动回到“需要重新输入密码”的状态。
 - 解锁已有 vault 文件时，后端会把 vault 条目的非敏感账号信息同步进当前本地配置，
   让 vault 中已保存的地址立即参与 Dashboard、Manual 和 signed preflight；同步过程不写
   入私钥，不覆盖账号级 notional/copy ratio 等风控字段。
@@ -90,7 +94,8 @@ Vault 页面支持两种写入方式：
   `copy_ratio = 0.10`、`max_order_notional_usd = 100.0`，私钥仍只保存在 vault。
 
 worker 实盘运行时通过 `account.secret_id` 查找对应密钥。若需要非交互启动，可用
-`TRADE_XYZ_VAULT_PASSWORD` 提供解锁密码；后续可升级为 Windows DPAPI 本机记住模式。
+`TRADE_XYZ_VAULT_PASSWORD` 提供解锁密码；本机前端服务重启时会优先尝试恢复仍在
+30 天有效期内的 DPAPI 会话缓存。
 
 ## 实盘保护
 
