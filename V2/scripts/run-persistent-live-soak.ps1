@@ -47,6 +47,26 @@ function Write-SoakLog {
     Write-Host $line
 }
 
+function Read-JsonObjectFile {
+    param([string]$Path)
+    $raw = Get-Content -LiteralPath $Path -Raw -Encoding utf8
+    try {
+        return $raw | ConvertFrom-Json
+    } catch {
+        $start = $raw.IndexOf('{')
+        $end = $raw.LastIndexOf('}')
+        if ($start -ge 0 -and $end -gt $start) {
+            $json = $raw.Substring($start, $end - $start + 1)
+            try {
+                return $json | ConvertFrom-Json
+            } catch {
+                throw "failed to parse JSON object from $Path after stripping noisy output: $($_.Exception.Message)"
+            }
+        }
+        throw "failed to parse JSON object from ${Path}: $($_.Exception.Message)"
+    }
+}
+
 function Get-NotificationSettings {
     if (-not (Test-Path -LiteralPath $notificationSettingsPath)) {
         return $null
@@ -180,6 +200,10 @@ function Invoke-BotRound {
         Remove-Item -LiteralPath $StderrPath -Force
     }
 
+    $previousNoColor = [Environment]::GetEnvironmentVariable("NO_COLOR", "Process")
+    $previousRustLog = [Environment]::GetEnvironmentVariable("RUST_LOG", "Process")
+    [Environment]::SetEnvironmentVariable("NO_COLOR", "1", "Process")
+    [Environment]::SetEnvironmentVariable("RUST_LOG", "error", "Process")
     $process = Start-Process `
         -FilePath $ExePath `
         -ArgumentList $Arguments `
@@ -188,6 +212,16 @@ function Invoke-BotRound {
         -RedirectStandardError $StderrPath `
         -WindowStyle Hidden `
         -PassThru
+    if ($null -eq $previousNoColor) {
+        [Environment]::SetEnvironmentVariable("NO_COLOR", $null, "Process")
+    } else {
+        [Environment]::SetEnvironmentVariable("NO_COLOR", $previousNoColor, "Process")
+    }
+    if ($null -eq $previousRustLog) {
+        [Environment]::SetEnvironmentVariable("RUST_LOG", $null, "Process")
+    } else {
+        [Environment]::SetEnvironmentVariable("RUST_LOG", $previousRustLog, "Process")
+    }
 
     if (-not $process.WaitForExit($TimeoutSecs * 1000)) {
         try {
@@ -301,7 +335,7 @@ while ($true) {
         Stop-WithNotification -Code $roundExitCode -Status "failed" -Reason "round_exit_code" -Detail "round=$round exit_code=$roundExitCode stderr=$stderrPath"
     }
 
-    $report = Get-Content -LiteralPath $reportPath -Raw -Encoding utf8 | ConvertFrom-Json
+    $report = Read-JsonObjectFile -Path $reportPath
     $submittedCount = @($report.persistent_live_submit.submitted_reports).Count
     $evidenceCount = @($report.persistent_live_submit.order_evidence).Count
     $cleanupCount = @($report.persistent_live_submit.cleanup_runbooks).Count

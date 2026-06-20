@@ -8955,7 +8955,10 @@ fn find_running_copy_live_soak_pid() -> Option<u32> {
 Get-CimInstance Win32_Process |
   Where-Object {
     $_.ProcessId -ne $PID -and
-    $_.CommandLine -like '*run-persistent-live-soak.ps1*'
+    $_.Name -match '^(powershell|pwsh)\.exe$' -and
+    $_.CommandLine -like '*run-persistent-live-soak.ps1*' -and
+    $_.CommandLine -match '(?i)(^|\s)-File\s+' -and
+    $_.CommandLine -notlike '*Get-CimInstance*'
   } |
   Sort-Object CreationDate -Descending |
   Select-Object -First 1 -ExpandProperty ProcessId

@@ -148,15 +148,26 @@ function Get-SoakProcess {
         $soakPid = 0
         if ([int]::TryParse($pidText.Trim(), [ref]$soakPid)) {
             $byPid = Get-CimInstance Win32_Process -Filter "ProcessId=$soakPid" -ErrorAction SilentlyContinue
-            if ($byPid -and $byPid.CommandLine -like "*run-persistent-live-soak.ps1*") {
+            if ($byPid -and (Test-SoakProcessCommand $byPid)) {
                 return $byPid
             }
         }
     }
     return Get-CimInstance Win32_Process | Where-Object {
-        $_.Name -match "^(powershell|pwsh)\.exe$" -and
-        $_.CommandLine -like "*run-persistent-live-soak.ps1*"
+        Test-SoakProcessCommand $_
     } | Sort-Object CreationDate -Descending | Select-Object -First 1
+}
+
+function Test-SoakProcessCommand {
+    param([object]$Process)
+    if ($null -eq $Process) {
+        return $false
+    }
+    $commandLine = [string]$Process.CommandLine
+    return $Process.Name -match "^(powershell|pwsh)\.exe$" `
+        -and $commandLine -like "*run-persistent-live-soak.ps1*" `
+        -and $commandLine -match "(?i)(^|\\s)-File\\s+" `
+        -and $commandLine -notlike "*Get-CimInstance*"
 }
 
 function Test-SoakProcessRunning {
