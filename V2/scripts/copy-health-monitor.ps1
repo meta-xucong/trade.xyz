@@ -124,7 +124,7 @@ function Get-LatestRunDiagnostic {
     $parts = @("running=$($data.running)", "run_id=$($data.run_id)", "message=$($data.message)")
     if ($data.latest_report_path -and (Test-Path -LiteralPath $data.latest_report_path)) {
         try {
-            $report = Get-Content -LiteralPath $data.latest_report_path -Raw -Encoding utf8 | ConvertFrom-Json
+            $report = Read-JsonObjectFile -Path $data.latest_report_path
             $failed = @($report.checks | Where-Object { -not $_.ok } | ForEach-Object { "$($_.name): $($_.detail)" })
             $parts += "report_ok=$($report.ok)"
             $parts += "watcher_status=$($report.watcher_status)"
@@ -139,6 +139,26 @@ function Get-LatestRunDiagnostic {
         }
     }
     return ($parts -join "; ")
+}
+
+function Read-JsonObjectFile {
+    param([string]$Path)
+    $raw = Get-Content -LiteralPath $Path -Raw -Encoding utf8
+    try {
+        return $raw | ConvertFrom-Json
+    } catch {
+        $start = $raw.IndexOf('{')
+        $end = $raw.LastIndexOf('}')
+        if ($start -ge 0 -and $end -gt $start) {
+            $json = $raw.Substring($start, $end - $start + 1)
+            try {
+                return $json | ConvertFrom-Json
+            } catch {
+                throw "failed to parse JSON object from $Path after stripping noisy output: $($_.Exception.Message)"
+            }
+        }
+        throw "failed to parse JSON object from ${Path}: $($_.Exception.Message)"
+    }
 }
 
 function Get-SoakProcess {
@@ -214,8 +234,7 @@ function Set-LatestSoakPid {
     param([datetime]$StartedAt)
     Start-Sleep -Seconds 2
     $proc = Get-CimInstance Win32_Process | Where-Object {
-        $_.Name -match "^(powershell|pwsh)\.exe$" -and
-        $_.CommandLine -like "*run-persistent-live-soak.ps1*" -and
+        (Test-SoakProcessCommand $_) -and
         $_.CreationDate -ge $StartedAt.AddSeconds(-5)
     } | Sort-Object CreationDate -Descending | Select-Object -First 1
     if ($proc) {
