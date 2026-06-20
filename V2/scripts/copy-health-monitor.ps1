@@ -19,12 +19,83 @@ $ErrorActionPreference = "Stop"
 $projectRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 Set-Location $projectRoot
 New-Item -ItemType Directory -Force -Path ".codex-longrun" | Out-Null
+$notificationSettingsPath = ".codex-longrun\notification-settings.json"
 
 function Write-MonitorLog {
     param([string]$Message)
     $line = "$(Get-Date -Format o) $Message"
     Add-Content -LiteralPath $LogPath -Value $line -Encoding utf8
     Write-Host $line
+}
+
+function Get-NotificationSettings {
+    if (-not (Test-Path -LiteralPath $notificationSettingsPath)) {
+        return $null
+    }
+    try {
+        $settings = Get-Content -LiteralPath $notificationSettingsPath -Raw -Encoding utf8 | ConvertFrom-Json
+        if (-not [bool]$settings.enabled) {
+            return $null
+        }
+        return $settings
+    } catch {
+        Write-MonitorLog "notification settings parse failed: $($_.Exception.Message)"
+        return $null
+    }
+}
+
+function Send-MonitorNotification {
+    param(
+        [string]$Status,
+        [string]$Reason,
+        [string]$Detail
+    )
+    $settings = Get-NotificationSettings
+    if ($null -eq $settings) {
+        return
+    }
+    $title = "trade.xyz copy health monitor $Status"
+    $message = @(
+        "status=$Status",
+        "reason=$Reason",
+        "detail=$Detail",
+        "time=$(Get-Date -Format o)"
+    ) -join "`n"
+    try {
+        if ([string]$settings.provider -eq "feishu") {
+            $webhook = [string]$settings.feishu_webhook
+            if ([string]::IsNullOrWhiteSpace($webhook)) {
+                return
+            }
+            $body = @{
+                msg_type = "text"
+                content = @{ text = "$title`n$message" }
+            } | ConvertTo-Json -Compress -Depth 6
+            Invoke-RestMethod -Uri $webhook -Method POST -ContentType "application/json" -Body $body -TimeoutSec 10 | Out-Null
+            Write-MonitorLog "notification sent provider=feishu status=$Status reason=$Reason"
+        } else {
+            $sendKey = [string]$settings.serverchan_sendkey
+            if ([string]::IsNullOrWhiteSpace($sendKey)) {
+                return
+            }
+            Invoke-RestMethod -Uri "https://sctapi.ftqq.com/$sendKey.send" -Method POST -ContentType "application/x-www-form-urlencoded" -Body @{
+                title = $title
+                desp = $message
+                short = $Reason
+                noip = "1"
+            } -TimeoutSec 10 | Out-Null
+            Write-MonitorLog "notification sent provider=serverchan status=$Status reason=$Reason"
+        }
+    } catch {
+        $errorMessage = [string]$_.Exception.Message
+        if ($null -ne $settings.serverchan_sendkey) {
+            $errorMessage = $errorMessage.Replace([string]$settings.serverchan_sendkey, "***")
+        }
+        if ($null -ne $settings.feishu_webhook) {
+            $errorMessage = $errorMessage.Replace([string]$settings.feishu_webhook, "***")
+        }
+        Write-MonitorLog "notification failed provider=$($settings.provider) status=$Status error=$errorMessage"
+    }
 }
 
 function Invoke-Json {
@@ -209,7 +280,13 @@ while ($true) {
         } else {
             $diagnostic = Get-LatestRunDiagnostic
             Write-MonitorLog "detected stopped soak; diagnostic: $diagnostic"
-            Start-CopyLiveSoak
+            Send-MonitorNotification -Status "stopped" -Reason "soak_not_running" -Detail $diagnostic
+            try {
+                Start-CopyLiveSoak
+            } catch {
+                Send-MonitorNotification -Status "failed" -Reason "restart_failed" -Detail $_.Exception.Message
+                throw
+            }
         }
     } catch {
         if (Test-SoakProcessRunning) {
@@ -217,6 +294,7 @@ while ($true) {
             Write-MonitorLog "healthy_fallback pid=$($proc.ProcessId) status_exception=$($_.Exception.Message)"
         } else {
             Write-MonitorLog "monitor loop error: $($_.Exception.Message)"
+            Send-MonitorNotification -Status "failed" -Reason "monitor_loop_error" -Detail $_.Exception.Message
         }
     }
     Start-Sleep -Seconds $PollSecs

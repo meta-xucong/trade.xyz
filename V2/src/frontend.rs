@@ -112,6 +112,7 @@ const FIB_INSTANCE_HISTORY_PATH: &str = "logs/fib_instance_history.jsonl";
 const COPY_SHADOW_HISTORY_PATH: &str = "logs/copy_shadow_history.jsonl";
 const COPY_LIVE_SOAK_DIR: &str = ".codex-longrun";
 const COPY_UI_SETTINGS_PATH: &str = ".codex-longrun/copy-ui-settings.json";
+const NOTIFICATION_SETTINGS_PATH: &str = ".codex-longrun/notification-settings.json";
 const VAULT_SESSION_CACHE_PATH: &str = ".codex-longrun/vault-session-cache.json";
 const VAULT_SESSION_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 const COPY_LIVE_SOAK_STALE_MS: u64 = 25 * 60 * 1000;
@@ -1075,6 +1076,10 @@ pub async fn run(options: FrontendOptions) -> Result<()> {
         .route("/api/vault/change-password", post(vault_change_password))
         .route("/api/vault/upsert", post(vault_upsert))
         .route("/api/vault/check-secret", post(vault_check_secret))
+        .route(
+            "/api/vault/notifications",
+            get(vault_notifications).post(vault_notifications_update),
+        )
         .with_state(state);
 
     let listener = TcpListener::bind(&options.bind_addr)
@@ -3440,6 +3445,7 @@ async fn copy_live_soak_start(
         "max_total_notional_usd": payload.max_total_notional_usd,
         "max_total_fees_usd": payload.max_total_fees_usd,
         "hold_positions_after_submit": payload.hold_positions_after_submit,
+        "persistence_path": payload.persistence_path.clone(),
     });
     let result = start_copy_live_soak_from_frontend(&state, payload);
     let response = ApiResult::from_result(result);
@@ -4129,6 +4135,41 @@ async fn vault_check_secret(
     state.audit_api_result(
         "vault_check_secret",
         audit_account_id,
+        None,
+        audit_details,
+        &response,
+    );
+    Json(response)
+}
+
+async fn vault_notifications() -> Json<ApiResult<NotificationSettingsResponse>> {
+    Json(ApiResult::from_result(
+        read_notification_settings().map(NotificationSettingsResponse::from_settings),
+    ))
+}
+
+async fn vault_notifications_update(
+    State(state): State<FrontendAppState>,
+    Json(payload): Json<NotificationSettingsPayload>,
+) -> Json<ApiResult<NotificationSettingsResponse>> {
+    let audit_details = json!({
+        "enabled": payload.enabled,
+        "provider": payload.provider.clone(),
+        "serverchan_sendkey_present": payload
+            .serverchan_sendkey
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty()),
+        "feishu_webhook_present": payload
+            .feishu_webhook
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty()),
+    });
+    let result =
+        update_notification_settings(payload).map(NotificationSettingsResponse::from_settings);
+    let response = ApiResult::from_result(result);
+    state.audit_api_result(
+        "vault_notifications_update",
+        None,
         None,
         audit_details,
         &response,
@@ -7580,6 +7621,139 @@ fn write_json_pretty<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         .with_context(|| format!("failed to write {}", path.display()))
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct NotificationSettings {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    provider: String,
+    #[serde(default)]
+    serverchan_sendkey: String,
+    #[serde(default)]
+    feishu_webhook: String,
+}
+
+impl Default for NotificationSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: "serverchan".to_string(),
+            serverchan_sendkey: String::new(),
+            feishu_webhook: String::new(),
+        }
+    }
+}
+
+impl NotificationSettings {
+    fn normalized(mut self) -> Self {
+        self.provider = match self.provider.trim().to_lowercase().as_str() {
+            "feishu" | "lark" => "feishu".to_string(),
+            _ => "serverchan".to_string(),
+        };
+        self.serverchan_sendkey = self.serverchan_sendkey.trim().to_string();
+        self.feishu_webhook = self.feishu_webhook.trim().to_string();
+        if !self.enabled {
+            return self;
+        }
+        let has_target = match self.provider.as_str() {
+            "feishu" => !self.feishu_webhook.is_empty(),
+            _ => !self.serverchan_sendkey.is_empty(),
+        };
+        if !has_target {
+            self.enabled = false;
+        }
+        self
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct NotificationSettingsResponse {
+    enabled: bool,
+    provider: String,
+    serverchan_configured: bool,
+    feishu_configured: bool,
+    path: String,
+}
+
+impl NotificationSettingsResponse {
+    fn from_settings(settings: NotificationSettings) -> Self {
+        Self {
+            enabled: settings.enabled,
+            provider: settings.provider,
+            serverchan_configured: !settings.serverchan_sendkey.trim().is_empty(),
+            feishu_configured: !settings.feishu_webhook.trim().is_empty(),
+            path: NOTIFICATION_SETTINGS_PATH.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct NotificationSettingsPayload {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    provider: String,
+    #[serde(default)]
+    serverchan_sendkey: Option<String>,
+    #[serde(default)]
+    feishu_webhook: Option<String>,
+}
+
+fn read_notification_settings() -> Result<NotificationSettings> {
+    let path = Path::new(NOTIFICATION_SETTINGS_PATH);
+    if !path.exists() {
+        return Ok(NotificationSettings::default());
+    }
+    let raw =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    if raw.trim().is_empty() {
+        return Ok(NotificationSettings::default());
+    }
+    let settings = serde_json::from_str::<NotificationSettings>(&raw)
+        .context("failed to parse notification settings")?;
+    Ok(settings.normalized())
+}
+
+fn write_notification_settings(settings: &NotificationSettings) -> Result<()> {
+    write_json_pretty(
+        Path::new(NOTIFICATION_SETTINGS_PATH),
+        &settings.clone().normalized(),
+    )
+}
+
+fn update_notification_settings(
+    payload: NotificationSettingsPayload,
+) -> Result<NotificationSettings> {
+    let current = read_notification_settings().unwrap_or_default();
+    let settings = apply_notification_settings_payload(current, payload);
+    write_notification_settings(&settings)?;
+    Ok(settings)
+}
+
+fn apply_notification_settings_payload(
+    current: NotificationSettings,
+    payload: NotificationSettingsPayload,
+) -> NotificationSettings {
+    let provider = if payload.provider.trim().is_empty() {
+        current.provider
+    } else {
+        payload.provider
+    };
+    NotificationSettings {
+        enabled: payload.enabled,
+        provider,
+        serverchan_sendkey: payload
+            .serverchan_sendkey
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(current.serverchan_sendkey),
+        feishu_webhook: payload
+            .feishu_webhook
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(current.feishu_webhook),
+    }
+    .normalized()
+}
+
 fn start_copy_live_soak_from_frontend(
     state: &FrontendAppState,
     payload: CopyLiveSoakStartPayload,
@@ -7634,10 +7808,17 @@ fn start_copy_live_soak_from_frontend(
     if payload.hold_positions_after_submit {
         command.arg("-HoldPositionsAfterSubmit");
     }
+    if let Some(persistence_path) = payload.persistence_path.as_deref() {
+        let persistence_path = persistence_path.trim();
+        if !persistence_path.is_empty() {
+            command.arg("-PersistencePath").arg(persistence_path);
+        }
+    }
     command.env("TRADE_XYZ_VAULT_PASSWORD", vault_password);
-    command
+    let child = command
         .spawn()
         .context("failed to start copy live soak process")?;
+    write_copy_live_soak_current_pid(&copy_live_soak_dir(), child.id())?;
     std::thread::sleep(std::time::Duration::from_millis(500));
     let status = build_copy_live_soak_status_response()?;
     Ok(CopyLiveSoakActionResponse {
@@ -8446,6 +8627,10 @@ fn build_copy_live_soak_status_response_from_dir(
         final_reconcile_health: None,
         hold_positions_after_submit: None,
         watcher_status: None,
+        status_kind: "not_detected".to_string(),
+        stale: false,
+        pid_running: false,
+        terminal: false,
         message: "no persistent live soak status found".to_string(),
         fetched_at_ms: now_ms_value,
     };
@@ -8478,7 +8663,7 @@ fn build_copy_live_soak_status_response_from_dir(
     response.latest_log_path = Some(log_path.display().to_string());
     response.last_updated_at_ms = log_modified_ms;
 
-    let pid_running = if let Some(pid_path) = copy_live_soak_pid_file(dir)? {
+    let mut pid_running = if let Some(pid_path) = copy_live_soak_pid_file(dir)? {
         response.pid = fs::read_to_string(&pid_path)
             .ok()
             .and_then(|text| text.trim().parse::<u32>().ok());
@@ -8486,6 +8671,12 @@ fn build_copy_live_soak_status_response_from_dir(
     } else {
         false
     };
+    if !pid_running && is_default_copy_live_soak_dir(dir) {
+        if let Some(pid) = find_running_copy_live_soak_pid() {
+            response.pid = Some(pid);
+            pid_running = true;
+        }
+    }
 
     if !run_id.is_empty() {
         let summary_path = dir.join(format!("persistent-live-soak-{run_id}-summary.jsonl"));
@@ -8526,13 +8717,31 @@ fn build_copy_live_soak_status_response_from_dir(
         || lower_last.contains(" completed")
         || lower_last.contains(" failed")
         || lower_last.contains(" error=");
+    response.stale = stale;
+    response.pid_running = pid_running;
+    response.terminal = terminal;
     response.running = !stale && !terminal && pid_running;
+    response.status_kind = if response.running {
+        "running".to_string()
+    } else if stale {
+        "stale".to_string()
+    } else if response.pid.is_some() && !pid_running {
+        "process_stopped".to_string()
+    } else if terminal {
+        "terminal".to_string()
+    } else {
+        "unknown".to_string()
+    };
     response.message = if response.running {
         last_log_line
+    } else if stale && response.pid.is_some() && !pid_running {
+        "latest live soak is stale and its process is not running".to_string()
     } else if stale {
         "latest live soak log is stale".to_string()
     } else if response.pid.is_some() && !pid_running {
         "latest live soak process is not running".to_string()
+    } else if terminal {
+        format!("latest live soak ended: {last_log_line}")
     } else {
         last_log_line
     };
@@ -8565,6 +8774,58 @@ fn process_id_is_running(pid: u32) -> bool {
     #[cfg(not(windows))]
     {
         PathBuf::from(format!("/proc/{pid}")).exists()
+    }
+}
+
+fn write_copy_live_soak_current_pid(dir: &Path, pid: u32) -> Result<()> {
+    fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    fs::write(
+        dir.join("persistent-live-soak-detached-current.pid"),
+        format!("{pid}\n"),
+    )
+    .with_context(|| "failed to write copy live soak current pid")
+}
+
+fn is_default_copy_live_soak_dir(dir: &Path) -> bool {
+    dir.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name == COPY_LIVE_SOAK_DIR)
+        .unwrap_or(false)
+}
+
+fn find_running_copy_live_soak_pid() -> Option<u32> {
+    #[cfg(windows)]
+    {
+        let script = r#"
+Get-CimInstance Win32_Process |
+  Where-Object {
+    $_.ProcessId -ne $PID -and
+    $_.CommandLine -like '*run-persistent-live-soak.ps1*'
+  } |
+  Sort-Object CreationDate -Descending |
+  Select-Object -First 1 -ExpandProperty ProcessId
+"#;
+        let output = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                script,
+            ])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        text.lines()
+            .find_map(|line| line.trim().parse::<u32>().ok())
+            .filter(|pid| process_id_is_running(*pid))
+    }
+    #[cfg(not(windows))]
+    {
+        None
     }
 }
 
@@ -13765,6 +14026,10 @@ struct CopyLiveSoakStatusResponse {
     final_reconcile_health: Option<bool>,
     hold_positions_after_submit: Option<bool>,
     watcher_status: Option<String>,
+    status_kind: String,
+    stale: bool,
+    pid_running: bool,
+    terminal: bool,
     message: String,
     fetched_at_ms: u64,
 }
@@ -13850,6 +14115,8 @@ struct CopyLiveSoakStartPayload {
     hold_positions_after_submit: bool,
     #[serde(default)]
     confirm_mainnet_live: bool,
+    #[serde(default)]
+    persistence_path: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -14921,10 +15188,11 @@ mod tests {
         CopyPnlAccountSummary, CopyPnlReportSummary, CopyUiSettings, DashboardOpenOrderResponse,
         FibBasicConfig, FibBasicLevelPlan, FibBasicPlan, FibInstanceRecord, FibInstanceStatus,
         FibOrderRef, FibPositionSnapshot, FibProfitLossMode, FibTradeDirection, FrontendAppState,
-        ManualSettingsPayload, OrderStatusPayload, OrderStatusQuery, PerpFundingLayer,
+        ManualSettingsPayload, NotificationSettings, NotificationSettingsPayload,
+        NotificationSettingsResponse, OrderStatusPayload, OrderStatusQuery, PerpFundingLayer,
         ReadinessCheckResponse, SecretUsage, SpotFundingLayer, VAULT_SESSION_TTL_MS,
-        account_funding_next_actions, account_funding_summary, build_basic_plan,
-        build_copy_live_soak_status_response_from_dir,
+        account_funding_next_actions, account_funding_summary, apply_notification_settings_payload,
+        build_basic_plan, build_copy_live_soak_status_response_from_dir,
         build_copy_shadow_history_response_from_path, build_copy_summary_response_from_entries,
         build_fib_strategy_pnl_summary, dashboard_cancel_stopped_without_open_orders_count,
         dashboard_cancel_strategy_ids, dashboard_order_is_cancelable_fib_entry,
@@ -15090,6 +15358,32 @@ mod tests {
             .expect("read cache");
 
         assert_eq!(restored, None);
+    }
+
+    #[test]
+    fn notification_settings_update_redacts_and_preserves_existing_secret() {
+        let first = NotificationSettingsPayload {
+            enabled: true,
+            provider: "serverchan".to_string(),
+            serverchan_sendkey: Some("SCT_TEST_SENDKEY".to_string()),
+            feishu_webhook: None,
+        };
+        let settings = apply_notification_settings_payload(NotificationSettings::default(), first);
+        assert!(settings.enabled);
+        assert_eq!(settings.provider, "serverchan");
+        assert_eq!(settings.serverchan_sendkey, "SCT_TEST_SENDKEY");
+        let response = NotificationSettingsResponse::from_settings(settings.clone());
+        assert!(response.serverchan_configured);
+
+        let second = NotificationSettingsPayload {
+            enabled: true,
+            provider: "serverchan".to_string(),
+            serverchan_sendkey: Some("   ".to_string()),
+            feishu_webhook: None,
+        };
+        let preserved = apply_notification_settings_payload(settings, second);
+        assert_eq!(preserved.serverchan_sendkey, "SCT_TEST_SENDKEY");
+        assert!(preserved.enabled);
     }
 
     #[test]

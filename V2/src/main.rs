@@ -2519,6 +2519,181 @@ mod tests {
     }
 
     #[test]
+    fn copy_live_daemon_margin_resize_shrinks_open_ref_before_cap_partition() {
+        let refs = vec![
+            CopyLiveDaemonWouldSubmitRef {
+                record_index: 0,
+                signal_id: "sig-open-low-margin".to_string(),
+                leader_id: "leader_a".to_string(),
+                leader_address: "0x00000000000000000000000000000000000000aa".to_string(),
+                order: CopyExecutionCanaryWouldSubmit {
+                    account_id: "addr_a".to_string(),
+                    worker_id: "worker-addr_a".to_string(),
+                    coin: "xyz:XYZ100".to_string(),
+                    side: crate::domain::OrderSide::Sell,
+                    notional_usd: 50.0,
+                    reduce_only: false,
+                    cloid: "00000000-0000-0000-0000-000000000101".to_string(),
+                },
+            },
+            CopyLiveDaemonWouldSubmitRef {
+                record_index: 1,
+                signal_id: "sig-open-second".to_string(),
+                leader_id: "leader_b".to_string(),
+                leader_address: "0x00000000000000000000000000000000000000bb".to_string(),
+                order: CopyExecutionCanaryWouldSubmit {
+                    account_id: "addr_a".to_string(),
+                    worker_id: "worker-addr_a".to_string(),
+                    coin: "xyz:GBP".to_string(),
+                    side: crate::domain::OrderSide::Buy,
+                    notional_usd: 50.0,
+                    reduce_only: false,
+                    cloid: "00000000-0000-0000-0000-000000000102".to_string(),
+                },
+            },
+        ];
+        let reconciliations = vec![CopyBoundedLiveWindowReconcile {
+            account_id: "addr_a".to_string(),
+            ok: true,
+            open_order_count: Some(0),
+            asset_positions: Some(0),
+            account_value: Some("20.0".to_string()),
+            withdrawable: Some("3.267497".to_string()),
+            total_ntl_pos: Some("0.0".to_string()),
+            total_margin_used: Some("0.0".to_string()),
+            error: None,
+        }];
+
+        let (prepared, suppressed) =
+            super::copy_live_daemon_resize_open_refs_for_margin(&refs, &reconciliations);
+
+        assert_eq!(prepared.len(), 1);
+        assert_eq!(suppressed.len(), 1);
+        assert_eq!(
+            suppressed[0].reason_code,
+            "COPY_DAEMON_MARGIN_RESIZED_BELOW_MIN"
+        );
+        assert_eq!(prepared[0].signal_id, "sig-open-low-margin");
+        assert!(
+            (prepared[0].order.notional_usd - 14.8522590909).abs() < 0.0001,
+            "{prepared:#?}"
+        );
+    }
+
+    #[test]
+    fn copy_live_daemon_margin_resize_below_min_does_not_consume_live_order_slot() {
+        let options = follow_position_options();
+        let refs = vec![
+            CopyLiveDaemonWouldSubmitRef {
+                record_index: 0,
+                signal_id: "sig-too-small".to_string(),
+                leader_id: "leader_a".to_string(),
+                leader_address: "0x00000000000000000000000000000000000000aa".to_string(),
+                order: CopyExecutionCanaryWouldSubmit {
+                    account_id: "addr_a".to_string(),
+                    worker_id: "worker-addr_a".to_string(),
+                    coin: "xyz:XYZ100".to_string(),
+                    side: crate::domain::OrderSide::Sell,
+                    notional_usd: 50.0,
+                    reduce_only: false,
+                    cloid: "00000000-0000-0000-0000-000000000111".to_string(),
+                },
+            },
+            CopyLiveDaemonWouldSubmitRef {
+                record_index: 1,
+                signal_id: "sig-other-account".to_string(),
+                leader_id: "leader_b".to_string(),
+                leader_address: "0x00000000000000000000000000000000000000bb".to_string(),
+                order: CopyExecutionCanaryWouldSubmit {
+                    account_id: "addr_b".to_string(),
+                    worker_id: "worker-addr_b".to_string(),
+                    coin: "xyz:GBP".to_string(),
+                    side: crate::domain::OrderSide::Buy,
+                    notional_usd: 12.0,
+                    reduce_only: false,
+                    cloid: "00000000-0000-0000-0000-000000000112".to_string(),
+                },
+            },
+        ];
+        let reconciliations = vec![
+            CopyBoundedLiveWindowReconcile {
+                account_id: "addr_a".to_string(),
+                ok: true,
+                open_order_count: Some(0),
+                asset_positions: Some(0),
+                account_value: Some("2.0".to_string()),
+                withdrawable: Some("1.0".to_string()),
+                total_ntl_pos: Some("0.0".to_string()),
+                total_margin_used: Some("0.0".to_string()),
+                error: None,
+            },
+            CopyBoundedLiveWindowReconcile {
+                account_id: "addr_b".to_string(),
+                ok: true,
+                open_order_count: Some(0),
+                asset_positions: Some(0),
+                account_value: Some("20.0".to_string()),
+                withdrawable: Some("20.0".to_string()),
+                total_ntl_pos: Some("0.0".to_string()),
+                total_margin_used: Some("0.0".to_string()),
+                error: None,
+            },
+        ];
+
+        let (margin_prepared, mut margin_suppressed) =
+            super::copy_live_daemon_resize_open_refs_for_margin(&refs, &reconciliations);
+        let (executable, mut cap_suppressed) =
+            super::partition_copy_live_daemon_would_submit_refs(&margin_prepared, &options);
+        margin_suppressed.append(&mut cap_suppressed);
+
+        assert_eq!(executable.len(), 1);
+        assert_eq!(executable[0].signal_id, "sig-other-account");
+        assert_eq!(margin_suppressed.len(), 1);
+        assert_eq!(
+            margin_suppressed[0].reason_code,
+            "COPY_DAEMON_MARGIN_RESIZED_BELOW_MIN"
+        );
+    }
+
+    #[test]
+    fn copy_live_daemon_margin_resize_leaves_reduce_only_refs_untouched() {
+        let refs = vec![CopyLiveDaemonWouldSubmitRef {
+            record_index: 0,
+            signal_id: "sig-close".to_string(),
+            leader_id: "leader_a".to_string(),
+            leader_address: "0x00000000000000000000000000000000000000aa".to_string(),
+            order: CopyExecutionCanaryWouldSubmit {
+                account_id: "addr_a".to_string(),
+                worker_id: "worker-addr_a".to_string(),
+                coin: "xyz:GBP".to_string(),
+                side: crate::domain::OrderSide::Sell,
+                notional_usd: 50.0,
+                reduce_only: true,
+                cloid: "00000000-0000-0000-0000-000000000121".to_string(),
+            },
+        }];
+        let reconciliations = vec![CopyBoundedLiveWindowReconcile {
+            account_id: "addr_a".to_string(),
+            ok: true,
+            open_order_count: Some(0),
+            asset_positions: Some(1),
+            account_value: Some("1.0".to_string()),
+            withdrawable: Some("0.0".to_string()),
+            total_ntl_pos: Some("50.0".to_string()),
+            total_margin_used: Some("1.0".to_string()),
+            error: None,
+        }];
+
+        let (prepared, suppressed) =
+            super::copy_live_daemon_resize_open_refs_for_margin(&refs, &reconciliations);
+
+        assert_eq!(prepared.len(), 1);
+        assert!(suppressed.is_empty(), "{suppressed:#?}");
+        assert!(prepared[0].order.reduce_only);
+        assert_eq!(prepared[0].order.notional_usd, 50.0);
+    }
+
+    #[test]
     fn copy_live_daemon_reduce_refs_wait_until_pending_min_notional_accumulates() {
         let pending_entry = crate::strategies::smart_money::CopyLedgerEntry {
             local_account_id: "addr_a".to_string(),
@@ -7601,8 +7776,23 @@ async fn run_copy_live_daemon_supervisor(
 
     input.elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
     let saved = strategies::smart_money::load_copy_persistence_snapshot(&options.persistence_path)?;
-    let (executable_submit_plan_refs, suppressed_submit_plan_refs) =
-        copy_live_daemon_executable_refs_for_snapshot(&would_submit_plan_refs, &options, &saved);
+    let (prepared_submit_plan_refs, mut suppressed_submit_plan_refs) =
+        copy_live_daemon_prepare_refs_for_follow_position_limits(
+            &would_submit_plan_refs,
+            &options,
+            &saved,
+        );
+    let pre_submit_reconciliations =
+        reconcile_copy_bounded_window_accounts(config, &target_accounts).await;
+    let (margin_adjusted_submit_plan_refs, mut margin_suppressed_refs) =
+        copy_live_daemon_resize_open_refs_for_margin(
+            &prepared_submit_plan_refs,
+            &pre_submit_reconciliations,
+        );
+    suppressed_submit_plan_refs.append(&mut margin_suppressed_refs);
+    let (executable_submit_plan_refs, mut cap_suppressed_refs) =
+        partition_copy_live_daemon_would_submit_refs(&margin_adjusted_submit_plan_refs, &options);
+    suppressed_submit_plan_refs.append(&mut cap_suppressed_refs);
     let would_submit_orders = copy_live_daemon_order_refs_to_orders(&would_submit_plan_refs);
     let executable_would_submit_orders =
         copy_live_daemon_order_refs_to_orders(&executable_submit_plan_refs);
@@ -7613,8 +7803,6 @@ async fn run_copy_live_daemon_supervisor(
             .sum::<f64>(),
     );
     let estimated_fees_usd = normalize_report_zero(planned_notional_usd * 0.001);
-    let pre_submit_reconciliations =
-        reconcile_copy_bounded_window_accounts(config, &target_accounts).await;
     let submit_plan_contract = copy_live_daemon_submit_plan_contract(
         &options,
         &executable_submit_plan_refs,
@@ -10475,6 +10663,83 @@ fn copy_live_daemon_executable_refs_for_snapshot(
         partition_copy_live_daemon_would_submit_refs(&prepared_refs, options);
     suppressed_refs.append(&mut cap_suppressed_refs);
     (executable_refs, suppressed_refs)
+}
+
+fn copy_live_daemon_resize_open_refs_for_margin(
+    refs: &[CopyLiveDaemonWouldSubmitRef],
+    reconciliations: &[CopyBoundedLiveWindowReconcile],
+) -> (
+    Vec<CopyLiveDaemonWouldSubmitRef>,
+    Vec<CopyLiveDaemonSuppressedWouldSubmitRef>,
+) {
+    let mut prepared = Vec::new();
+    let mut suppressed = Vec::new();
+    let mut remaining_margin_by_account = reconciliations
+        .iter()
+        .filter_map(|reconcile| {
+            let withdrawable = reconcile
+                .withdrawable
+                .as_deref()
+                .and_then(|value| value.parse::<f64>().ok())?;
+            Some((reconcile.account_id.clone(), withdrawable.max(0.0)))
+        })
+        .collect::<HashMap<_, _>>();
+    let leverage = strategies::smart_money::COPY_MAX_LEVERAGE.max(1.0);
+    let margin_multiplier = 1.0 + COPY_DAEMON_MARGIN_BUFFER_RATIO;
+
+    for plan in refs {
+        if plan.order.reduce_only {
+            prepared.push(plan.clone());
+            continue;
+        }
+
+        let Some(remaining_margin) = remaining_margin_by_account.get_mut(&plan.order.account_id)
+        else {
+            suppressed.push(CopyLiveDaemonSuppressedWouldSubmitRef {
+                plan: plan.clone(),
+                reason_code: "COPY_DAEMON_MARGIN_UNAVAILABLE".to_string(),
+                message: format!(
+                    "{} withdrawable unavailable; cannot prove opening margin for {:.6} notional",
+                    plan.order.account_id, plan.order.notional_usd
+                ),
+            });
+            continue;
+        };
+
+        let requested_notional = plan.order.notional_usd.max(0.0);
+        let requested_margin = (requested_notional / leverage) * margin_multiplier;
+        if *remaining_margin + 1e-9 >= requested_margin {
+            *remaining_margin = (*remaining_margin - requested_margin).max(0.0);
+            prepared.push(plan.clone());
+            continue;
+        }
+
+        let resized_notional =
+            normalize_report_zero((*remaining_margin * leverage) / margin_multiplier);
+        if resized_notional + 1e-9 < trading::HYPERLIQUID_MIN_ORDER_NOTIONAL_USD {
+            suppressed.push(CopyLiveDaemonSuppressedWouldSubmitRef {
+                plan: plan.clone(),
+                reason_code: "COPY_DAEMON_MARGIN_RESIZED_BELOW_MIN".to_string(),
+                message: format!(
+                    "{} withdrawable={:.6} supports resized_notional={:.6}, below exchange minimum {:.6}; requested_notional={:.6}",
+                    plan.order.account_id,
+                    *remaining_margin,
+                    resized_notional,
+                    trading::HYPERLIQUID_MIN_ORDER_NOTIONAL_USD,
+                    requested_notional
+                ),
+            });
+            continue;
+        }
+
+        let mut resized = plan.clone();
+        resized.order.notional_usd = resized_notional.min(requested_notional);
+        let resized_margin = (resized.order.notional_usd / leverage) * margin_multiplier;
+        *remaining_margin = (*remaining_margin - resized_margin).max(0.0);
+        prepared.push(resized);
+    }
+
+    (prepared, suppressed)
 }
 
 fn copy_live_daemon_prepare_refs_for_follow_position_limits(

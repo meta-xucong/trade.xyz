@@ -3162,6 +3162,40 @@
                   </div>
                 </div>
               </form>
+
+              <form class="panel" id="vaultNotificationForm">
+                <div class="panel-head">
+                  <h3 data-i18n="vault.notify_title">Stop Notifications</h3>
+                  <span class="pill" id="vaultNotificationStatus" data-i18n="vault.notify_off">off</span>
+                </div>
+                <div class="panel-body form-grid">
+                  <div class="field wide">
+                    <label class="checkbox-line subtle">
+                      <input id="vaultNotifyEnabled" type="checkbox" />
+                      <span data-i18n="vault.notify_enable">Notify me when live copy stops</span>
+                    </label>
+                  </div>
+                  <div class="field">
+                    <label for="vaultNotifyProvider" data-i18n="vault.notify_provider">Channel</label>
+                    <select id="vaultNotifyProvider">
+                      <option value="serverchan">ServerChan</option>
+                      <option value="feishu">Feishu</option>
+                    </select>
+                  </div>
+                  <div class="field wide" id="vaultNotifyServerChanField">
+                    <label for="vaultNotifyServerChan" data-i18n="vault.notify_serverchan">ServerChan SendKey</label>
+                    <input id="vaultNotifyServerChan" type="password" autocomplete="off" data-i18n-placeholder="vault.notify_keep_existing" />
+                  </div>
+                  <div class="field wide hidden" id="vaultNotifyFeishuField">
+                    <label for="vaultNotifyFeishu" data-i18n="vault.notify_feishu">Feishu Webhook</label>
+                    <input id="vaultNotifyFeishu" type="password" autocomplete="off" data-i18n-placeholder="vault.notify_keep_existing" />
+                  </div>
+                  <div class="quote-meta wide" id="vaultNotifyHelp" data-i18n="vault.notify_help">Optional. Leave empty to disable notifications. Existing secrets are not shown.</div>
+                  <div class="footer-actions wide compact">
+                    <button class="action-button" type="submit" id="vaultNotifySave"><i data-lucide="bell"></i><span data-i18n="vault.notify_save">Save Notifications</span></button>
+                  </div>
+                </div>
+              </form>
             </div>
             <div class="panel">
               <div class="panel-head"><h3 data-i18n="vault.result">Vault Result</h3><span class="pill mono" id="vaultPath">secrets/trade_xyz.vault</span></div>
@@ -3240,6 +3274,7 @@
         vaultUnlocked: false,
         vaultExists: false,
         vaultStatusKnown: false,
+        vaultNotificationSettings: null,
         changePasswordVisible: false,
         manualRunMode: localStorage.getItem("trade_xyz_manual_mode") === "live" ? "live" : "dry_run",
         fibRunMode: localStorage.getItem("trade_xyz_fib_mode") === "live" ? "live" : "dry_run",
@@ -3918,6 +3953,10 @@
           "copy.live_soak_empty": "No background copy soak was detected on this machine.",
           "copy.live_soak_running": "Running",
           "copy.live_soak_stopped": "Stopped",
+          "copy.live_soak_status_stale": "Status stale",
+          "copy.live_soak_status_process_stopped": "Process stopped",
+          "copy.live_soak_status_terminal": "Ended",
+          "copy.live_soak_status_unknown": "Unknown",
           "copy.live_soak_run_id": "Run ID",
           "copy.live_soak_round": "Latest Round",
           "copy.live_soak_submitted": "Submitted",
@@ -3926,6 +3965,8 @@
           "copy.live_soak_final_flat": "Final Flat",
           "copy.live_soak_hold": "Hold After Submit",
           "copy.live_soak_watcher": "Watcher",
+          "copy.live_soak_pid_running": "PID Running",
+          "copy.live_soak_status_kind": "Runtime Status",
           "copy.live_soak_message": "Latest Log",
           "copy.shadow_history_title": "Shadow Copy History",
           "copy.shadow_history_empty": "No shadow copy history",
@@ -3969,6 +4010,17 @@
           "vault.toggle_private_key": "Show or hide private key",
           "vault.save_secret": "Save Secret",
           "vault.test_secret": "Test Secret",
+          "vault.notify_title": "Stop Notifications",
+          "vault.notify_enable": "Notify me when live copy stops",
+          "vault.notify_provider": "Channel",
+          "vault.notify_serverchan": "ServerChan SendKey",
+          "vault.notify_feishu": "Feishu Webhook",
+          "vault.notify_keep_existing": "leave blank to keep existing",
+          "vault.notify_help": "Optional. Leave empty to disable notifications. Existing secrets are not shown.",
+          "vault.notify_save": "Save Notifications",
+          "vault.notify_on": "on",
+          "vault.notify_off": "off",
+          "vault.notify_saved": "Notification settings saved",
           "vault.result": "Vault Result",
           "placeholder.market": "market",
           "placeholder.live": "live",
@@ -4569,6 +4621,10 @@
           "copy.live_soak_empty": "当前机器未检测到后台跟单长测。",
           "copy.live_soak_running": "运行中",
           "copy.live_soak_stopped": "已停止",
+          "copy.live_soak_status_stale": "状态过期",
+          "copy.live_soak_status_process_stopped": "进程已停止",
+          "copy.live_soak_status_terminal": "已结束",
+          "copy.live_soak_status_unknown": "状态未知",
           "copy.live_soak_run_id": "运行 ID",
           "copy.live_soak_round": "最近轮次",
           "copy.live_soak_submitted": "已提交",
@@ -4577,6 +4633,8 @@
           "copy.live_soak_final_flat": "最终空仓",
           "copy.live_soak_hold": "提交后持仓",
           "copy.live_soak_watcher": "监听状态",
+          "copy.live_soak_pid_running": "PID 存活",
+          "copy.live_soak_status_kind": "真实状态",
           "copy.live_soak_message": "最近日志",
           "copy.shadow_history_title": "跟单 Shadow 历史",
           "copy.shadow_history_empty": "暂无跟单 shadow 历史",
@@ -4620,6 +4678,17 @@
           "vault.toggle_private_key": "显示或隐藏私钥",
           "vault.save_secret": "保存密钥",
           "vault.test_secret": "测试密钥",
+          "vault.notify_title": "停机通知",
+          "vault.notify_enable": "跟单长测停止时通知我",
+          "vault.notify_provider": "渠道",
+          "vault.notify_serverchan": "ServerChan SendKey",
+          "vault.notify_feishu": "飞书 Webhook",
+          "vault.notify_keep_existing": "留空则保留已有配置",
+          "vault.notify_help": "可选项。不启用或不填写就不会推送，已有密钥不会明文显示。",
+          "vault.notify_save": "保存通知",
+          "vault.notify_on": "已开启",
+          "vault.notify_off": "未开启",
+          "vault.notify_saved": "通知设置已保存",
           "vault.result": "密钥库结果",
           "placeholder.market": "市价",
           "placeholder.live": "实时",
@@ -4750,6 +4819,7 @@
         updateManualProtectionModeUi();
         updateManualAdvancedTargets();
         updateVaultUsageUi();
+        updateVaultNotificationUi();
         syncManualTransferInputs({ force: true });
         syncModuleSymbolPolicyInputs({ force: false });
         syncLeverageControlsForMarket();
@@ -4771,6 +4841,7 @@
         updateManualModeUi();
         updateFibModeUi();
         updateVaultUi();
+        updateVaultNotificationUi();
         renderDashboardVaultStatus();
         if (state.app) {
           applyRuntimePills(state.app);
@@ -8129,6 +8200,37 @@
         if (window.lucide) lucide.createIcons();
       }
 
+      function updateVaultNotificationUi() {
+        const provider = $("vaultNotifyProvider")?.value || state.vaultNotificationSettings?.provider || "serverchan";
+        const useFeishu = provider === "feishu";
+        const enabled = !!$("vaultNotifyEnabled")?.checked;
+        const status = $("vaultNotificationStatus");
+        if (status) {
+          status.textContent = enabled ? t("vault.notify_on") : t("vault.notify_off");
+        }
+        $("vaultNotifyServerChanField")?.classList.toggle("hidden", useFeishu);
+        $("vaultNotifyFeishuField")?.classList.toggle("hidden", !useFeishu);
+        const settings = state.vaultNotificationSettings || {};
+        const configured = useFeishu ? settings.feishu_configured : settings.serverchan_configured;
+        const help = $("vaultNotifyHelp");
+        if (help) {
+          const configuredText = configured
+            ? (state.lang === "zh" ? "当前渠道已有配置；输入新值会覆盖。" : "Current channel is configured; enter a new value to replace it.")
+            : "";
+          help.textContent = [t("vault.notify_help"), configuredText].filter(Boolean).join(" ");
+        }
+        if (window.lucide) lucide.createIcons();
+      }
+
+      function applyVaultNotificationSettings(settings) {
+        state.vaultNotificationSettings = settings || {};
+        if ($("vaultNotifyEnabled")) $("vaultNotifyEnabled").checked = !!settings?.enabled;
+        if ($("vaultNotifyProvider")) $("vaultNotifyProvider").value = settings?.provider === "feishu" ? "feishu" : "serverchan";
+        if ($("vaultNotifyServerChan")) $("vaultNotifyServerChan").value = "";
+        if ($("vaultNotifyFeishu")) $("vaultNotifyFeishu").value = "";
+        updateVaultNotificationUi();
+      }
+
       function updateVaultUsageUi() {
         const isTransfer = state.vaultSecretUsage === "transfer";
         $("vaultUsageTrading").classList.toggle("active", !isTransfer);
@@ -10905,7 +11007,19 @@
           return;
         }
         const running = Boolean(status.running);
-        const tone = running ? "live" : "waiting";
+        const statusKind = String(status.status_kind || (running ? "running" : "unknown"));
+        const statusLabel = statusKind === "running"
+          ? t("copy.live_soak_running")
+          : statusKind === "stale"
+            ? t("copy.live_soak_status_stale")
+            : statusKind === "process_stopped"
+              ? t("copy.live_soak_status_process_stopped")
+              : statusKind === "terminal"
+                ? t("copy.live_soak_status_terminal")
+                : statusKind === "not_detected"
+                  ? t("copy.live_soak_stopped")
+                  : t("copy.live_soak_status_unknown");
+        const tone = running ? "live" : (statusKind === "stale" || statusKind === "process_stopped" ? "warning" : "waiting");
         const updatedAt = status.last_updated_at_ms ? formatDateTime(status.last_updated_at_ms) : "-";
         const latestOk = status.latest_ok == null ? "-" : (status.latest_ok ? "OK" : "FAIL");
         const boolText = (value) => value == null
@@ -10915,14 +11029,16 @@
           <div class="fib-instance-card">
             <div class="fib-instance-body">
               <div class="strategy-status-note">
-                <strong><span class="status-badge" data-status="${escapeHtml(tone)}">${escapeHtml(running ? t("copy.live_soak_running") : t("copy.live_soak_stopped"))}</span></strong>
+                <strong><span class="status-badge" data-status="${escapeHtml(tone)}">${escapeHtml(statusLabel)}</span></strong>
                 <span class="mono">${escapeHtml(updatedAt)}</span>
               </div>
               <div class="fib-instance-kv">
                 <div><span>${t("copy.live_soak_run_id")}</span><strong class="mono">${escapeHtml(status.run_id || "-")}</strong></div>
                 <div><span>${t("copy.live_soak_round")}</span><strong>${escapeHtml(status.latest_round ?? "-")}</strong></div>
+                <div><span>${t("copy.live_soak_status_kind")}</span><strong>${escapeHtml(statusLabel)}</strong></div>
                 <div><span>OK</span><strong>${escapeHtml(latestOk)}</strong></div>
                 <div><span>PID</span><strong class="mono">${escapeHtml(status.pid || "-")}</strong></div>
+                <div><span>${t("copy.live_soak_pid_running")}</span><strong>${escapeHtml(boolText(status.pid_running))}</strong></div>
                 <div><span>${t("copy.live_soak_submitted")}</span><strong>${escapeHtml(status.submitted_reports ?? "-")}</strong></div>
                 <div><span>${t("copy.live_soak_evidence")}</span><strong>${escapeHtml(status.order_evidence ?? "-")}</strong></div>
                 <div><span>${t("copy.live_soak_cleanup_errors")}</span><strong>${escapeHtml(status.cleanup_errors ?? "-")}</strong></div>
@@ -12300,6 +12416,7 @@
           syncModuleSymbolPolicyInputs({ force: false });
           if (withVaultStatus) {
             await loadVaultStatus();
+            await loadVaultNotifications({ silent: true });
           }
           if (withDashboardSnapshot) {
             await loadDashboardSnapshot({ silent: true });
@@ -12445,6 +12562,18 @@
           if (!silent) {
             showResult("vaultResult", { ok: false, error: error?.message || String(error) });
           }
+        }
+      }
+
+      async function loadVaultNotifications({ silent = true } = {}) {
+        try {
+          const result = await api("/api/vault/notifications");
+          if (result.ok) {
+            applyVaultNotificationSettings(result.data || {});
+          }
+          if (!silent) showResult("vaultResult", result);
+        } catch (error) {
+          if (!silent) showResult("vaultResult", { ok: false, error: error?.message || String(error) });
         }
       }
 
@@ -12711,6 +12840,8 @@
       $("vaultUseNew").addEventListener("click", () => setVaultMode("new"));
       $("vaultUsageTrading").addEventListener("click", () => setVaultSecretUsage("trading"));
       $("vaultUsageTransfer").addEventListener("click", () => setVaultSecretUsage("transfer"));
+      $("vaultNotifyEnabled").addEventListener("change", updateVaultNotificationUi);
+      $("vaultNotifyProvider").addEventListener("change", updateVaultNotificationUi);
       $("toggleVaultPasswordChange").addEventListener("click", () => {
         state.changePasswordVisible = !state.changePasswordVisible;
         updateVaultUi();
@@ -13752,6 +13883,35 @@
         }
       });
 
+      $("vaultNotificationForm").addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const payload = {
+          enabled: $("vaultNotifyEnabled").checked,
+          provider: $("vaultNotifyProvider").value,
+          serverchan_sendkey: $("vaultNotifyServerChan").value.trim(),
+          feishu_webhook: $("vaultNotifyFeishu").value.trim(),
+        };
+        await showActionResult("vaultResult", "vaultNotifySave", async () => {
+          const result = await api("/api/vault/notifications", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+          if (result.ok) {
+            applyVaultNotificationSettings(result.data || {});
+            $("vaultNotifyServerChan").value = "";
+            $("vaultNotifyFeishu").value = "";
+          }
+          return {
+            ...result,
+            data: {
+              ...(result.data || {}),
+              message: t("vault.notify_saved"),
+            },
+          };
+        });
+      });
+
       applyI18n();
       setManualSide(state.side);
       syncManualPositionModeUi();
@@ -13765,6 +13925,7 @@
       updateFibStopLossCooldownState();
       updateFibManualRangeUi();
       updateVaultUi();
+      updateVaultNotificationUi();
       renderManualQuote(null);
       syncManualQuoteFieldVisibility(activeManualMarket());
       renderFibQuote(null);

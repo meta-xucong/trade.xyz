@@ -3,7 +3,7 @@ param(
     [int]$MaxRounds = 0,
     [int]$SleepSecs = 5,
     [int]$DegradedSleepSecs = 60,
-    [int]$RoundTimeoutBufferSecs = 300,
+    [int]$RoundTimeoutBufferSecs = 1800,
     [double]$MaxTotalNotionalUsd = 200.0,
     [double]$MaxTotalFeesUsd = 1.0,
     [int]$MaxEvents = 20000,
@@ -28,6 +28,7 @@ $runId = Get-Date -Format "yyyyMMdd-HHmmss"
 $prefix = ".codex-longrun\persistent-live-soak-$runId"
 $summaryPath = "$prefix-summary.jsonl"
 $logPath = "$prefix-run.log"
+$notificationSettingsPath = ".codex-longrun\notification-settings.json"
 if ([string]::IsNullOrWhiteSpace($PersistencePath)) {
     $persistencePath = "$prefix-snapshot.json"
 } else {
@@ -44,6 +45,89 @@ function Write-SoakLog {
     $line = "$(Get-Date -Format o) $Message"
     Add-Content -LiteralPath $logPath -Value $line -Encoding utf8
     Write-Host $line
+}
+
+function Get-NotificationSettings {
+    if (-not (Test-Path -LiteralPath $notificationSettingsPath)) {
+        return $null
+    }
+    try {
+        $settings = Get-Content -LiteralPath $notificationSettingsPath -Raw -Encoding utf8 | ConvertFrom-Json
+        if (-not [bool]$settings.enabled) {
+            return $null
+        }
+        return $settings
+    } catch {
+        Write-SoakLog "notification settings parse failed: $($_.Exception.Message)"
+        return $null
+    }
+}
+
+function Send-StopNotification {
+    param(
+        [string]$Status,
+        [string]$Reason,
+        [string]$Detail
+    )
+    $settings = Get-NotificationSettings
+    if ($null -eq $settings) {
+        return
+    }
+    $title = "trade.xyz copy live soak $Status"
+    $message = @(
+        "run_id=$runId",
+        "status=$Status",
+        "reason=$Reason",
+        "detail=$Detail",
+        "time=$(Get-Date -Format o)"
+    ) -join "`n"
+    try {
+        if ([string]$settings.provider -eq "feishu") {
+            $webhook = [string]$settings.feishu_webhook
+            if ([string]::IsNullOrWhiteSpace($webhook)) {
+                return
+            }
+            $body = @{
+                msg_type = "text"
+                content = @{ text = "$title`n$message" }
+            } | ConvertTo-Json -Compress -Depth 6
+            Invoke-RestMethod -Uri $webhook -Method POST -ContentType "application/json" -Body $body -TimeoutSec 10 | Out-Null
+            Write-SoakLog "stop notification sent provider=feishu status=$Status reason=$Reason"
+        } else {
+            $sendKey = [string]$settings.serverchan_sendkey
+            if ([string]::IsNullOrWhiteSpace($sendKey)) {
+                return
+            }
+            $uri = "https://sctapi.ftqq.com/$sendKey.send"
+            Invoke-RestMethod -Uri $uri -Method POST -ContentType "application/x-www-form-urlencoded" -Body @{
+                title = $title
+                desp = $message
+                short = $Reason
+                noip = "1"
+            } -TimeoutSec 10 | Out-Null
+            Write-SoakLog "stop notification sent provider=serverchan status=$Status reason=$Reason"
+        }
+    } catch {
+        $errorMessage = [string]$_.Exception.Message
+        if ($null -ne $settings.serverchan_sendkey) {
+            $errorMessage = $errorMessage.Replace([string]$settings.serverchan_sendkey, "***")
+        }
+        if ($null -ne $settings.feishu_webhook) {
+            $errorMessage = $errorMessage.Replace([string]$settings.feishu_webhook, "***")
+        }
+        Write-SoakLog "stop notification failed provider=$($settings.provider) status=$Status error=$errorMessage"
+    }
+}
+
+function Stop-WithNotification {
+    param(
+        [int]$Code,
+        [string]$Status,
+        [string]$Reason,
+        [string]$Detail = ""
+    )
+    Send-StopNotification -Status $Status -Reason $Reason -Detail $Detail
+    exit $Code
 }
 
 Write-SoakLog "starting persistent live soak window_secs=$WindowSecs max_rounds=$MaxRounds max_notional=$MaxTotalNotionalUsd max_fees=$MaxTotalFeesUsd hold_positions_after_submit=$([bool]$HoldPositionsAfterSubmit) settings=$SettingsPath persistence=$persistencePath shadow=$shadowPath"
@@ -107,7 +191,19 @@ function Invoke-BotRound {
 
     if (-not $process.WaitForExit($TimeoutSecs * 1000)) {
         try {
-            $process.Kill($true)
+            if ($IsWindows -or $env:OS -eq "Windows_NT") {
+                $kill = Start-Process `
+                    -FilePath "taskkill" `
+                    -ArgumentList @("/PID", $process.Id.ToString(), "/T", "/F") `
+                    -WindowStyle Hidden `
+                    -Wait `
+                    -PassThru
+                if ($kill.ExitCode -ne 0) {
+                    Stop-Process -Id $process.Id -Force -ErrorAction Stop
+                }
+            } else {
+                $process.Kill()
+            }
         } catch {
             Write-SoakLog "round child timeout kill failed pid=$($process.Id) error=$($_.Exception.Message)"
         }
@@ -155,7 +251,7 @@ while ($true) {
     $round += 1
     if ($MaxRounds -gt 0 -and $round -gt $MaxRounds) {
         Write-SoakLog "completed max_rounds=$MaxRounds"
-        exit 0
+        Stop-WithNotification -Code 0 -Status "completed" -Reason "max_rounds" -Detail "completed max_rounds=$MaxRounds"
     }
 
     $roundTag = "{0:D4}" -f $round
@@ -197,12 +293,12 @@ while ($true) {
 
     if ($roundExitCode -eq 124) {
         Write-SoakLog "round=$round timed out after ${roundTimeoutSecs}s; child process was killed, stderr=$stderrPath"
-        exit 124
+        Stop-WithNotification -Code 124 -Status "stopped" -Reason "round_timeout" -Detail "round=$round timeout_secs=$roundTimeoutSecs stderr=$stderrPath"
     }
 
     if ($roundExitCode -ne 0) {
         Write-SoakLog "round=$round failed exit_code=$roundExitCode stderr=$stderrPath"
-        exit $roundExitCode
+        Stop-WithNotification -Code $roundExitCode -Status "failed" -Reason "round_exit_code" -Detail "round=$round exit_code=$roundExitCode stderr=$stderrPath"
     }
 
     $report = Get-Content -LiteralPath $reportPath -Raw -Encoding utf8 | ConvertFrom-Json
@@ -296,12 +392,12 @@ while ($true) {
 
     if (-not $report.ok -or (-not $HoldPositionsAfterSubmit -and -not $finalReconcileHealth) -or $cleanupErrors -gt 0) {
         Write-SoakLog "round=$round stopping because health check failed"
-        exit 2
+        Stop-WithNotification -Code 2 -Status "failed" -Reason "health_check_failed" -Detail "round=$round failed_checks=$($failedChecks -join ' | ')"
     }
 
     if ($StopAfterRealSubmit -and $submittedCount -gt 0) {
         Write-SoakLog "round=$round stopping after first real submit evidence"
-        exit 0
+        Stop-WithNotification -Code 0 -Status "completed" -Reason "stop_after_real_submit" -Detail "round=$round submitted=$submittedCount evidence=$evidenceCount"
     }
 
     Start-Sleep -Seconds $SleepSecs
