@@ -3193,6 +3193,7 @@
                   <div class="quote-meta wide" id="vaultNotifyHelp" data-i18n="vault.notify_help">Optional. Leave empty to disable notifications. Existing secrets are not shown.</div>
                   <div class="footer-actions wide compact">
                     <button class="action-button" type="submit" id="vaultNotifySave"><i data-lucide="bell"></i><span data-i18n="vault.notify_save">Save Notifications</span></button>
+                    <button class="ghost-button" type="button" id="vaultNotifyTest"><i data-lucide="send"></i><span data-i18n="vault.notify_test">Test</span></button>
                   </div>
                 </div>
               </form>
@@ -3275,6 +3276,7 @@
         vaultExists: false,
         vaultStatusKnown: false,
         vaultNotificationSettings: null,
+        vaultNotificationDirty: false,
         changePasswordVisible: false,
         manualRunMode: localStorage.getItem("trade_xyz_manual_mode") === "live" ? "live" : "dry_run",
         fibRunMode: localStorage.getItem("trade_xyz_fib_mode") === "live" ? "live" : "dry_run",
@@ -4018,9 +4020,11 @@
           "vault.notify_keep_existing": "leave blank to keep existing",
           "vault.notify_help": "Optional. Leave empty to disable notifications. Existing secrets are not shown.",
           "vault.notify_save": "Save Notifications",
+          "vault.notify_test": "Test",
           "vault.notify_on": "on",
           "vault.notify_off": "off",
           "vault.notify_saved": "Notification settings saved",
+          "vault.notify_tested": "Test notification delivered",
           "vault.result": "Vault Result",
           "placeholder.market": "market",
           "placeholder.live": "live",
@@ -4686,9 +4690,11 @@
           "vault.notify_keep_existing": "留空则保留已有配置",
           "vault.notify_help": "可选项。不启用或不填写就不会推送，已有密钥不会明文显示。",
           "vault.notify_save": "保存通知",
+          "vault.notify_test": "测试通知",
           "vault.notify_on": "已开启",
           "vault.notify_off": "未开启",
           "vault.notify_saved": "通知设置已保存",
+          "vault.notify_tested": "测试通知已发送",
           "vault.result": "密钥库结果",
           "placeholder.market": "市价",
           "placeholder.live": "实时",
@@ -7526,6 +7532,9 @@
           loadCopyLiveSoakStatus({ silent: true });
           loadCopyShadowHistory({ silent: true });
         }
+        if (state.activeView === "vault") {
+          loadVaultNotifications({ silent: true });
+        }
       }
 
       function manualEffectiveReduceOnly() {
@@ -8203,15 +8212,15 @@
       function updateVaultNotificationUi() {
         const provider = $("vaultNotifyProvider")?.value || state.vaultNotificationSettings?.provider || "serverchan";
         const useFeishu = provider === "feishu";
-        const enabled = !!$("vaultNotifyEnabled")?.checked;
+        const settings = state.vaultNotificationSettings || {};
+        const configured = useFeishu ? settings.feishu_configured : settings.serverchan_configured;
+        const persistedEnabled = !!settings.enabled && settings.provider === provider && !!configured;
         const status = $("vaultNotificationStatus");
         if (status) {
-          status.textContent = enabled ? t("vault.notify_on") : t("vault.notify_off");
+          status.textContent = persistedEnabled ? t("vault.notify_on") : t("vault.notify_off");
         }
         $("vaultNotifyServerChanField")?.classList.toggle("hidden", useFeishu);
         $("vaultNotifyFeishuField")?.classList.toggle("hidden", !useFeishu);
-        const settings = state.vaultNotificationSettings || {};
-        const configured = useFeishu ? settings.feishu_configured : settings.serverchan_configured;
         const help = $("vaultNotifyHelp");
         if (help) {
           const configuredText = configured
@@ -8222,12 +8231,17 @@
         if (window.lucide) lucide.createIcons();
       }
 
-      function applyVaultNotificationSettings(settings) {
+      function applyVaultNotificationSettings(settings, { force = false } = {}) {
         state.vaultNotificationSettings = settings || {};
-        if ($("vaultNotifyEnabled")) $("vaultNotifyEnabled").checked = !!settings?.enabled;
-        if ($("vaultNotifyProvider")) $("vaultNotifyProvider").value = settings?.provider === "feishu" ? "feishu" : "serverchan";
-        if ($("vaultNotifyServerChan")) $("vaultNotifyServerChan").value = "";
-        if ($("vaultNotifyFeishu")) $("vaultNotifyFeishu").value = "";
+        const provider = settings?.provider === "feishu" ? "feishu" : "serverchan";
+        if (force || !state.vaultNotificationDirty) {
+          if ($("vaultNotifyEnabled")) $("vaultNotifyEnabled").checked = !!settings?.enabled;
+          if ($("vaultNotifyProvider")) $("vaultNotifyProvider").value = provider;
+          const activeInput = provider === "feishu" ? $("vaultNotifyFeishu") : $("vaultNotifyServerChan");
+          const inactiveInput = provider === "feishu" ? $("vaultNotifyServerChan") : $("vaultNotifyFeishu");
+          if (activeInput && document.activeElement !== activeInput) activeInput.value = "";
+          if (inactiveInput && document.activeElement !== inactiveInput) inactiveInput.value = "";
+        }
         updateVaultNotificationUi();
       }
 
@@ -12584,6 +12598,7 @@
         state.statePollTimer = setInterval(() => {
           loadState({ withVaultStatus: false, withDashboardSnapshot: false, silent: true });
           loadVaultStatus({ silent: true });
+          loadVaultNotifications({ silent: true });
         }, STATE_REFRESH_MS);
         ensureManualQuoteSocket();
         ensureFibQuoteSocket();
@@ -12624,6 +12639,7 @@
         if (!document.hidden) {
           loadState({ withVaultStatus: false, withDashboardSnapshot: false, silent: true });
           loadVaultStatus({ silent: true });
+          loadVaultNotifications({ silent: true });
           loadDashboardSnapshot({ silent: true });
           ensureManualQuoteSocket();
           subscribeManualQuoteStream();
@@ -12840,8 +12856,37 @@
       $("vaultUseNew").addEventListener("click", () => setVaultMode("new"));
       $("vaultUsageTrading").addEventListener("click", () => setVaultSecretUsage("trading"));
       $("vaultUsageTransfer").addEventListener("click", () => setVaultSecretUsage("transfer"));
-      $("vaultNotifyEnabled").addEventListener("change", updateVaultNotificationUi);
-      $("vaultNotifyProvider").addEventListener("change", updateVaultNotificationUi);
+      ["vaultNotifyEnabled", "vaultNotifyProvider", "vaultNotifyServerChan", "vaultNotifyFeishu"].forEach((id) => {
+        $(id).addEventListener(id === "vaultNotifyServerChan" || id === "vaultNotifyFeishu" ? "input" : "change", () => {
+          state.vaultNotificationDirty = true;
+          updateVaultNotificationUi();
+        });
+      });
+      $("vaultNotifyTest").addEventListener("click", async () => {
+        const payload = {
+          enabled: true,
+          provider: $("vaultNotifyProvider").value,
+          serverchan_sendkey: $("vaultNotifyServerChan").value.trim(),
+          feishu_webhook: $("vaultNotifyFeishu").value.trim(),
+        };
+        await showActionResult("vaultResult", "vaultNotifyTest", async () => {
+          const result = await api("/api/vault/notifications/test", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+          if (result.ok) {
+            await loadVaultNotifications({ silent: true });
+          }
+          return {
+            ...result,
+            data: {
+              ...(result.data || {}),
+              message: result.ok ? t("vault.notify_tested") : result.error,
+            },
+          };
+        });
+      });
       $("toggleVaultPasswordChange").addEventListener("click", () => {
         state.changePasswordVisible = !state.changePasswordVisible;
         updateVaultUi();
@@ -13898,9 +13943,8 @@
             body: JSON.stringify(payload),
           });
           if (result.ok) {
-            applyVaultNotificationSettings(result.data || {});
-            $("vaultNotifyServerChan").value = "";
-            $("vaultNotifyFeishu").value = "";
+            state.vaultNotificationDirty = false;
+            applyVaultNotificationSettings(result.data || {}, { force: true });
           }
           return {
             ...result,
@@ -13946,6 +13990,7 @@
         loadCopySummary({ silent: true }),
         loadCopyLiveSoakStatus({ silent: true }),
         loadCopyShadowHistory({ silent: true }),
+        loadVaultNotifications({ silent: true }),
       ]);
       const bootSequence = loadState({ withVaultStatus: true, silent: false })
         .then(() => loadMarketCapabilities({ silent: false }))

@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::{Arc, RwLock},
-    time::UNIX_EPOCH,
+    time::{Duration, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
@@ -1079,6 +1079,10 @@ pub async fn run(options: FrontendOptions) -> Result<()> {
         .route(
             "/api/vault/notifications",
             get(vault_notifications).post(vault_notifications_update),
+        )
+        .route(
+            "/api/vault/notifications/test",
+            post(vault_notifications_test),
         )
         .with_state(state);
 
@@ -4169,6 +4173,33 @@ async fn vault_notifications_update(
     let response = ApiResult::from_result(result);
     state.audit_api_result(
         "vault_notifications_update",
+        None,
+        None,
+        audit_details,
+        &response,
+    );
+    Json(response)
+}
+
+async fn vault_notifications_test(
+    State(state): State<FrontendAppState>,
+    Json(payload): Json<NotificationSettingsPayload>,
+) -> Json<ApiResult<NotificationTestResponse>> {
+    let audit_details = json!({
+        "provider": payload.provider.clone(),
+        "serverchan_sendkey_present": payload
+            .serverchan_sendkey
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty()),
+        "feishu_webhook_present": payload
+            .feishu_webhook
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty()),
+    });
+    let result = send_notification_test(payload).await;
+    let response = ApiResult::from_result(result);
+    state.audit_api_result(
+        "vault_notifications_test",
         None,
         None,
         audit_details,
@@ -7687,6 +7718,13 @@ impl NotificationSettingsResponse {
     }
 }
 
+#[derive(Debug, Serialize)]
+struct NotificationTestResponse {
+    provider: String,
+    delivered: bool,
+    message: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct NotificationSettingsPayload {
     #[serde(default)]
@@ -7752,6 +7790,123 @@ fn apply_notification_settings_payload(
             .unwrap_or(current.feishu_webhook),
     }
     .normalized()
+}
+
+async fn send_notification_test(
+    payload: NotificationSettingsPayload,
+) -> Result<NotificationTestResponse> {
+    let current = read_notification_settings().unwrap_or_default();
+    let mut settings = apply_notification_settings_payload(
+        current,
+        NotificationSettingsPayload {
+            enabled: true,
+            provider: payload.provider,
+            serverchan_sendkey: payload.serverchan_sendkey,
+            feishu_webhook: payload.feishu_webhook,
+        },
+    );
+    settings.enabled = true;
+    let provider = settings.provider.clone();
+    let title = "trade.xyz stop notification test";
+    let message = format!(
+        "This is a trade.xyz notification test from the Vault panel.\ntime_ms={}",
+        now_ms()
+    );
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .context("failed to build notification test client")?;
+
+    if provider == "feishu" {
+        let webhook = settings.feishu_webhook.trim();
+        anyhow::ensure!(
+            !webhook.is_empty(),
+            "Feishu webhook is not configured for notification test"
+        );
+        let response = client
+            .post(webhook)
+            .json(&json!({
+                "msg_type": "text",
+                "content": {
+                    "text": format!("{title}\n{message}")
+                }
+            }))
+            .send()
+            .await
+            .context("Feishu notification test request failed")?;
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::ensure!(
+            status.is_success() && feishu_test_response_ok(&body),
+            "Feishu notification test failed with status {}",
+            status
+        );
+    } else {
+        let send_key = settings.serverchan_sendkey.trim();
+        anyhow::ensure!(
+            !send_key.is_empty(),
+            "ServerChan SendKey is not configured for notification test"
+        );
+        let url = format!("https://sctapi.ftqq.com/{send_key}.send");
+        let response = client
+            .post(url)
+            .form(&[
+                ("title", title),
+                ("desp", message.as_str()),
+                ("short", "notification test"),
+                ("noip", "1"),
+            ])
+            .send()
+            .await
+            .context("ServerChan notification test request failed")?;
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::ensure!(
+            status.is_success() && serverchan_test_response_ok(&body),
+            "ServerChan notification test failed with status {}",
+            status
+        );
+    }
+
+    Ok(NotificationTestResponse {
+        provider,
+        delivered: true,
+        message: "notification test delivered".to_string(),
+    })
+}
+
+fn serverchan_test_response_ok(body: &str) -> bool {
+    if body.trim().is_empty() {
+        return true;
+    }
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return true;
+    };
+    value
+        .get("code")
+        .and_then(Value::as_i64)
+        .map(|code| code == 0)
+        .unwrap_or(true)
+        && value
+            .pointer("/data/errno")
+            .and_then(Value::as_i64)
+            .map(|errno| errno == 0)
+            .unwrap_or(true)
+}
+
+fn feishu_test_response_ok(body: &str) -> bool {
+    if body.trim().is_empty() {
+        return true;
+    }
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return true;
+    };
+    value
+        .get("StatusCode")
+        .or_else(|| value.get("code"))
+        .and_then(Value::as_i64)
+        .map(|code| code == 0)
+        .unwrap_or(true)
 }
 
 fn start_copy_live_soak_from_frontend(
@@ -15196,7 +15351,7 @@ mod tests {
         build_copy_shadow_history_response_from_path, build_copy_summary_response_from_entries,
         build_fib_strategy_pnl_summary, dashboard_cancel_stopped_without_open_orders_count,
         dashboard_cancel_strategy_ids, dashboard_order_is_cancelable_fib_entry,
-        ensure_fib_pair_available, failed_readiness_blockers,
+        ensure_fib_pair_available, failed_readiness_blockers, feishu_test_response_ok,
         fib_all_target_accounts_have_complete_protection, fib_background_stop_requested,
         fib_coordinator_signals_from_plan, fib_entry_sync_assessment,
         fib_position_is_effectively_flat, fib_position_matches_direction,
@@ -15206,8 +15361,9 @@ mod tests {
         normalize_recovered_fib_instance, persist_vault_session_cache_to_path,
         read_cached_vault_password_from_path, read_copy_live_soak_pnl_summary,
         read_recent_copy_shadow_history_entries_from_paths, selected_enabled_account_ids,
-        trade_record_event_type, transfer_amount_label, usdc_transfer_readiness_next_actions,
-        usdc_transfer_readiness_summary, validate_batch_account_count,
+        serverchan_test_response_ok, trade_record_event_type, transfer_amount_label,
+        usdc_transfer_readiness_next_actions, usdc_transfer_readiness_summary,
+        validate_batch_account_count,
     };
 
     #[test]
@@ -15384,6 +15540,27 @@ mod tests {
         let preserved = apply_notification_settings_payload(settings, second);
         assert_eq!(preserved.serverchan_sendkey, "SCT_TEST_SENDKEY");
         assert!(preserved.enabled);
+        let refreshed = NotificationSettingsResponse::from_settings(preserved);
+        assert!(refreshed.enabled);
+        assert_eq!(refreshed.provider, "serverchan");
+        assert!(refreshed.serverchan_configured);
+    }
+
+    #[test]
+    fn notification_settings_response_parsers_accept_success_payloads() {
+        assert!(serverchan_test_response_ok(
+            r#"{"code":0,"message":"","data":{"errno":0,"error":"SUCCESS"}}"#
+        ));
+        assert!(!serverchan_test_response_ok(
+            r#"{"code":40001,"message":"bad sendkey","data":{"errno":1}}"#
+        ));
+        assert!(feishu_test_response_ok(
+            r#"{"StatusCode":0,"StatusMessage":"success"}"#
+        ));
+        assert!(feishu_test_response_ok(r#"{"code":0,"msg":"success"}"#));
+        assert!(!feishu_test_response_ok(
+            r#"{"code":19001,"msg":"bad webhook"}"#
+        ));
     }
 
     #[test]
