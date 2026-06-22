@@ -25,9 +25,19 @@ pub struct CopyShadowHistoryEntry {
     pub coin: String,
     pub action_kind: String,
     pub action_event_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leader_exchange_time_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leader_received_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leader_to_received_delay_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub received_to_record_delay_ms: Option<u64>,
     pub live_gate: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub risk_reject_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejection_code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signal_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -64,8 +74,20 @@ impl CopyShadowHistoryEntry {
             coin: record.action.coin.clone(),
             action_kind: format!("{:?}", record.action.kind),
             action_event_id: record.action.event_id.clone(),
+            leader_exchange_time_ms: Some(record.action.exchange_time_ms),
+            leader_received_at_ms: Some(record.action.received_at_ms),
+            leader_to_received_delay_ms: Some(
+                record
+                    .action
+                    .received_at_ms
+                    .saturating_sub(record.action.exchange_time_ms),
+            ),
+            received_to_record_delay_ms: Some(
+                occurred_at_ms.saturating_sub(record.action.received_at_ms),
+            ),
             live_gate: copy_live_gate_label(&record.live_gate),
-            risk_reject_reason,
+            risk_reject_reason: risk_reject_reason.clone(),
+            rejection_code: risk_reject_reason,
             signal_id: record
                 .signal
                 .as_ref()
@@ -80,6 +102,33 @@ impl CopyShadowHistoryEntry {
                 .as_ref()
                 .map(|signal| signal.order.notional_usd),
             ledger_status: record.ledger_entry.as_ref().map(|entry| entry.status),
+        }
+    }
+}
+
+impl Default for CopyShadowHistoryEntry {
+    fn default() -> Self {
+        Self {
+            schema_version: COPY_SHADOW_HISTORY_SCHEMA_VERSION,
+            occurred_at_ms: 0,
+            status: String::new(),
+            leader_id: String::new(),
+            leader_address: String::new(),
+            coin: String::new(),
+            action_kind: String::new(),
+            action_event_id: String::new(),
+            leader_exchange_time_ms: None,
+            leader_received_at_ms: None,
+            leader_to_received_delay_ms: None,
+            received_to_record_delay_ms: None,
+            live_gate: String::new(),
+            risk_reject_reason: None,
+            rejection_code: None,
+            signal_id: None,
+            side: None,
+            reduce_only: None,
+            notional_usd: None,
+            ledger_status: None,
         }
     }
 }

@@ -449,6 +449,22 @@ impl CopyLedger {
         (open_notional - pending_reduce_notional).max(0.0)
     }
 
+    pub fn effective_exposure_usd_for_leader_group(
+        &self,
+        local_account_id: &str,
+        leader_group: &str,
+        coin: &str,
+        side: OrderSide,
+    ) -> f64 {
+        self.effective_exposure_usd_filtered(
+            local_account_id,
+            coin,
+            side,
+            Some(leader_group),
+            false,
+        )
+    }
+
     pub fn submitted_effective_exposure_usd(
         &self,
         local_account_id: &str,
@@ -486,6 +502,16 @@ impl CopyLedger {
         (open_notional - pending_reduce_notional).max(0.0)
     }
 
+    pub fn submitted_effective_exposure_usd_for_leader_group(
+        &self,
+        local_account_id: &str,
+        leader_group: &str,
+        coin: &str,
+        side: OrderSide,
+    ) -> f64 {
+        self.effective_exposure_usd_filtered(local_account_id, coin, side, Some(leader_group), true)
+    }
+
     pub fn mapped_close_notional_usd(
         &self,
         local_account_id: &str,
@@ -497,6 +523,67 @@ impl CopyLedger {
             OrderSide::Sell => OrderSide::Buy,
         };
         self.effective_exposure_usd(local_account_id, coin, exposure_side)
+    }
+
+    pub fn mapped_close_notional_usd_for_leader_group(
+        &self,
+        local_account_id: &str,
+        leader_group: &str,
+        coin: &str,
+        close_order_side: OrderSide,
+    ) -> f64 {
+        let exposure_side = match close_order_side {
+            OrderSide::Buy => OrderSide::Sell,
+            OrderSide::Sell => OrderSide::Buy,
+        };
+        self.effective_exposure_usd_for_leader_group(
+            local_account_id,
+            leader_group,
+            coin,
+            exposure_side,
+        )
+    }
+
+    fn effective_exposure_usd_filtered(
+        &self,
+        local_account_id: &str,
+        coin: &str,
+        side: OrderSide,
+        leader_group: Option<&str>,
+        submitted_only: bool,
+    ) -> f64 {
+        let mut open_notional = 0.0;
+        let mut pending_reduce_notional = 0.0;
+
+        for entry in self.entries.iter().filter(|entry| {
+            entry.local_account_id == local_account_id
+                && entry.coin == coin
+                && entry.local_side == side
+                && leader_group.is_none_or(|group| entry.leader_group == group)
+        }) {
+            match entry.status {
+                CopyLedgerStatus::PendingOpen
+                    if !submitted_only || copy_ledger_entry_has_submission(entry) =>
+                {
+                    open_notional += entry.pending_notional_usd.max(0.0);
+                }
+                CopyLedgerStatus::Open => {
+                    open_notional += entry.remaining_notional_usd.max(0.0);
+                }
+                CopyLedgerStatus::PendingReduce | CopyLedgerStatus::PendingClose
+                    if !submitted_only || copy_ledger_entry_has_submission(entry) =>
+                {
+                    pending_reduce_notional += entry.pending_notional_usd.max(0.0);
+                }
+                CopyLedgerStatus::PendingOpen
+                | CopyLedgerStatus::PendingReduce
+                | CopyLedgerStatus::PendingClose
+                | CopyLedgerStatus::Closed
+                | CopyLedgerStatus::Rejected => {}
+            }
+        }
+
+        (open_notional - pending_reduce_notional).max(0.0)
     }
 }
 

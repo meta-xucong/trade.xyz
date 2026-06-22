@@ -3,6 +3,7 @@ param(
     [int]$PollSecs = 60,
     [int]$WindowSecs = 600,
     [double]$PrincipalCapUsd = 35.0,
+    [double]$Leverage = 10.0,
     [double]$MaxTotalNotionalUsd = 700.0,
     [double]$MaxTotalFeesUsd = 1.0,
     [string]$AccountId = "addr_a",
@@ -11,8 +12,10 @@ param(
         "0x6ac0b46b32dc429dbd129a503292f88649d2b8a0"
     ),
     [double]$CopyRatio = 0.2,
+    [string]$PersistencePath = ".codex-longrun\persistent-live-soak-resume-current-snapshot.json",
     [string]$LogPath = ".codex-longrun\copy-health-monitor.log",
-    [string]$VaultPasswordEnv = "TRADE_XYZ_VAULT_PASSWORD"
+    [string]$VaultPasswordEnv = "TRADE_XYZ_VAULT_PASSWORD",
+    [string]$BotExePath = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -214,12 +217,13 @@ function Set-CopyRuntimeSettings {
         leaders = $Leaders
         copy_ratio = $CopyRatio
         principal_cap_usd = $PrincipalCapUsd
+        leverage = $Leverage
         account_id = $AccountId
     }
     if (-not $settings.ok) {
         throw "copy settings update failed: $($settings.error)"
     }
-    $notionalCap = $PrincipalCapUsd * 5.0
+    $notionalCap = $PrincipalCapUsd * $Leverage
     $manual = Invoke-Json "/api/manual-settings" "POST" @{
         max_manual_order_notional_usd = $notionalCap
         account_max_order_notional_usd = $notionalCap
@@ -253,6 +257,10 @@ function Start-CopyLiveSoak {
     Ensure-VaultUnlocked
     Set-CopyRuntimeSettings
     $startedAt = Get-Date
+    $resolvedBotExePath = $BotExePath
+    if ([string]::IsNullOrWhiteSpace($resolvedBotExePath)) {
+        $resolvedBotExePath = $env:TRADE_XYZ_BOT_EXE
+    }
     $body = @{
         window_secs = $WindowSecs
         max_rounds = 0
@@ -260,14 +268,19 @@ function Start-CopyLiveSoak {
         max_total_fees_usd = $MaxTotalFeesUsd
         hold_positions_after_submit = $true
         confirm_mainnet_live = $true
+        persistence_path = $PersistencePath
     }
-    $start = Invoke-Json "/api/copy/live-soak/start" "POST" $body
-    if ($start.ok) {
-        $soakPid = Set-LatestSoakPid $startedAt
-        Write-MonitorLog "restart requested run_id=$($start.data.status.run_id) pid=$soakPid principal_cap=$PrincipalCapUsd max_total_notional=$MaxTotalNotionalUsd max_total_fees=$MaxTotalFeesUsd"
-        return
+    if (-not [string]::IsNullOrWhiteSpace($resolvedBotExePath)) {
+        $body.bot_exe_path = $resolvedBotExePath
+    } else {
+        $start = Invoke-Json "/api/copy/live-soak/start" "POST" $body
+        if ($start.ok) {
+            $soakPid = Set-LatestSoakPid $startedAt
+            Write-MonitorLog "restart requested run_id=$($start.data.status.run_id) pid=$soakPid principal_cap=$PrincipalCapUsd leverage=$Leverage max_total_notional=$MaxTotalNotionalUsd max_total_fees=$MaxTotalFeesUsd"
+            return
+        }
+        Write-MonitorLog "frontend start failed; falling back to direct soak script: $($start.error)"
     }
-    Write-MonitorLog "frontend start failed; falling back to direct soak script: $($start.error)"
     $script = if (Test-Path ".codex-longrun\run-persistent-live-soak.ps1") {
         ".codex-longrun\run-persistent-live-soak.ps1"
     } else {
@@ -289,14 +302,19 @@ function Start-CopyLiveSoak {
         [string]$MaxTotalFeesUsd,
         "-SettingsPath",
         ".codex-longrun/copy-ui-settings.json",
+        "-PersistencePath",
+        $PersistencePath,
         "-HoldPositionsAfterSubmit"
     )
+    if (-not [string]::IsNullOrWhiteSpace($resolvedBotExePath)) {
+        $args += @("-BotExePath", $resolvedBotExePath)
+    }
     $process = Start-Process -FilePath powershell -ArgumentList $args -WorkingDirectory $projectRoot -WindowStyle Hidden -PassThru
     Set-Content -LiteralPath ".codex-longrun\persistent-live-soak-detached-current.pid" -Value ([string]$process.Id) -Encoding ascii
-    Write-MonitorLog "direct soak restart requested pid=$($process.Id) principal_cap=$PrincipalCapUsd max_total_notional=$MaxTotalNotionalUsd max_total_fees=$MaxTotalFeesUsd"
+    Write-MonitorLog "direct soak restart requested pid=$($process.Id) principal_cap=$PrincipalCapUsd leverage=$Leverage max_total_notional=$MaxTotalNotionalUsd max_total_fees=$MaxTotalFeesUsd bot_exe=$resolvedBotExePath"
 }
 
-Write-MonitorLog "monitor started poll_secs=$PollSecs base_url=$BaseUrl principal_cap=$PrincipalCapUsd max_total_notional=$MaxTotalNotionalUsd max_total_fees=$MaxTotalFeesUsd"
+Write-MonitorLog "monitor started poll_secs=$PollSecs base_url=$BaseUrl principal_cap=$PrincipalCapUsd leverage=$Leverage max_total_notional=$MaxTotalNotionalUsd max_total_fees=$MaxTotalFeesUsd bot_exe=$BotExePath"
 
 while ($true) {
     try {

@@ -70,17 +70,19 @@ mod tests {
         copy_execution_canary_report, copy_live_daemon_live_submit_health_ok,
         copy_live_daemon_merge_persistence_snapshots_for_save,
         copy_live_daemon_merge_persistent_live_submit_reports,
+        copy_live_daemon_open_notional_usd_from_refs,
         copy_live_daemon_persistence_snapshot_for_save, copy_live_daemon_persistent_live_submit,
         copy_live_daemon_persistent_submit_dry_run,
         copy_live_daemon_persistent_submit_snapshot_safe_to_save,
         copy_live_daemon_prepare_refs_for_follow_position_limits,
         copy_live_daemon_reconcile_healthy_for_mode,
         copy_live_daemon_reconcile_only_degraded_round, copy_live_daemon_recoverable_watcher_error,
+        copy_live_daemon_reduce_only_matching_position_notional_usd,
         copy_live_daemon_reduce_only_ref_has_matching_position,
         copy_live_daemon_submit_evidence_contract, copy_live_daemon_submit_plan_contract,
         copy_live_daemon_supervisor_ok, copy_live_daemon_suppress_refs_rejected_by_submit_contract,
         copy_live_daemon_watcher_progress_check, copy_live_stability_round_submission_totals,
-        copy_live_stability_soak_ok, copy_shadow_smoke_check,
+        copy_live_stability_soak_ok, copy_shadow_smoke_check, normalize_report_zero,
         plan_copy_daemon_acceptance_order_refs, run_copy_execution_canary,
         run_copy_live_daemon_acceptance, run_copy_shadow_smoke,
     };
@@ -914,7 +916,7 @@ mod tests {
                 confirm_mainnet_live: false,
                 max_duration_secs: 300,
                 max_live_orders: 1,
-                max_total_notional_usd: 50.0,
+                max_total_notional_usd: 100.0,
                 max_total_fees_usd: 0.10,
                 max_slippage_bps: 50.0,
                 require_cleanup_after_submit: true,
@@ -972,7 +974,7 @@ mod tests {
                 confirm_mainnet_live: false,
                 max_duration_secs: 300,
                 max_live_orders: 1,
-                max_total_notional_usd: 50.0,
+                max_total_notional_usd: 100.0,
                 max_total_fees_usd: 0.10,
                 max_slippage_bps: 50.0,
                 require_cleanup_after_submit: true,
@@ -1138,6 +1140,7 @@ mod tests {
             ok: false,
             open_order_count: None,
             asset_positions: None,
+            position_summaries: Vec::new(),
             account_value: None,
             withdrawable: None,
             total_ntl_pos: None,
@@ -1353,6 +1356,7 @@ mod tests {
             ok: false,
             open_order_count: Some(0),
             asset_positions: Some(1),
+            position_summaries: Vec::new(),
             account_value: Some("100.0".to_string()),
             withdrawable: Some("100.0".to_string()),
             total_ntl_pos: Some("49.5".to_string()),
@@ -1433,7 +1437,7 @@ mod tests {
                 confirm_mainnet_live: false,
                 max_duration_secs: 300,
                 max_live_orders: 1,
-                max_total_notional_usd: 50.0,
+                max_total_notional_usd: 100.0,
                 max_total_fees_usd: 0.10,
                 max_slippage_bps: 50.0,
                 require_cleanup_after_submit: true,
@@ -1479,6 +1483,7 @@ mod tests {
             ok: true,
             open_order_count: Some(0),
             asset_positions: Some(0),
+            position_summaries: Vec::new(),
             account_value: Some("100.0".to_string()),
             withdrawable: Some("100.0".to_string()),
             total_ntl_pos: Some("0.0".to_string()),
@@ -1842,6 +1847,7 @@ mod tests {
                     position: crate::hyperliquid::PerpPosition {
                         coin: coin.to_string(),
                         szi: szi.to_string(),
+                        position_value: Some("123.45".to_string()),
                         ..Default::default()
                     },
                     position_type: None,
@@ -1894,6 +1900,46 @@ mod tests {
             &state_with_position("xyz:NATGAS", "-7.6"),
             &sell_to_close_long
         ));
+    }
+
+    #[test]
+    fn copy_live_daemon_reduce_only_position_filter_caps_to_local_position_notional() {
+        let state = crate::hyperliquid::ClearinghouseState {
+            margin_summary: crate::hyperliquid::MarginSummary::default(),
+            cross_margin_summary: None,
+            cross_maintenance_margin_used: None,
+            withdrawable: None,
+            asset_positions: vec![crate::hyperliquid::AssetPosition {
+                position: crate::hyperliquid::PerpPosition {
+                    coin: "xyz:GBP".to_string(),
+                    szi: "38.0".to_string(),
+                    position_value: Some("12.5".to_string()),
+                    ..Default::default()
+                },
+                position_type: None,
+            }],
+            time: None,
+        };
+        let plan = CopyLiveDaemonWouldSubmitRef {
+            record_index: 0,
+            signal_id: "sig-close".to_string(),
+            leader_id: "leader_a".to_string(),
+            leader_address: "0x00000000000000000000000000000000000000aa".to_string(),
+            order: CopyExecutionCanaryWouldSubmit {
+                account_id: "addr_a".to_string(),
+                worker_id: "worker-addr_a".to_string(),
+                coin: "xyz:GBP".to_string(),
+                side: crate::domain::OrderSide::Sell,
+                notional_usd: 50.0,
+                reduce_only: true,
+                cloid: "00000000-0000-0000-0000-000000000001".to_string(),
+            },
+        };
+
+        assert_eq!(
+            copy_live_daemon_reduce_only_matching_position_notional_usd(&state, &plan),
+            Some(12.5)
+        );
     }
 
     #[test]
@@ -1979,6 +2025,7 @@ mod tests {
             ok: true,
             open_order_count: Some(0),
             asset_positions: Some(0),
+            position_summaries: Vec::new(),
             account_value: Some("100.0".to_string()),
             withdrawable: Some("100.0".to_string()),
             total_ntl_pos: Some("0.0".to_string()),
@@ -2094,6 +2141,7 @@ mod tests {
             ok: true,
             open_order_count: Some(0),
             asset_positions: Some(0),
+            position_summaries: Vec::new(),
             account_value: Some("100.0".to_string()),
             withdrawable: Some("100.0".to_string()),
             total_ntl_pos: Some("0.0".to_string()),
@@ -2168,6 +2216,7 @@ mod tests {
             ok: true,
             open_order_count: Some(0),
             asset_positions: Some(0),
+            position_summaries: Vec::new(),
             account_value: Some("100.0".to_string()),
             withdrawable: Some("100.0".to_string()),
             total_ntl_pos: Some("0.0".to_string()),
@@ -2244,6 +2293,7 @@ mod tests {
             ok: false,
             open_order_count: Some(0),
             asset_positions: Some(2),
+            position_summaries: Vec::new(),
             account_value: Some("100.0".to_string()),
             withdrawable: Some("100.0".to_string()),
             total_ntl_pos: Some("42.0".to_string()),
@@ -2318,6 +2368,7 @@ mod tests {
             ok: false,
             open_order_count: Some(0),
             asset_positions: Some(2),
+            position_summaries: Vec::new(),
             account_value: Some("100.0".to_string()),
             withdrawable: Some("100.0".to_string()),
             total_ntl_pos: Some("42.0".to_string()),
@@ -2329,8 +2380,8 @@ mod tests {
             &options,
             &[reduce_ref],
             &[],
-            42.0,
-            0.042,
+            0.0,
+            0.0,
             &held_position,
         );
 
@@ -2341,6 +2392,78 @@ mod tests {
             .expect("bounded_account_total_exposure check");
         assert!(exposure.ok, "{contract:#?}");
         assert!(contract.ok, "{contract:#?}");
+    }
+
+    #[test]
+    fn copy_live_daemon_submit_plan_contract_does_not_cap_reduce_only_notional_or_fees() {
+        let options = CopyLiveDaemonSupervisorOptions {
+            leaders: Vec::new(),
+            account_ids: vec!["addr_a".to_string()],
+            local_account_id: Some("addr_a".to_string()),
+            coin: "xyz:GBP".to_string(),
+            side: crate::domain::OrderSide::Sell,
+            persistence_path: std::env::temp_dir().join("unused-reduce-cap.json"),
+            shadow_history_path: std::env::temp_dir().join("unused-reduce-cap.jsonl"),
+            leader_notional_usd: 120.0,
+            leader_size: 1.0,
+            live_gate: true,
+            allow_live_submit: true,
+            confirm_mainnet_live: true,
+            submit: true,
+            hold_positions_after_submit: true,
+            cleanup_max_slippage_bps: 50.0,
+            duration_secs: 900,
+            max_events: 1000,
+            max_live_orders: 1,
+            max_total_notional_usd: 10.0,
+            max_total_fees_usd: 0.001,
+            max_slippage_bps: 50.0,
+            environment: Some("mainnet".to_string()),
+            ws_url: None,
+        };
+        let reduce_ref = CopyLiveDaemonWouldSubmitRef {
+            record_index: 0,
+            signal_id: "sig-close".to_string(),
+            leader_id: "leader_a".to_string(),
+            leader_address: "0x00000000000000000000000000000000000000aa".to_string(),
+            order: CopyExecutionCanaryWouldSubmit {
+                account_id: "addr_a".to_string(),
+                worker_id: "worker-addr_a".to_string(),
+                coin: "xyz:GBP".to_string(),
+                side: crate::domain::OrderSide::Sell,
+                notional_usd: 50.0,
+                reduce_only: true,
+                cloid: "00000000-0000-0000-0000-000000000001".to_string(),
+            },
+        };
+        let reconciliations = vec![CopyBoundedLiveWindowReconcile {
+            account_id: "addr_a".to_string(),
+            ok: false,
+            open_order_count: Some(0),
+            asset_positions: Some(1),
+            position_summaries: Vec::new(),
+            account_value: Some("42.0".to_string()),
+            withdrawable: Some("3.0".to_string()),
+            total_ntl_pos: Some("200.0".to_string()),
+            total_margin_used: Some("39.0".to_string()),
+            error: None,
+        }];
+        let planned_open_notional =
+            copy_live_daemon_open_notional_usd_from_refs(std::slice::from_ref(&reduce_ref));
+        let estimated_open_fees = normalize_report_zero(planned_open_notional * 0.001);
+        let contract = copy_live_daemon_submit_plan_contract(
+            &options,
+            &[reduce_ref],
+            &[],
+            planned_open_notional,
+            estimated_open_fees,
+            &reconciliations,
+        );
+
+        assert!(contract.ok, "{contract:#?}");
+        assert_eq!(contract.planned_notional_usd, 0.0);
+        assert_eq!(contract.estimated_fees_usd, 0.0);
+        assert_eq!(contract.executable_reduce_only_plan_count, 1);
     }
 
     #[test]
@@ -2390,6 +2513,7 @@ mod tests {
             ok: false,
             open_order_count: Some(0),
             asset_positions: Some(2),
+            position_summaries: Vec::new(),
             account_value: Some("100.0".to_string()),
             withdrawable: Some("100.0".to_string()),
             total_ntl_pos: Some("42.0".to_string()),
@@ -2475,6 +2599,7 @@ mod tests {
             ok: false,
             open_order_count: Some(0),
             asset_positions: Some(2),
+            position_summaries: Vec::new(),
             account_value: Some("7.14".to_string()),
             withdrawable: Some("5.0".to_string()),
             total_ntl_pos: Some("42.0".to_string()),
@@ -2557,6 +2682,7 @@ mod tests {
             ok: true,
             open_order_count: Some(0),
             asset_positions: Some(0),
+            position_summaries: Vec::new(),
             account_value: Some("20.0".to_string()),
             withdrawable: Some("3.267497".to_string()),
             total_ntl_pos: Some("0.0".to_string()),
@@ -2575,7 +2701,7 @@ mod tests {
         );
         assert_eq!(prepared[0].signal_id, "sig-open-low-margin");
         assert!(
-            (prepared[0].order.notional_usd - 14.8522590909).abs() < 0.0001,
+            (prepared[0].order.notional_usd - 29.7045181818).abs() < 0.0001,
             "{prepared:#?}"
         );
     }
@@ -2621,6 +2747,7 @@ mod tests {
                 ok: true,
                 open_order_count: Some(0),
                 asset_positions: Some(0),
+                position_summaries: Vec::new(),
                 account_value: Some("2.0".to_string()),
                 withdrawable: Some("1.0".to_string()),
                 total_ntl_pos: Some("0.0".to_string()),
@@ -2632,6 +2759,7 @@ mod tests {
                 ok: true,
                 open_order_count: Some(0),
                 asset_positions: Some(0),
+                position_summaries: Vec::new(),
                 account_value: Some("20.0".to_string()),
                 withdrawable: Some("20.0".to_string()),
                 total_ntl_pos: Some("0.0".to_string()),
@@ -2677,6 +2805,7 @@ mod tests {
             ok: true,
             open_order_count: Some(0),
             asset_positions: Some(1),
+            position_summaries: Vec::new(),
             account_value: Some("1.0".to_string()),
             withdrawable: Some("0.0".to_string()),
             total_ntl_pos: Some("50.0".to_string()),
@@ -3255,6 +3384,124 @@ mod tests {
     }
 
     #[test]
+    fn copy_live_daemon_prunes_stale_ledger_entries_without_live_position() {
+        let stale_open = crate::strategies::smart_money::CopyLedgerEntry {
+            local_account_id: "addr_a".to_string(),
+            leader_id: "leader_a".to_string(),
+            leader_group: "leader_a".to_string(),
+            signal_id: "sig-stale-gbp-open".to_string(),
+            coin: "xyz:GBP".to_string(),
+            local_side: crate::domain::OrderSide::Buy,
+            order_cloid: Some("11111111-1111-5111-8111-111111111111".to_string()),
+            order_oid: Some(9001),
+            submitted_at_ms: Some(now_ms()),
+            filled_at_ms: Some(now_ms()),
+            planned_notional_usd: 50.0,
+            pending_notional_usd: 0.0,
+            filled_notional_usd: 49.3025,
+            remaining_notional_usd: 0.0814,
+            status: crate::strategies::smart_money::CopyLedgerStatus::Open,
+        };
+        let stale_reduce = crate::strategies::smart_money::CopyLedgerEntry {
+            signal_id: "sig-stale-gbp-reduce".to_string(),
+            order_cloid: None,
+            order_oid: None,
+            submitted_at_ms: None,
+            filled_at_ms: None,
+            planned_notional_usd: 0.0814,
+            pending_notional_usd: 0.0814,
+            filled_notional_usd: 0.0,
+            remaining_notional_usd: 0.0814,
+            status: crate::strategies::smart_money::CopyLedgerStatus::PendingReduce,
+            ..stale_open.clone()
+        };
+        let live_jpy = crate::strategies::smart_money::CopyLedgerEntry {
+            signal_id: "sig-live-jpy-open".to_string(),
+            coin: "xyz:JPY".to_string(),
+            remaining_notional_usd: 49.0,
+            ..stale_open.clone()
+        };
+        let snapshot = crate::strategies::smart_money::CopyPersistenceSnapshot {
+            schema_version: 1,
+            saved_at_ms: now_ms(),
+            seen_event_keys: vec!["seen-gbp".to_string()],
+            ledger_entries: vec![stale_open, stale_reduce, live_jpy],
+        };
+        let reconciliations = vec![CopyBoundedLiveWindowReconcile {
+            account_id: "addr_a".to_string(),
+            ok: false,
+            open_order_count: Some(0),
+            asset_positions: Some(1),
+            position_summaries: vec![super::CopyBoundedLiveWindowPositionSummary {
+                coin: "xyz:JPY".to_string(),
+                szi: "0.62".to_string(),
+                position_value: Some("99.9254".to_string()),
+            }],
+            account_value: Some("42.5".to_string()),
+            withdrawable: Some("13.1".to_string()),
+            total_ntl_pos: Some("99.9".to_string()),
+            total_margin_used: Some("19.9".to_string()),
+            error: None,
+        }];
+
+        let pruned = super::copy_live_daemon_prune_snapshot_against_reconciliations(
+            snapshot,
+            &reconciliations,
+        );
+
+        assert_eq!(pruned.seen_event_keys, vec!["seen-gbp"]);
+        assert_eq!(pruned.ledger_entries.len(), 1);
+        assert_eq!(pruned.ledger_entries[0].signal_id, "sig-live-jpy-open");
+    }
+
+    #[test]
+    fn copy_live_daemon_prune_keeps_snapshot_when_reconcile_unreadable() {
+        let entry = crate::strategies::smart_money::CopyLedgerEntry {
+            local_account_id: "addr_a".to_string(),
+            leader_id: "leader_a".to_string(),
+            leader_group: "leader_a".to_string(),
+            signal_id: "sig-open".to_string(),
+            coin: "xyz:GBP".to_string(),
+            local_side: crate::domain::OrderSide::Buy,
+            order_cloid: Some("11111111-1111-5111-8111-111111111111".to_string()),
+            order_oid: Some(9001),
+            submitted_at_ms: Some(now_ms()),
+            filled_at_ms: Some(now_ms()),
+            planned_notional_usd: 50.0,
+            pending_notional_usd: 0.0,
+            filled_notional_usd: 49.3025,
+            remaining_notional_usd: 49.3025,
+            status: crate::strategies::smart_money::CopyLedgerStatus::Open,
+        };
+        let snapshot = crate::strategies::smart_money::CopyPersistenceSnapshot {
+            schema_version: 1,
+            saved_at_ms: now_ms(),
+            seen_event_keys: Vec::new(),
+            ledger_entries: vec![entry],
+        };
+        let reconciliations = vec![CopyBoundedLiveWindowReconcile {
+            account_id: "addr_a".to_string(),
+            ok: false,
+            open_order_count: None,
+            asset_positions: None,
+            position_summaries: Vec::new(),
+            account_value: None,
+            withdrawable: None,
+            total_ntl_pos: None,
+            total_margin_used: None,
+            error: Some("network timeout".to_string()),
+        }];
+
+        let pruned = super::copy_live_daemon_prune_snapshot_against_reconciliations(
+            snapshot,
+            &reconciliations,
+        );
+
+        assert_eq!(pruned.ledger_entries.len(), 1);
+        assert_eq!(pruned.ledger_entries[0].signal_id, "sig-open");
+    }
+
+    #[test]
     fn copy_live_daemon_snapshot_save_allows_evidenced_submit_even_if_health_false() {
         let cloid = "88888888-8888-5888-8888-888888888888".to_string();
         let submitted = crate::domain::OrderSubmitted {
@@ -3436,6 +3683,7 @@ mod tests {
             ok: true,
             open_order_count: Some(0),
             asset_positions: Some(0),
+            position_summaries: Vec::new(),
             account_value: Some("100.0".to_string()),
             withdrawable: Some("100.0".to_string()),
             total_ntl_pos: Some("0.0".to_string()),
@@ -3694,6 +3942,7 @@ mod tests {
             ok: true,
             open_order_count: Some(0),
             asset_positions: Some(0),
+            position_summaries: Vec::new(),
             account_value: Some("100.0".to_string()),
             withdrawable: Some("100.0".to_string()),
             total_ntl_pos: Some("0.0".to_string()),
@@ -3766,6 +4015,7 @@ mod tests {
             ok: true,
             open_order_count: Some(0),
             asset_positions: Some(0),
+            position_summaries: Vec::new(),
             account_value: Some("100.0".to_string()),
             withdrawable: Some("100.0".to_string()),
             total_ntl_pos: Some("0.0".to_string()),
@@ -3855,6 +4105,7 @@ mod tests {
             ok: true,
             open_order_count: Some(0),
             asset_positions: Some(0),
+            position_summaries: Vec::new(),
             account_value: Some("100.0".to_string()),
             withdrawable: Some("100.0".to_string()),
             total_ntl_pos: Some("0.0".to_string()),
@@ -4271,6 +4522,7 @@ mod tests {
             ok: true,
             open_order_count: Some(0),
             asset_positions: Some(0),
+            position_summaries: Vec::new(),
             account_value: Some("100.0".to_string()),
             withdrawable: Some("100.0".to_string()),
             total_ntl_pos: Some("0.0".to_string()),
@@ -4282,6 +4534,7 @@ mod tests {
             ok: false,
             open_order_count: Some(1),
             asset_positions: Some(0),
+            position_summaries: Vec::new(),
             account_value: Some("100.0".to_string()),
             withdrawable: Some("100.0".to_string()),
             total_ntl_pos: Some("0.0".to_string()),
@@ -4395,6 +4648,7 @@ mod tests {
             ok: true,
             open_order_count: Some(0),
             asset_positions: Some(0),
+            position_summaries: Vec::new(),
             account_value: Some("100.0".to_string()),
             withdrawable: Some("100.0".to_string()),
             total_ntl_pos: Some("0.0".to_string()),
@@ -6385,11 +6639,19 @@ struct CopyBoundedLiveWindowReconcile {
     ok: bool,
     open_order_count: Option<usize>,
     asset_positions: Option<usize>,
+    position_summaries: Vec<CopyBoundedLiveWindowPositionSummary>,
     account_value: Option<String>,
     withdrawable: Option<String>,
     total_ntl_pos: Option<String>,
     total_margin_used: Option<String>,
     error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CopyBoundedLiveWindowPositionSummary {
+    coin: String,
+    szi: String,
+    position_value: Option<String>,
 }
 
 fn run_copy_shadow_smoke(
@@ -7643,12 +7905,10 @@ async fn run_copy_live_daemon_supervisor(
                                 .filter(|plan| !submitted_plan_cloids.contains(&plan.order.cloid))
                                 .collect::<Vec<_>>();
                             if !pending_executable_refs.is_empty() {
-                                let pending_planned_notional_usd = normalize_report_zero(
-                                    pending_executable_refs
-                                        .iter()
-                                        .map(|plan| plan.order.notional_usd.max(0.0))
-                                        .sum::<f64>(),
-                                );
+                                let pending_planned_notional_usd =
+                                    copy_live_daemon_open_notional_usd_from_refs(
+                                        &pending_executable_refs,
+                                    );
                                 let pending_estimated_fees_usd =
                                     normalize_report_zero(pending_planned_notional_usd * 0.001);
                                 let immediate_reconciliations =
@@ -7776,14 +8036,17 @@ async fn run_copy_live_daemon_supervisor(
 
     input.elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
     let saved = strategies::smart_money::load_copy_persistence_snapshot(&options.persistence_path)?;
+    let pre_submit_reconciliations =
+        reconcile_copy_bounded_window_accounts(config, &target_accounts).await;
+    let saved =
+        copy_live_daemon_prune_snapshot_against_reconciliations(saved, &pre_submit_reconciliations);
+    strategies::smart_money::save_copy_persistence_snapshot(&options.persistence_path, &saved)?;
     let (prepared_submit_plan_refs, mut suppressed_submit_plan_refs) =
         copy_live_daemon_prepare_refs_for_follow_position_limits(
             &would_submit_plan_refs,
             &options,
             &saved,
         );
-    let pre_submit_reconciliations =
-        reconcile_copy_bounded_window_accounts(config, &target_accounts).await;
     let (margin_adjusted_submit_plan_refs, mut margin_suppressed_refs) =
         copy_live_daemon_resize_open_refs_for_margin(
             &prepared_submit_plan_refs,
@@ -7796,12 +8059,8 @@ async fn run_copy_live_daemon_supervisor(
     let would_submit_orders = copy_live_daemon_order_refs_to_orders(&would_submit_plan_refs);
     let executable_would_submit_orders =
         copy_live_daemon_order_refs_to_orders(&executable_submit_plan_refs);
-    let planned_notional_usd = normalize_report_zero(
-        executable_would_submit_orders
-            .iter()
-            .map(|order| order.notional_usd.max(0.0))
-            .sum::<f64>(),
-    );
+    let planned_notional_usd =
+        copy_live_daemon_open_notional_usd_from_orders(&executable_would_submit_orders);
     let estimated_fees_usd = normalize_report_zero(planned_notional_usd * 0.001);
     let submit_plan_contract = copy_live_daemon_submit_plan_contract(
         &options,
@@ -7836,12 +8095,8 @@ async fn run_copy_live_daemon_supervisor(
             message: suppressed.message.clone(),
         })
         .collect::<Vec<_>>();
-    let planned_notional_usd = normalize_report_zero(
-        executable_would_submit_orders
-            .iter()
-            .map(|order| order.notional_usd.max(0.0))
-            .sum::<f64>(),
-    );
+    let planned_notional_usd =
+        copy_live_daemon_open_notional_usd_from_orders(&executable_would_submit_orders);
     let estimated_fees_usd = normalize_report_zero(planned_notional_usd * 0.001);
     let pending_final_executable_refs = executable_submit_plan_refs
         .iter()
@@ -8120,6 +8375,27 @@ fn normalize_report_zero(value: f64) -> f64 {
     }
 }
 
+fn copy_live_daemon_open_notional_usd_from_refs(refs: &[CopyLiveDaemonWouldSubmitRef]) -> f64 {
+    normalize_report_zero(
+        refs.iter()
+            .filter(|plan| !plan.order.reduce_only)
+            .map(|plan| plan.order.notional_usd.max(0.0))
+            .sum::<f64>(),
+    )
+}
+
+fn copy_live_daemon_open_notional_usd_from_orders(
+    orders: &[CopyExecutionCanaryWouldSubmit],
+) -> f64 {
+    normalize_report_zero(
+        orders
+            .iter()
+            .filter(|order| !order.reduce_only)
+            .map(|order| order.notional_usd.max(0.0))
+            .sum::<f64>(),
+    )
+}
+
 fn copy_live_daemon_live_submit_health_ok(
     report: &CopyLiveDaemonPersistentLiveSubmitReport,
 ) -> bool {
@@ -8287,6 +8563,33 @@ fn copy_live_daemon_reconcile_health_detail(
             reconciliations.len()
         )
     }
+}
+
+fn copy_live_daemon_reconciliations_ready_for_reduce_only(
+    reconciliations: &[CopyBoundedLiveWindowReconcile],
+) -> bool {
+    !reconciliations.is_empty()
+        && reconciliations
+            .iter()
+            .all(|reconcile| reconcile.error.is_none() && reconcile.open_order_count == Some(0))
+}
+
+fn copy_live_daemon_reduce_only_reconcile_health_detail(
+    reconciliations: &[CopyBoundedLiveWindowReconcile],
+) -> String {
+    let readable_count = reconciliations
+        .iter()
+        .filter(|reconcile| reconcile.error.is_none())
+        .count();
+    let no_open_orders = reconciliations
+        .iter()
+        .filter(|reconcile| reconcile.open_order_count == Some(0))
+        .count();
+    format!(
+        "reduce-only submit precheck: {readable_count}/{} account(s) readable, {no_open_orders}/{} account(s) have no open orders; total exposure cap is intentionally not applied to risk-reducing closes",
+        reconciliations.len(),
+        reconciliations.len()
+    )
 }
 
 fn copy_live_daemon_recoverable_watcher_error(error: &anyhow::Error) -> bool {
@@ -8487,6 +8790,8 @@ fn copy_live_daemon_submit_plan_contract(
         .iter()
         .filter(|plan| plan.order.reduce_only)
         .count();
+    let reduce_only_only_plan =
+        executable_open_plan_count == 0 && executable_reduce_only_plan_count > 0;
     let planned_open_notional_usd = normalize_report_zero(
         executable_refs
             .iter()
@@ -8568,7 +8873,7 @@ fn copy_live_daemon_submit_plan_contract(
             "bounded_submit_plan_notional",
             planned_notional_usd <= options.max_total_notional_usd,
             format!(
-                "planned_notional_usd={planned_notional_usd:.6} must be <= {:.6}",
+                "planned_open_notional_usd={planned_notional_usd:.6} must be <= {:.6}; reduce-only closes do not add exposure",
                 options.max_total_notional_usd
             ),
         ),
@@ -8576,7 +8881,7 @@ fn copy_live_daemon_submit_plan_contract(
             "bounded_submit_plan_fees",
             estimated_fees_usd <= options.max_total_fees_usd,
             format!(
-                "estimated_fees_usd={estimated_fees_usd:.6} must be <= {:.6}",
+                "estimated_open_fees_usd={estimated_fees_usd:.6} must be <= {:.6}; reduce-only closes are not blocked by open-order fee budget",
                 options.max_total_fees_usd
             ),
         ),
@@ -8609,8 +8914,16 @@ fn copy_live_daemon_submit_plan_contract(
             } else {
                 "pre_submit_reconcile_flat"
             },
-            copy_live_daemon_reconciliations_healthy_for_mode(options, final_reconciliations),
-            copy_live_daemon_reconcile_health_detail(options, final_reconciliations),
+            if reduce_only_only_plan {
+                copy_live_daemon_reconciliations_ready_for_reduce_only(final_reconciliations)
+            } else {
+                copy_live_daemon_reconciliations_healthy_for_mode(options, final_reconciliations)
+            },
+            if reduce_only_only_plan {
+                copy_live_daemon_reduce_only_reconcile_health_detail(final_reconciliations)
+            } else {
+                copy_live_daemon_reconcile_health_detail(options, final_reconciliations)
+            },
         ),
     ];
     CopyLiveDaemonSubmitPlanContract {
@@ -8991,27 +9304,49 @@ fn copy_live_daemon_persistent_submit_dry_run(
     }
 }
 
+#[cfg(test)]
 fn copy_live_daemon_reduce_only_ref_has_matching_position(
     state: &hyperliquid::ClearinghouseState,
     plan: &CopyLiveDaemonWouldSubmitRef,
 ) -> bool {
+    copy_live_daemon_reduce_only_matching_position_notional_usd(state, plan)
+        .is_some_and(|notional| notional > 0.0)
+}
+
+fn copy_live_daemon_reduce_only_matching_position_notional_usd(
+    state: &hyperliquid::ClearinghouseState,
+    plan: &CopyLiveDaemonWouldSubmitRef,
+) -> Option<f64> {
     if !plan.order.reduce_only {
-        return true;
+        return Some(plan.order.notional_usd.max(0.0));
     }
-    state.asset_positions.iter().any(|asset| {
-        asset
-            .position
-            .coin
-            .eq_ignore_ascii_case(plan.order.coin.as_str())
-            && asset
+    state
+        .asset_positions
+        .iter()
+        .filter(|asset| {
+            asset
                 .position
-                .szi
+                .coin
+                .eq_ignore_ascii_case(plan.order.coin.as_str())
+        })
+        .filter_map(|asset| {
+            let szi = asset.position.szi.parse::<f64>().ok()?;
+            let matches_side = match plan.order.side {
+                domain::OrderSide::Buy => szi < -1e-12,
+                domain::OrderSide::Sell => szi > 1e-12,
+            };
+            if !matches_side {
+                return None;
+            }
+            let position_value = asset
+                .position
+                .position_value
+                .as_deref()?
                 .parse::<f64>()
-                .is_ok_and(|szi| match plan.order.side {
-                    domain::OrderSide::Buy => szi < -1e-12,
-                    domain::OrderSide::Sell => szi > 1e-12,
-                })
-    })
+                .ok()?;
+            Some(position_value.abs())
+        })
+        .max_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))
 }
 
 async fn copy_live_daemon_filter_submit_refs_for_live_reduce_exposure(
@@ -9060,6 +9395,7 @@ async fn copy_live_daemon_filter_submit_refs_for_live_reduce_exposure(
 
     let mut eligible_refs = Vec::new();
     let mut verified_reduce_only_count = 0usize;
+    let mut resized_reduce_only_count = 0usize;
     let mut skipped_no_exposure_count = 0usize;
     let mut verification_error_count = 0usize;
     for plan in executable_refs {
@@ -9068,14 +9404,25 @@ async fn copy_live_daemon_filter_submit_refs_for_live_reduce_exposure(
             continue;
         }
         match state_by_account.get(&plan.order.account_id) {
-            Some(Ok(state))
-                if copy_live_daemon_reduce_only_ref_has_matching_position(state, plan) =>
-            {
+            Some(Ok(state)) => {
+                let Some(local_position_notional) =
+                    copy_live_daemon_reduce_only_matching_position_notional_usd(state, plan)
+                else {
+                    skipped_no_exposure_count += 1;
+                    continue;
+                };
+                if local_position_notional <= 0.0 {
+                    skipped_no_exposure_count += 1;
+                    continue;
+                }
                 verified_reduce_only_count += 1;
-                eligible_refs.push(plan.clone());
-            }
-            Some(Ok(_)) => {
-                skipped_no_exposure_count += 1;
+                let mut prepared = plan.clone();
+                let capped_notional = prepared.order.notional_usd.min(local_position_notional);
+                if (prepared.order.notional_usd - capped_notional).abs() > 1e-9 {
+                    resized_reduce_only_count += 1;
+                    prepared.order.notional_usd = capped_notional;
+                }
+                eligible_refs.push(prepared);
             }
             Some(Err(_)) | None => {
                 verification_error_count += 1;
@@ -9089,7 +9436,7 @@ async fn copy_live_daemon_filter_submit_refs_for_live_reduce_exposure(
             "reduce_only_local_exposure_filter",
             verification_error_count == 0,
             format!(
-                "{verified_reduce_only_count}/{reduce_only_count} reduce-only ref(s) matched live local exposure; {skipped_no_exposure_count} skipped as no-op; {verification_error_count} verification error(s)"
+                "{verified_reduce_only_count}/{reduce_only_count} reduce-only ref(s) matched live local exposure; {resized_reduce_only_count} resized to local position notional; {skipped_no_exposure_count} skipped as no-op; {verification_error_count} verification error(s)"
             ),
         )],
     )
@@ -10311,6 +10658,7 @@ async fn reconcile_copy_bounded_window_accounts(
                 ok: false,
                 open_order_count: None,
                 asset_positions: None,
+                position_summaries: Vec::new(),
                 account_value: None,
                 withdrawable: None,
                 total_ntl_pos: None,
@@ -10348,6 +10696,16 @@ fn copy_bounded_live_window_reconcile_from_report(
 ) -> CopyBoundedLiveWindowReconcile {
     let margin = &report.clearinghouse_state.margin_summary;
     let asset_positions = report.clearinghouse_state.asset_positions.len();
+    let position_summaries = report
+        .clearinghouse_state
+        .asset_positions
+        .iter()
+        .map(|asset| CopyBoundedLiveWindowPositionSummary {
+            coin: asset.position.coin.clone(),
+            szi: asset.position.szi.clone(),
+            position_value: asset.position.position_value.clone(),
+        })
+        .collect::<Vec<_>>();
     let total_ntl_zero = margin
         .total_ntl_pos
         .parse::<f64>()
@@ -10364,6 +10722,7 @@ fn copy_bounded_live_window_reconcile_from_report(
             && total_margin_zero,
         open_order_count: Some(report.open_order_count),
         asset_positions: Some(asset_positions),
+        position_summaries,
         account_value: Some(margin.account_value.clone()),
         withdrawable: report.clearinghouse_state.withdrawable.clone(),
         total_ntl_pos: Some(margin.total_ntl_pos.clone()),
@@ -10900,6 +11259,69 @@ fn copy_live_daemon_persistence_snapshot_for_save(
         ) || copy_live_daemon_ledger_entry_has_submission(entry)
     });
     snapshot
+}
+
+fn copy_live_daemon_prune_snapshot_against_reconciliations(
+    mut snapshot: strategies::smart_money::CopyPersistenceSnapshot,
+    reconciliations: &[CopyBoundedLiveWindowReconcile],
+) -> strategies::smart_money::CopyPersistenceSnapshot {
+    let readable_accounts = reconciliations
+        .iter()
+        .filter(|reconcile| reconcile.error.is_none())
+        .map(|reconcile| reconcile.account_id.as_str())
+        .collect::<HashSet<_>>();
+    if readable_accounts.is_empty() {
+        return snapshot;
+    }
+
+    let live_position_keys = reconciliations
+        .iter()
+        .filter(|reconcile| reconcile.error.is_none())
+        .flat_map(|reconcile| {
+            reconcile
+                .position_summaries
+                .iter()
+                .filter_map(move |position| {
+                    let local_side = copy_live_daemon_local_side_from_position_szi(&position.szi)?;
+                    Some((
+                        reconcile.account_id.clone(),
+                        position.coin.clone(),
+                        copy_live_daemon_order_side_key(local_side),
+                    ))
+                })
+        })
+        .collect::<HashSet<_>>();
+
+    snapshot.ledger_entries.retain(|entry| {
+        if !readable_accounts.contains(entry.local_account_id.as_str())
+            || !matches!(
+                entry.status,
+                strategies::smart_money::CopyLedgerStatus::Open
+                    | strategies::smart_money::CopyLedgerStatus::PendingReduce
+                    | strategies::smart_money::CopyLedgerStatus::PendingClose
+            )
+        {
+            return true;
+        }
+        let key = (
+            entry.local_account_id.clone(),
+            entry.coin.clone(),
+            copy_live_daemon_order_side_key(entry.local_side),
+        );
+        live_position_keys.contains(&key)
+    });
+    snapshot
+}
+
+fn copy_live_daemon_local_side_from_position_szi(szi: &str) -> Option<domain::OrderSide> {
+    let value = szi.parse::<f64>().ok()?;
+    if value > 1e-12 {
+        Some(domain::OrderSide::Buy)
+    } else if value < -1e-12 {
+        Some(domain::OrderSide::Sell)
+    } else {
+        None
+    }
 }
 
 fn copy_live_daemon_merge_persistence_snapshots_for_save(
