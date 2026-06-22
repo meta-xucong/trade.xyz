@@ -110,7 +110,7 @@ max_total_position_notional_usd = 5000.0
 max_order_notional_usd = 500.0
 max_daily_loss_usd = 300.0
 min_margin_health = 0.25
-max_leverage = 5
+max_leverage = 10
 max_signal_delay_ms = 2000
 
 [[risk.symbols]]

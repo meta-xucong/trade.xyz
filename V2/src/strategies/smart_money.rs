@@ -7,7 +7,7 @@ use crate::{
 
 const POSITION_EPS: f64 = 1e-9;
 pub const COPY_DEFAULT_PRINCIPAL_CAP_USD: f64 = 10.0;
-pub const COPY_MAX_LEVERAGE: f64 = 5.0;
+pub const COPY_MAX_LEVERAGE: f64 = 10.0;
 pub const COPY_DEFAULT_MAX_SIGNAL_NOTIONAL_USD: f64 =
     COPY_DEFAULT_PRINCIPAL_CAP_USD * COPY_MAX_LEVERAGE;
 mod conflict;
@@ -286,6 +286,10 @@ impl LeaderActionKind {
             self,
             Self::OpenLong | Self::IncreaseLong | Self::OpenShort | Self::IncreaseShort
         )
+    }
+
+    pub fn is_fresh_open(self) -> bool {
+        matches!(self, Self::OpenLong | Self::OpenShort)
     }
 
     pub fn closes_or_reduces(self) -> bool {
@@ -826,14 +830,13 @@ impl CopyDryRunShadowPipeline {
                 }
             })
             .unwrap_or(self.strategy.config.default_copy_ratio);
-        let mapped_close_notional_usd = self.mapped_close_notional_usd(action);
-        if mapped_close_notional_usd.is_some_and(|notional| notional <= 0.0) {
-            return CopySignalRiskDecision::Rejected {
-                reason_code: "COPY_MAPPING_MISSING".to_string(),
-            };
-        }
+        let mapped_close_notional_usd = self
+            .mapped_close_notional_usd(action)
+            .filter(|notional| *notional > 0.0);
         let is_mapped_close = mapped_close_notional_usd.is_some();
-        let sizing_leader_notional_usd = if action.kind.is_full_close() {
+        let is_close_or_reduce =
+            action.kind.close_side().is_some() && action.kind.open_side().is_none();
+        let sizing_leader_notional_usd = if is_close_or_reduce {
             mapped_close_notional_usd.unwrap_or(action.leader_notional_usd)
         } else {
             action.leader_notional_usd
@@ -860,26 +863,51 @@ impl CopyDryRunShadowPipeline {
                 }
             })
             .unwrap_or(0.0);
+        let same_leader_effective_exposure_usd = action
+            .kind
+            .open_side()
+            .map(|side| {
+                if matches!(
+                    evaluate_copy_live_gate(self.config.live_gate),
+                    CopyLiveGateDecision::LiveAllowed
+                ) {
+                    self.ledger
+                        .submitted_effective_exposure_usd_for_leader_group(
+                            &self.config.local_account_id,
+                            &action.leader_id,
+                            &action.coin,
+                            side,
+                        )
+                } else {
+                    self.ledger.effective_exposure_usd_for_leader_group(
+                        &self.config.local_account_id,
+                        &action.leader_id,
+                        &action.coin,
+                        side,
+                    )
+                }
+            })
+            .unwrap_or(0.0);
         evaluate_copy_signal_risk(CopySignalRiskInput {
             action,
             sizing: CopySizingInput {
                 leader_notional_usd: sizing_leader_notional_usd,
-                leader_copy_ratio: if action.kind.is_full_close() {
+                leader_copy_ratio: if is_close_or_reduce {
                     1.0
                 } else {
                     leader_copy_ratio
                 },
-                account_copy_ratio: if action.kind.is_full_close() {
+                account_copy_ratio: if is_close_or_reduce {
                     1.0
                 } else {
                     self.config.account_copy_ratio
                 },
-                principal_cap_usd: if action.kind.is_full_close() {
+                principal_cap_usd: if is_close_or_reduce {
                     None
                 } else {
                     Some(self.config.principal_cap_usd)
                 },
-                leverage: if action.kind.is_full_close() {
+                leverage: if is_close_or_reduce {
                     1.0
                 } else {
                     self.config.leverage.min(COPY_MAX_LEVERAGE)
@@ -907,14 +935,16 @@ impl CopyDryRunShadowPipeline {
                 .any(|symbol| symbol.eq_ignore_ascii_case(&action.coin)),
             allow_short: self.config.allow_short,
             current_effective_exposure_usd,
+            same_leader_effective_exposure_usd,
             max_effective_exposure_usd: self.config.max_effective_exposure_usd,
         })
     }
 
     fn mapped_close_notional_usd(&self, action: &SemanticLeaderAction) -> Option<f64> {
         let close_side = action.kind.close_side()?;
-        Some(self.ledger.mapped_close_notional_usd(
+        Some(self.ledger.mapped_close_notional_usd_for_leader_group(
             &self.config.local_account_id,
+            &action.leader_id,
             &action.coin,
             close_side,
         ))
@@ -1696,7 +1726,7 @@ mod tests {
                     leader_trade_cap_usd: None,
                     symbol_order_cap_usd: None,
                     account_order_cap_usd: None,
-                    remaining_symbol_position_cap_usd: None,
+                    remaining_symbol_position_cap_usd: Some(2.0),
                     remaining_daily_cap_usd: None,
                     exchange_min_open_notional_usd: 10.0,
                     reduce_only: false,
@@ -1730,7 +1760,7 @@ mod tests {
                     leader_trade_cap_usd: None,
                     symbol_order_cap_usd: None,
                     account_order_cap_usd: None,
-                    remaining_symbol_position_cap_usd: None,
+                    remaining_symbol_position_cap_usd: Some(2.0),
                     remaining_daily_cap_usd: None,
                     exchange_min_open_notional_usd: 10.0,
                     reduce_only: false,
@@ -1795,7 +1825,7 @@ mod tests {
         );
 
         let initial_records =
-            pipeline.handle_watcher_event(position_event("leader_a", 1.0, 10.0), now);
+            pipeline.handle_watcher_event(position_event("leader_a", 0.0, 0.0), now);
         assert!(initial_records.is_empty());
 
         let fill_records = pipeline.handle_watcher_event(
@@ -1809,10 +1839,10 @@ mod tests {
         );
         assert!(fill_records.is_empty());
 
-        let records = pipeline.handle_watcher_event(position_event("leader_a", 2.0, 20.0), now + 2);
+        let records = pipeline.handle_watcher_event(position_event("leader_a", 1.0, 20.0), now + 2);
 
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].action.kind, LeaderActionKind::IncreaseLong);
+        assert_eq!(records[0].action.kind, LeaderActionKind::OpenLong);
         assert_eq!(records[0].live_gate, CopyLiveGateDecision::DryRunOnly);
         assert_eq!(
             records[0].risk_decision,
@@ -1862,7 +1892,7 @@ mod tests {
 
         assert!(
             pipeline
-                .handle_watcher_event(position_event("leader_a", 1.0, 10.0), now)
+                .handle_watcher_event(position_event("leader_a", 0.0, 0.0), now)
                 .is_empty()
         );
         assert!(
@@ -1879,7 +1909,7 @@ mod tests {
                 .is_empty()
         );
         let records =
-            pipeline.handle_watcher_event(position_event("leader_a", 2.0, 1000.0), now + 2);
+            pipeline.handle_watcher_event(position_event("leader_a", 1.0, 1000.0), now + 2);
 
         assert_eq!(records.len(), 1);
         assert_eq!(
@@ -1917,7 +1947,7 @@ mod tests {
 
         assert!(
             pipeline
-                .handle_watcher_event(position_event("leader_a", 1.0, 10.0), now)
+                .handle_watcher_event(position_event("leader_a", 0.0, 0.0), now)
                 .is_empty()
         );
         assert!(
@@ -1933,7 +1963,7 @@ mod tests {
                 )
                 .is_empty()
         );
-        let records = pipeline.handle_watcher_event(position_event("leader_a", 2.0, 20.0), now + 2);
+        let records = pipeline.handle_watcher_event(position_event("leader_a", 1.0, 20.0), now + 2);
 
         assert_eq!(records.len(), 1);
         assert_eq!(
@@ -1961,7 +1991,7 @@ mod tests {
 
         assert!(
             pipeline
-                .handle_watcher_event(position_event("leader_a", 1.0, 10.0), now)
+                .handle_watcher_event(position_event("leader_a", 0.0, 0.0), now)
                 .is_empty()
         );
         assert!(
@@ -1982,7 +2012,7 @@ mod tests {
                 )
                 .is_empty()
         );
-        let records = pipeline.handle_watcher_event(position_event("leader_a", 2.0, 20.0), now + 2);
+        let records = pipeline.handle_watcher_event(position_event("leader_a", 1.0, 20.0), now + 2);
 
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].live_gate, CopyLiveGateDecision::LiveAllowed);
@@ -2000,7 +2030,7 @@ mod tests {
 
         assert!(
             pipeline
-                .handle_watcher_event(position_event("leader_a", 1.0, 10.0), now)
+                .handle_watcher_event(position_event("leader_a", 0.0, 0.0), now)
                 .is_empty()
         );
         assert!(
@@ -2021,7 +2051,7 @@ mod tests {
                 )
                 .is_empty()
         );
-        let records = pipeline.handle_watcher_event(position_event("leader_a", 2.0, 20.0), now + 2);
+        let records = pipeline.handle_watcher_event(position_event("leader_a", 1.0, 20.0), now + 2);
 
         assert_eq!(records.len(), 1);
         assert_eq!(
@@ -2032,6 +2062,13 @@ mod tests {
         );
         assert!(records[0].signal.is_none());
         assert!(records[0].ledger_entry.is_none());
+        let entry = CopyShadowHistoryEntry::from_shadow_record(&records[0], now + 3);
+        assert_eq!(entry.status, "rejected");
+        assert_eq!(
+            entry.risk_reject_reason.as_deref(),
+            Some("COPY_SYMBOL_BLOCKED")
+        );
+        assert_eq!(entry.rejection_code.as_deref(), Some("COPY_SYMBOL_BLOCKED"));
         assert_eq!(
             pipeline
                 .ledger()
@@ -2091,7 +2128,7 @@ mod tests {
     }
 
     #[test]
-    fn dry_run_shadow_full_close_rejects_without_mapped_exposure() {
+    fn dry_run_shadow_full_close_rejects_without_same_leader_mapping() {
         let now = now_ms();
         let mut pipeline = CopyDryRunShadowPipeline::new(
             dry_run_shadow_config(),
@@ -2120,7 +2157,7 @@ mod tests {
         assert_eq!(
             records[0].risk_decision,
             CopySignalRiskDecision::Rejected {
-                reason_code: "COPY_MAPPING_MISSING".to_string(),
+                reason_code: "COPY_CLOSE_WITHOUT_LOCAL_MAPPING".to_string(),
             }
         );
         assert!(records[0].signal.is_none());
@@ -2128,7 +2165,7 @@ mod tests {
     }
 
     #[test]
-    fn dry_run_shadow_partial_reduce_rejects_without_mapped_exposure() {
+    fn dry_run_shadow_partial_reduce_rejects_without_same_leader_mapping() {
         let now = now_ms();
         let mut pipeline = CopyDryRunShadowPipeline::new(
             dry_run_shadow_config(),
@@ -2157,11 +2194,159 @@ mod tests {
         assert_eq!(
             records[0].risk_decision,
             CopySignalRiskDecision::Rejected {
-                reason_code: "COPY_MAPPING_MISSING".to_string(),
+                reason_code: "COPY_CLOSE_WITHOUT_LOCAL_MAPPING".to_string(),
             }
         );
         assert!(records[0].signal.is_none());
         assert!(records[0].ledger_entry.is_none());
+    }
+
+    #[test]
+    fn dry_run_shadow_rejects_increase_without_same_leader_mapping() {
+        let now = now_ms();
+        let mut pipeline = CopyDryRunShadowPipeline::new(
+            dry_run_shadow_config(),
+            copy_strategy(),
+            CopyLedger::new(),
+        );
+
+        pipeline.handle_watcher_event(position_event("leader_a", 1.0, 10.0), now);
+        pipeline.handle_watcher_event(
+            CopyLeaderWatcherEvent::Fill {
+                leader_id: "leader_a".to_string(),
+                leader_address: "0xABC".to_string(),
+                fill: leader_fill("shadow-increase-tail-1", "leader_a", OrderSide::Buy, 100.0),
+                is_snapshot: false,
+            },
+            now + 1,
+        );
+        let records = pipeline.handle_watcher_event(position_event("leader_a", 2.0, 20.0), now + 2);
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].action.kind, LeaderActionKind::IncreaseLong);
+        assert_eq!(
+            records[0].risk_decision,
+            CopySignalRiskDecision::Rejected {
+                reason_code: "COPY_INCREASE_WITHOUT_LOCAL_MAPPING".to_string(),
+            }
+        );
+        assert!(records[0].signal.is_none());
+        assert!(records[0].ledger_entry.is_none());
+    }
+
+    #[test]
+    fn dry_run_shadow_allows_increase_with_same_leader_mapping() {
+        let now = now_ms();
+        let mut ledger = CopyLedger::new();
+        ledger.push(ledger_entry(
+            "leader-a-open",
+            OrderSide::Buy,
+            20.0,
+            0.0,
+            20.0,
+            20.0,
+            CopyLedgerStatus::Open,
+        ));
+        let mut pipeline =
+            CopyDryRunShadowPipeline::new(dry_run_shadow_config(), copy_strategy(), ledger);
+
+        pipeline.handle_watcher_event(position_event("leader_a", 1.0, 10.0), now);
+        pipeline.handle_watcher_event(
+            CopyLeaderWatcherEvent::Fill {
+                leader_id: "leader_a".to_string(),
+                leader_address: "0xABC".to_string(),
+                fill: leader_fill(
+                    "shadow-increase-mapped-1",
+                    "leader_a",
+                    OrderSide::Buy,
+                    100.0,
+                ),
+                is_snapshot: false,
+            },
+            now + 1,
+        );
+        let records = pipeline.handle_watcher_event(position_event("leader_a", 2.0, 20.0), now + 2);
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].risk_decision,
+            CopySignalRiskDecision::Approved {
+                side: OrderSide::Buy,
+                reduce_only: false,
+                notional_usd: COPY_DEFAULT_MAX_SIGNAL_NOTIONAL_USD,
+            }
+        );
+        assert!(records[0].signal.is_some());
+        assert!(records[0].ledger_entry.is_some());
+    }
+
+    #[test]
+    fn dry_run_shadow_other_leader_reduce_does_not_close_existing_mapping() {
+        let now = now_ms();
+        let mut config = dry_run_shadow_config();
+        config.live_gate = CopyLiveGateInput {
+            process_dry_run: true,
+            live_copy_enabled: false,
+            account_worker_live: false,
+        };
+        let mut strategy_config = copy_config();
+        strategy_config.leaders.push(LeaderRule {
+            leader_id: "leader_b".to_string(),
+            leader_address: "0xdef".to_string(),
+            enabled: true,
+            copy_ratio: 0.2,
+        });
+        let mut ledger = CopyLedger::new();
+        ledger.push(ledger_entry(
+            "leader-a-open",
+            OrderSide::Buy,
+            75.0,
+            0.0,
+            75.0,
+            75.0,
+            CopyLedgerStatus::Open,
+        ));
+        let mut pipeline = CopyDryRunShadowPipeline::new(
+            config,
+            SmartMoneyCopyStrategy::new(strategy_config),
+            ledger,
+        );
+
+        pipeline.handle_watcher_event(position_event("leader_b", 2.0, 20.0), now);
+        pipeline.handle_watcher_event(
+            CopyLeaderWatcherEvent::Fill {
+                leader_id: "leader_b".to_string(),
+                leader_address: "0xdef".to_string(),
+                fill: leader_fill(
+                    "shadow-other-leader-reduce-1",
+                    "leader_b",
+                    OrderSide::Sell,
+                    20.0,
+                ),
+                is_snapshot: false,
+            },
+            now + 1,
+        );
+        let records = pipeline.handle_watcher_event(position_event("leader_b", 1.0, 10.0), now + 2);
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].action.kind, LeaderActionKind::ReduceLong);
+        assert_eq!(
+            records[0].risk_decision,
+            CopySignalRiskDecision::Rejected {
+                reason_code: "COPY_CLOSE_WITHOUT_LOCAL_MAPPING".to_string(),
+            }
+        );
+        assert!(records[0].signal.is_none());
+        assert_eq!(
+            pipeline.ledger().effective_exposure_usd_for_leader_group(
+                "addr_a",
+                "leader_a",
+                "xyz:XYZ100",
+                OrderSide::Buy
+            ),
+            75.0
+        );
     }
 
     #[test]
@@ -2235,7 +2420,7 @@ mod tests {
             CopyLedger::new(),
         );
         let replay_fill = leader_fill("shadow-replay-1", "leader_a", OrderSide::Buy, 100.0);
-        first.handle_watcher_event(position_event("leader_a", 1.0, 10.0), now);
+        first.handle_watcher_event(position_event("leader_a", 0.0, 0.0), now);
         first.handle_watcher_event(
             CopyLeaderWatcherEvent::Fill {
                 leader_id: "leader_a".to_string(),
@@ -2246,7 +2431,7 @@ mod tests {
             now + 1,
         );
         let first_records =
-            first.handle_watcher_event(position_event("leader_a", 2.0, 20.0), now + 2);
+            first.handle_watcher_event(position_event("leader_a", 1.0, 20.0), now + 2);
         assert_eq!(first_records.len(), 1);
         assert!(first_records[0].signal.is_some());
 
@@ -2260,7 +2445,7 @@ mod tests {
             restarted_strategy,
             snapshot.ledger(),
         );
-        restarted.handle_watcher_event(position_event("leader_a", 1.0, 10.0), now + 4);
+        restarted.handle_watcher_event(position_event("leader_a", 0.0, 0.0), now + 4);
         restarted.handle_watcher_event(
             CopyLeaderWatcherEvent::Fill {
                 leader_id: "leader_a".to_string(),
@@ -2271,7 +2456,7 @@ mod tests {
             now + 5,
         );
         let replay_records =
-            restarted.handle_watcher_event(position_event("leader_a", 2.0, 20.0), now + 6);
+            restarted.handle_watcher_event(position_event("leader_a", 1.0, 20.0), now + 6);
 
         assert!(replay_records.is_empty());
         assert_eq!(
@@ -2292,7 +2477,7 @@ mod tests {
             copy_strategy(),
             CopyLedger::new(),
         );
-        pipeline.handle_watcher_event(position_event("leader_a", 1.0, 10.0), now);
+        pipeline.handle_watcher_event(position_event("leader_a", 0.0, 0.0), now);
         pipeline.handle_watcher_event(
             CopyLeaderWatcherEvent::Fill {
                 leader_id: "leader_a".to_string(),
@@ -2302,7 +2487,7 @@ mod tests {
             },
             now + 1,
         );
-        let records = pipeline.handle_watcher_event(position_event("leader_a", 2.0, 20.0), now + 2);
+        let records = pipeline.handle_watcher_event(position_event("leader_a", 1.0, 20.0), now + 2);
 
         append_copy_shadow_history_records(&path, &records, now + 3)
             .expect("append shadow history");
@@ -2314,7 +2499,24 @@ mod tests {
         assert_eq!(entries[0].leader_id, "leader_a");
         assert_eq!(entries[0].coin, "xyz:XYZ100");
         assert_eq!(entries[0].action_event_id, "shadow-history-1");
+        let leader_exchange_time_ms = entries[0]
+            .leader_exchange_time_ms
+            .expect("leader exchange time");
+        let leader_received_at_ms = entries[0]
+            .leader_received_at_ms
+            .expect("leader received time");
+        assert!(leader_exchange_time_ms >= now);
+        assert!(leader_received_at_ms >= leader_exchange_time_ms);
+        assert_eq!(
+            entries[0].leader_to_received_delay_ms,
+            Some(leader_received_at_ms.saturating_sub(leader_exchange_time_ms))
+        );
+        assert_eq!(
+            entries[0].received_to_record_delay_ms,
+            Some((now + 3).saturating_sub(leader_received_at_ms))
+        );
         assert_eq!(entries[0].live_gate, "dry_run_only");
+        assert_eq!(entries[0].rejection_code, entries[0].risk_reject_reason);
         assert_eq!(entries[0].side, Some(OrderSide::Buy));
         assert_eq!(
             entries[0].notional_usd,
@@ -2337,7 +2539,7 @@ mod tests {
             copy_strategy(),
             CopyLedger::new(),
         );
-        pipeline.handle_watcher_event(position_event("leader_a", 1.0, 10.0), now);
+        pipeline.handle_watcher_event(position_event("leader_a", 0.0, 0.0), now);
         pipeline.handle_watcher_event(
             CopyLeaderWatcherEvent::Fill {
                 leader_id: "leader_a".to_string(),
@@ -2347,7 +2549,7 @@ mod tests {
             },
             now + 1,
         );
-        let records = pipeline.handle_watcher_event(position_event("leader_a", 2.0, 20.0), now + 2);
+        let records = pipeline.handle_watcher_event(position_event("leader_a", 1.0, 20.0), now + 2);
 
         let intent =
             approved_shadow_record_to_trade_intent(&records[0], "addr_a", "worker-addr_a", 1.0)
@@ -3494,6 +3696,11 @@ mod tests {
             symbol_blocked: false,
             allow_short: true,
             current_effective_exposure_usd: 0.0,
+            same_leader_effective_exposure_usd: if action.kind.is_fresh_open() {
+                0.0
+            } else {
+                100.0
+            },
             max_effective_exposure_usd: Some(1_000.0),
         }
     }
@@ -3510,7 +3717,7 @@ mod tests {
         CopyLedgerEntry {
             local_account_id: "addr_a".to_string(),
             leader_id: "leader_a".to_string(),
-            leader_group: "group_a".to_string(),
+            leader_group: "leader_a".to_string(),
             signal_id: signal_id.to_string(),
             coin: "xyz:XYZ100".to_string(),
             local_side,

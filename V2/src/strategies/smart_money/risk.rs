@@ -34,6 +34,7 @@ pub struct CopySignalRiskInput<'a> {
     pub symbol_blocked: bool,
     pub allow_short: bool,
     pub current_effective_exposure_usd: f64,
+    pub same_leader_effective_exposure_usd: f64,
     pub max_effective_exposure_usd: Option<f64>,
 }
 
@@ -132,6 +133,12 @@ fn evaluate_copy_open_risk(
     if matches!(side, OrderSide::Sell) && !input.allow_short {
         return copy_risk_rejected("COPY_SHORT_NOT_ALLOWED");
     }
+    if input.action.kind.opens_or_increases()
+        && !input.action.kind.is_fresh_open()
+        && input.same_leader_effective_exposure_usd <= 0.0
+    {
+        return copy_risk_rejected("COPY_INCREASE_WITHOUT_LOCAL_MAPPING");
+    }
 
     let mut sizing = CopySizingInput {
         reduce_only: false,
@@ -170,6 +177,14 @@ fn evaluate_copy_close_risk(
     input: CopySignalRiskInput<'_>,
     side: OrderSide,
 ) -> CopySignalRiskDecision {
+    if input
+        .sizing
+        .remaining_symbol_position_cap_usd
+        .unwrap_or(0.0)
+        <= 0.0
+    {
+        return copy_risk_rejected("COPY_CLOSE_WITHOUT_LOCAL_MAPPING");
+    }
     let sizing = CopySizingInput {
         reduce_only: true,
         ..input.sizing

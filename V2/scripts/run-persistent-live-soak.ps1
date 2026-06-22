@@ -11,6 +11,7 @@ param(
     [switch]$StopAfterRealSubmit,
     [ValidateSet("all", "swing")]
     [string]$LeaderSet = "swing",
+    [string]$BotExePath = "",
     [string]$SettingsPath = ".codex-longrun\copy-ui-settings.json",
     [string]$PersistencePath = "",
     [string]$ShadowPath = ""
@@ -152,10 +153,17 @@ function Stop-WithNotification {
 
 Write-SoakLog "starting persistent live soak window_secs=$WindowSecs max_rounds=$MaxRounds max_notional=$MaxTotalNotionalUsd max_fees=$MaxTotalFeesUsd hold_positions_after_submit=$([bool]$HoldPositionsAfterSubmit) settings=$SettingsPath persistence=$persistencePath shadow=$shadowPath"
 $holdPositionsArg = ([bool]$HoldPositionsAfterSubmit).ToString().ToLowerInvariant()
-$botExe = Join-Path $env:USERPROFILE ".cargo\target-trade_xyz_bot\debug\trade_xyz_bot_v2.exe"
+$botExe = $BotExePath
+if ([string]::IsNullOrWhiteSpace($botExe)) {
+    $botExe = $env:TRADE_XYZ_BOT_EXE
+}
+if ([string]::IsNullOrWhiteSpace($botExe)) {
+    $botExe = Join-Path $env:USERPROFILE ".cargo\target-trade_xyz_bot\debug\trade_xyz_bot_v2.exe"
+}
 if (-not (Test-Path -LiteralPath $botExe)) {
     throw "trade_xyz_bot_v2.exe not found at $botExe; run cargo build --manifest-path V2\Cargo.toml before starting the soak"
 }
+Write-SoakLog "bot_exe=$botExe"
 
 $copySettings = $null
 if (-not [string]::IsNullOrWhiteSpace($SettingsPath) -and (Test-Path -LiteralPath $SettingsPath)) {
@@ -179,8 +187,12 @@ $leaderNotionalUsd = 120.0
 if ($copySettings -and $copySettings.copy_ratio -and $copySettings.principal_cap_usd) {
     $ratio = [double]$copySettings.copy_ratio
     $cap = [double]$copySettings.principal_cap_usd
+    $leverage = 10.0
+    if ($copySettings.leverage) {
+        $leverage = [double]$copySettings.leverage
+    }
     if ($ratio -gt 0 -and $cap -gt 0) {
-        $leaderNotionalUsd = [Math]::Max($cap * 5.0 / $ratio, 1.0)
+        $leaderNotionalUsd = [Math]::Max($cap * $leverage / $ratio, 1.0)
     }
 }
 

@@ -7969,6 +7969,12 @@ fn start_copy_live_soak_from_frontend(
             command.arg("-PersistencePath").arg(persistence_path);
         }
     }
+    if let Some(bot_exe_path) = payload.bot_exe_path.as_deref() {
+        let bot_exe_path = bot_exe_path.trim();
+        if !bot_exe_path.is_empty() {
+            command.arg("-BotExePath").arg(bot_exe_path);
+        }
+    }
     command.env("TRADE_XYZ_VAULT_PASSWORD", vault_password);
     let child = command
         .spawn()
@@ -14275,6 +14281,8 @@ struct CopyLiveSoakStartPayload {
     confirm_mainnet_live: bool,
     #[serde(default)]
     persistence_path: Option<String>,
+    #[serde(default)]
+    bot_exe_path: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -15333,6 +15341,8 @@ fn default_isolated() -> String {
 mod tests {
     use std::{fs, sync::Arc};
 
+    use serde_json::json;
+
     use crate::{
         audit::AuditEvent,
         config::{AppConfig, MARKET_HL_PERP, MARKET_SPOT, MARKET_XYZ_PERP},
@@ -15343,14 +15353,15 @@ mod tests {
     };
 
     use super::{
-        CopyPnlAccountSummary, CopyPnlReportSummary, CopyUiSettings, DashboardOpenOrderResponse,
-        FibBasicConfig, FibBasicLevelPlan, FibBasicPlan, FibInstanceRecord, FibInstanceStatus,
-        FibOrderRef, FibPositionSnapshot, FibProfitLossMode, FibTradeDirection, FrontendAppState,
-        ManualSettingsPayload, NotificationSettings, NotificationSettingsPayload,
-        NotificationSettingsResponse, OrderStatusPayload, OrderStatusQuery, PerpFundingLayer,
-        ReadinessCheckResponse, SecretUsage, SpotFundingLayer, VAULT_SESSION_TTL_MS,
-        account_funding_next_actions, account_funding_summary, apply_notification_settings_payload,
-        build_basic_plan, build_copy_live_soak_status_response_from_dir,
+        CopyLiveSoakStartPayload, CopyPnlAccountSummary, CopyPnlReportSummary, CopyUiSettings,
+        DashboardOpenOrderResponse, FibBasicConfig, FibBasicLevelPlan, FibBasicPlan,
+        FibInstanceRecord, FibInstanceStatus, FibOrderRef, FibPositionSnapshot, FibProfitLossMode,
+        FibTradeDirection, FrontendAppState, ManualSettingsPayload, NotificationSettings,
+        NotificationSettingsPayload, NotificationSettingsResponse, OrderStatusPayload,
+        OrderStatusQuery, PerpFundingLayer, ReadinessCheckResponse, SecretUsage, SpotFundingLayer,
+        VAULT_SESSION_TTL_MS, account_funding_next_actions, account_funding_summary,
+        apply_notification_settings_payload, build_basic_plan,
+        build_copy_live_soak_status_response_from_dir,
         build_copy_shadow_history_response_from_path, build_copy_summary_response_from_entries,
         build_fib_strategy_pnl_summary, dashboard_cancel_stopped_without_open_orders_count,
         dashboard_cancel_strategy_ids, dashboard_order_is_cancelable_fib_entry,
@@ -15590,6 +15601,7 @@ mod tests {
             reduce_only: Some(false),
             notional_usd: Some(12.5),
             ledger_status: None,
+            ..Default::default()
         };
         let second = crate::strategies::smart_money::CopyShadowHistoryEntry {
             occurred_at_ms: 200,
@@ -15629,6 +15641,7 @@ mod tests {
             reduce_only: Some(false),
             notional_usd: Some(12.5),
             ledger_status: None,
+            ..Default::default()
         };
         let rejected = crate::strategies::smart_money::CopyShadowHistoryEntry {
             status: "rejected".to_string(),
@@ -15681,6 +15694,7 @@ mod tests {
             reduce_only: Some(false),
             notional_usd: Some(10.0),
             ledger_status: None,
+            ..Default::default()
         };
         let pnl_report = CopyPnlReportSummary {
             path: Some(".codex-longrun/pnl-since-test.json".to_string()),
@@ -15817,6 +15831,7 @@ mod tests {
             reduce_only: Some(false),
             notional_usd: Some(12.5),
             ledger_status: None,
+            ..Default::default()
         };
         let stale = crate::strategies::smart_money::CopyShadowHistoryEntry {
             occurred_at_ms: 200,
@@ -15949,6 +15964,7 @@ mod tests {
             reduce_only: Some(false),
             notional_usd: Some(12.5),
             ledger_status: None,
+            ..Default::default()
         };
         let second = crate::strategies::smart_money::CopyShadowHistoryEntry {
             occurred_at_ms: 300,
@@ -16003,15 +16019,15 @@ mod tests {
     }
 
     #[test]
-    fn smart_money_preview_rejects_leverage_above_five() {
-        let payload = smart_money_preview_payload(50.0, 0.1, 10.0, 5.1);
+    fn smart_money_preview_rejects_leverage_above_max() {
+        let payload = smart_money_preview_payload(50.0, 0.1, 10.0, 10.1);
 
         let error = payload
             .sizing_preview()
             .expect_err("leverage above max must be rejected")
             .to_string();
 
-        assert!(error.contains("leverage must be less than or equal to 5"));
+        assert!(error.contains("leverage must be less than or equal to 10"));
     }
 
     #[test]
@@ -16024,6 +16040,28 @@ mod tests {
             .to_string();
 
         assert!(error.contains("leverage must be at least 1x"));
+    }
+
+    #[test]
+    fn copy_live_soak_start_payload_accepts_bot_exe_path() {
+        let payload: CopyLiveSoakStartPayload = serde_json::from_value(json!({
+            "window_secs": 30,
+            "max_rounds": 1,
+            "bot_exe_path": "D:\\AI\\trade.xyz\\target-codex-copy-verify\\debug\\trade_xyz_bot_v2.exe",
+            "persistence_path": ".codex-longrun\\snapshot.json",
+            "confirm_mainnet_live": true
+        }))
+        .expect("payload should parse");
+
+        assert_eq!(
+            payload.bot_exe_path.as_deref(),
+            Some("D:\\AI\\trade.xyz\\target-codex-copy-verify\\debug\\trade_xyz_bot_v2.exe")
+        );
+        assert_eq!(
+            payload.persistence_path.as_deref(),
+            Some(".codex-longrun\\snapshot.json")
+        );
+        assert!(payload.confirm_mainnet_live);
     }
 
     #[test]
