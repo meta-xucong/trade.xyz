@@ -1550,6 +1550,35 @@
         line-height: 1.35;
       }
 
+      .position-owner-badge {
+        display: inline-flex;
+        align-items: center;
+        max-width: 100%;
+        min-height: 20px;
+        margin-top: 4px;
+        padding: 0 6px;
+        border: 1px solid rgba(255,255,255,0.08);
+        border-radius: 999px;
+        background: rgba(255,255,255,0.04);
+        color: var(--muted);
+        font-size: 11px;
+        line-height: 1.2;
+        white-space: normal;
+      }
+
+      .position-owner-badge[data-owner="unattributed"] {
+        color: #ffd9a8;
+        border-color: rgba(255, 190, 120, 0.28);
+        background: rgba(255, 190, 120, 0.08);
+      }
+
+      .position-owner-badge[data-owner="fib"],
+      .position-owner-badge[data-owner="copy"] {
+        color: #9de5bd;
+        border-color: rgba(157, 229, 189, 0.2);
+        background: rgba(157, 229, 189, 0.07);
+      }
+
       .copy-pnl-positive {
         color: #9de5bd;
       }
@@ -2283,7 +2312,7 @@
             <div class="panel metric">
               <div class="metric-label" data-i18n="metric.unrealized">Unrealized PnL</div>
               <div class="metric-value" id="unrealized">$0.00</div>
-              <div class="metric-sub" data-i18n="metric.unrealized_sub">all configured addresses</div>
+              <div class="metric-sub" id="unrealizedSub" data-i18n="metric.unrealized_sub">all configured addresses</div>
             </div>
           </div>
 
@@ -2988,11 +3017,12 @@
                 <input id="copyAddress" type="hidden" value="0xabc" />
                 <input id="copyCoin" type="hidden" value="xyz:XYZ100" />
                 <input id="copyLeaderNotional" type="hidden" value="100" />
-                <input id="copyLeverage" type="hidden" value="5" min="1" max="5" step="1" />
+                <input id="copyLeverage" type="hidden" value="10" min="1" max="10" step="1" />
                 <input id="copyReduce" type="checkbox" class="hidden" />
-                <div class="field copy-advanced hidden">
-                  <label for="copyMarket" data-i18n="manual.market">Market</label>
-                  <select id="copyMarket"></select>
+                <div class="field">
+                  <label for="copyMarkets" data-i18n="copy.markets">Copy Markets</label>
+                  <select id="copyMarkets" multiple size="3"></select>
+                  <div class="quote-meta" data-i18n="copy.markets_help">Choose one or more markets. Unselected markets remain exit-only after the new settings take effect.</div>
                 </div>
                 <div class="field copy-advanced hidden">
                   <label for="copySide" data-i18n="manual.side">Side</label>
@@ -3316,6 +3346,14 @@
         manualMarket: localStorage.getItem("trade_xyz_manual_market") || "xyz_perp",
         fibMarket: localStorage.getItem("trade_xyz_fib_market") || "xyz_perp",
         copyMarket: localStorage.getItem("trade_xyz_copy_market") || "xyz_perp",
+        copyMarkets: (() => {
+          try {
+            const value = JSON.parse(localStorage.getItem("trade_xyz_copy_markets") || "[]");
+            return Array.isArray(value) ? value : [];
+          } catch {
+            return [];
+          }
+        })(),
         manualAdvancedOpen: localStorage.getItem("trade_xyz_manual_advanced_open") === "1",
         manualLimitsDirty: false,
         manualLimitTargetsDirty: false,
@@ -3468,6 +3506,10 @@
           "dashboard.position.close_tip": "Submit a market close for this position only",
           "dashboard.position.close_confirm": "Close {account} / {coin} at market now?",
           "dashboard.position.too_small_status": "Below Exchange Step",
+          "dashboard.position.owner_fib": "Fib",
+          "dashboard.position.owner_fib_residual": "Fib residual",
+          "dashboard.position.owner_copy": "Smart Money",
+          "dashboard.position.owner_unattributed": "Unassigned",
           "dashboard.position.spot_min_lot_blocked": "{coin} size {size} is below the exchange size step {step}. Native TP/SL and close are disabled for this spot position.",
           "dashboard.tpsl.result": "Position TP/SL Result",
           "dashboard.tpsl.apply": "Apply TP/SL",
@@ -3533,6 +3575,7 @@
           "metric.available_sub": "clearinghouse snapshot",
           "metric.unrealized": "Unrealized PnL",
           "metric.unrealized_sub": "all configured addresses",
+          "metric.unrealized_attribution_sub": "attributed {attributed} · unassigned {unattributed}",
           "metric.realized": "Daily Realized",
           "metric.realized_sub": "session total",
           "metric.position_value": "Position Value",
@@ -3896,6 +3939,10 @@
           "copy.leader_accounts": "Target copy accounts",
           "copy.leader_accounts_placeholder": "Paste wallet addresses, one per line",
           "copy.leader_accounts_help": "Paste one or more wallet addresses. Use a new line, comma, or space to separate them.",
+          "copy.markets": "Copy Markets",
+          "copy.markets_help": "Choose one or more markets. Unselected markets remain exit-only after the new settings take effect.",
+          "copy.market_scope": "Copy markets",
+          "copy.market_exit_only": "Unselected markets are exit-only",
           "copy.leader_id": "Leader ID",
           "copy.leader_address": "Leader Address",
           "copy.leader_notional": "Leader Notional",
@@ -3924,12 +3971,17 @@
           "copy.summary_pnl_note": "PnL",
           "copy.summary_recent": "Recent signals",
           "copy.overview_title": "Copy Strategy",
-          "copy.overview_subtitle": "{leaders} target(s) · {orders} submitted · {signals} signals",
+          "copy.overview_subtitle": "{leaders} target(s) · current soak {orders} submitted · {approved} approved · {rejected} rejected · {deduped} deduped",
           "copy.my_pnl": "My PnL",
           "copy.target_pnl": "Target PnL",
           "copy.target_raw_pnl": "Target Raw PnL",
           "copy.target_accounts": "Target Copy Accounts",
           "copy.trade_count": "Trades",
+          "copy.current_run_orders": "Current Soak Orders",
+          "copy.history_total_orders": "Current run total",
+          "copy.unattributed_pnl": "Unassigned Position PnL",
+          "copy.unattributed_positions": "{count} unassigned position(s)",
+          "copy.unattributed_warning": "{count} open position(s) are not mapped to Fib or Smart Money yet; unassigned unrealized PnL is {pnl}.",
           "copy.open_positions": "Open Positions",
           "copy.realized": "Realized",
           "copy.unrealized": "Unrealized",
@@ -3948,6 +4000,7 @@
           "copy.pnl_report_fresh": "PnL report loaded · age {minutes} min",
           "copy.pnl_report_stale": "PnL report loaded but stale · age {minutes} min",
           "copy.pnl_scope_note": "Target values are raw account scale; My PnL is actual copied account scale.",
+          "copy.realtime_attribution_note": "Open PnL uses realtime account positions matched by the copy ledger.",
           "copy.waiting_pnl": "Waiting",
           "copy.error_requires_leader": "Enter at least one target copy account.",
           "copy.error_invalid_leader": "Invalid target copy account: {address}",
@@ -4138,6 +4191,10 @@
           "dashboard.position.close_tip": "仅对这一条持仓提交市价平仓",
           "dashboard.position.close_confirm": "确认立即对 {account} / {coin} 执行市价平仓吗？",
           "dashboard.position.too_small_status": "低于最小单位",
+          "dashboard.position.owner_fib": "斐波那契",
+          "dashboard.position.owner_fib_residual": "斐波那契残留",
+          "dashboard.position.owner_copy": "聪明钱跟单",
+          "dashboard.position.owner_unattributed": "未归属",
           "dashboard.position.spot_min_lot_blocked": "{coin} 数量 {size} 低于交易所最小数量步进 {step}，这条现货仓位已禁用原生止盈止损和平仓操作。",
           "dashboard.tpsl.result": "持仓止盈止损结果",
           "dashboard.tpsl.apply": "应用止盈止损",
@@ -4203,6 +4260,7 @@
           "metric.available_sub": "清算状态快照",
           "metric.unrealized": "未实现盈亏",
           "metric.unrealized_sub": "已配置账户汇总",
+          "metric.unrealized_attribution_sub": "已归因 {attributed} · 未归属 {unattributed}",
           "metric.realized": "当日已实现",
           "metric.realized_sub": "会话累计",
           "metric.position_value": "仓位总价值",
@@ -4566,6 +4624,10 @@
           "copy.leader_accounts": "目标跟单账号",
           "copy.leader_accounts_placeholder": "粘贴钱包地址，每行一个",
           "copy.leader_accounts_help": "可以填多个钱包地址，用换行、逗号或空格分隔。",
+          "copy.markets": "跟单市场",
+          "copy.markets_help": "可多选。取消某个市场后，新配置生效起该市场只跟卖/减仓，不再跟买/加仓。",
+          "copy.market_scope": "跟单市场",
+          "copy.market_exit_only": "未选择市场只出不进",
           "copy.leader_id": "领单 ID",
           "copy.leader_address": "领单地址",
           "copy.leader_notional": "领单名义金额",
@@ -4594,12 +4656,17 @@
           "copy.summary_pnl_note": "盈亏说明",
           "copy.summary_recent": "最近信号",
           "copy.overview_title": "跟单策略",
-          "copy.overview_subtitle": "{leaders} 个目标 · {orders} 笔下单 · {signals} 条信号",
+          "copy.overview_subtitle": "{leaders} 个目标 · 当前长测 {orders} 笔下单 · 通过 {approved} · 拦截 {rejected} · 去重 {deduped}",
           "copy.my_pnl": "我的盈亏",
           "copy.target_pnl": "目标盈亏",
           "copy.target_raw_pnl": "目标原始盈亏",
           "copy.target_accounts": "目标跟单账户",
           "copy.trade_count": "交易次数",
+          "copy.current_run_orders": "当前长测订单",
+          "copy.history_total_orders": "当前运行累计",
+          "copy.unattributed_pnl": "未归属持仓盈亏",
+          "copy.unattributed_positions": "{count} 个未归属持仓",
+          "copy.unattributed_warning": "当前有 {count} 个真实持仓还没有映射到斐波那契或聪明钱跟单，未归属未实现盈亏为 {pnl}。",
           "copy.open_positions": "持仓数",
           "copy.realized": "已实现",
           "copy.unrealized": "未实现",
@@ -4618,6 +4685,7 @@
           "copy.pnl_report_fresh": "已读取盈亏报告 · 距今 {minutes} 分钟",
           "copy.pnl_report_stale": "已读取盈亏报告，但数据已过期 · 距今 {minutes} 分钟",
           "copy.pnl_scope_note": "目标为目标账号原始规模；我的盈亏为本账户实际跟单规模。",
+          "copy.realtime_attribution_note": "持仓浮盈亏使用实时账户持仓，并按跟单账本归因。",
           "copy.waiting_pnl": "等待归因",
           "copy.error_requires_leader": "请至少填写一个目标跟单账号。",
           "copy.error_invalid_leader": "目标跟单账号格式不正确：{address}",
@@ -6504,6 +6572,11 @@
           const timeEl = $("copySummarySnapshotTime");
           if (timeEl) {
             timeEl.textContent = fetchedAt ? formatDateTime(fetchedAt) : "--:--:--";
+          }
+          if (Array.isArray(state.dashboardPositions)) {
+            state.dashboardPnl = applyDashboardAttributionToPnl(state.dashboardPnl || {}, state.dashboardPositions);
+            renderDashboardMetrics(state.dashboardPnl);
+            renderPositions(state.dashboardPositions);
           }
           renderCopySummary();
         } catch (error) {
@@ -8436,6 +8509,43 @@
         return state.copyMarket || state.manualMarket || "xyz_perp";
       }
 
+      function defaultCopyMarkets() {
+        const markets = Array.isArray(state.marketCapabilities) ? state.marketCapabilities : [];
+        const ids = markets.map((item) => item?.market).filter(Boolean);
+        return ids.length > 0 ? ids : ["xyz_perp", "hl_perp", "spot"];
+      }
+
+      function selectedCopyMarkets() {
+        const select = $("copyMarkets");
+        const selected = select
+          ? Array.from(select.selectedOptions).map((option) => option.value).filter(Boolean)
+          : [];
+        if (selected.length > 0) return selected;
+        if (Array.isArray(state.copyMarkets) && state.copyMarkets.length > 0) return state.copyMarkets;
+        return defaultCopyMarkets();
+      }
+
+      function setCopyMarketSelections(markets, { persist = true } = {}) {
+        const known = new Set(defaultCopyMarkets());
+        const normalized = (Array.isArray(markets) ? markets : [])
+          .map((market) => String(market || "").trim())
+          .filter((market) => market && (known.size === 0 || known.has(market)));
+        const next = normalized.length > 0 ? Array.from(new Set(normalized)) : defaultCopyMarkets();
+        state.copyMarkets = next;
+        state.copyMarket = next[0] || activeCopyMarket();
+        const select = $("copyMarkets");
+        if (select) {
+          for (const option of Array.from(select.options)) {
+            option.selected = next.includes(option.value);
+          }
+        }
+        if (persist) {
+          localStorage.setItem("trade_xyz_copy_markets", JSON.stringify(next));
+          localStorage.setItem("trade_xyz_copy_market", state.copyMarket);
+        }
+        renderCopyConfigPreview();
+      }
+
       function activeDashboardMarket() {
         return state.dashboardMarket || state.manualMarket || "xyz_perp";
       }
@@ -8585,7 +8695,15 @@
         $("dashboardMarket").innerHTML = toOptions(activeDashboardMarket());
         $("manualMarket").innerHTML = toOptions(activeManualMarket());
         $("fibMarket").innerHTML = toOptions(activeFibMarket());
-        $("copyMarket").innerHTML = toOptions(activeCopyMarket());
+        const copySelect = $("copyMarkets");
+        if (copySelect) {
+          const selected = new Set((Array.isArray(state.copyMarkets) && state.copyMarkets.length > 0) ? state.copyMarkets : defaultCopyMarkets());
+          copySelect.innerHTML = markets.map((item) => {
+            const isSelected = selected.has(item.market) ? " selected" : "";
+            return `<option value="${item.market}"${isSelected}>${item.label} (${item.dex})</option>`;
+          }).join("");
+          setCopyMarketSelections(Array.from(selected), { persist: false });
+        }
       }
 
       function setModuleMarket(module, marketId, { persist = true, reloadUniverse = true } = {}) {
@@ -8921,6 +9039,96 @@
         return false;
       }
 
+      function normalizedPositionCoinKey(coin) {
+        const raw = String(coin || "").trim().toLowerCase();
+        if (!raw) return "";
+        if (raw.includes(":")) return raw;
+        return raw.replace(/-usd\s*\(xyz\)$/i, "").replace(/\/usd$/i, "");
+      }
+
+      function dashboardPositionSide(position) {
+        const size = parseNum(position?.size);
+        if (size > 0) return "long";
+        if (size < 0) return "short";
+        return "";
+      }
+
+      function fibInstanceOwnsPosition(instance, position) {
+        const summary = instance?.pnl_summary || {};
+        if (Math.abs(parseNum(summary.open_position_size)) <= MANUAL_POSITION_DUST_EPS) return false;
+        const instanceCoin = normalizedPositionCoinKey(instance?.config?.coin || instance?.plan?.coin);
+        const positionCoin = normalizedPositionCoinKey(position?.coin);
+        if (!instanceCoin || !positionCoin || instanceCoin !== positionCoin) return false;
+        const accounts = Array.isArray(summary.account_summaries) ? summary.account_summaries : [];
+        if (accounts.length === 0) return true;
+        return accounts.some((account) =>
+          String(account?.account_id || "") === String(position?.account_id || "")
+          && Math.abs(parseNum(account?.open_position_size)) > MANUAL_POSITION_DUST_EPS
+        );
+      }
+
+      function copySummaryOwnsPosition(summary, position) {
+        const localPositions = Array.isArray(summary?.local_summary?.positions)
+          ? summary.local_summary.positions
+          : [];
+        const positionCoin = normalizedPositionCoinKey(position?.coin);
+        const positionSide = dashboardPositionSide(position);
+        return localPositions.some((item) => {
+          const itemCoin = normalizedPositionCoinKey(item?.coin);
+          const itemSide = String(item?.side || "").trim().toLowerCase();
+          return itemCoin && itemCoin === positionCoin
+            && (!positionSide || !itemSide || itemSide === positionSide)
+            && Math.abs(parseNum(item?.size)) > MANUAL_POSITION_DUST_EPS;
+        });
+      }
+
+      function dashboardPositionAttribution(position) {
+        const fibMatch = (Array.isArray(state.fibInstances) ? state.fibInstances : [])
+          .find((instance) => fibInstanceOwnsPosition(instance, position));
+        if (fibMatch) {
+          const status = String(fibMatch?.status || "").toLowerCase();
+          return {
+            owner: "fib",
+            label: status === "killed" || status === "completed"
+              ? t("dashboard.position.owner_fib_residual")
+              : t("dashboard.position.owner_fib"),
+          };
+        }
+        if (copySummaryOwnsPosition(state.copySummary, position)) {
+          return { owner: "copy", label: t("dashboard.position.owner_copy") };
+        }
+        return { owner: "unattributed", label: t("dashboard.position.owner_unattributed") };
+      }
+
+      function dashboardPositionAttributionSummary(positions) {
+        const summary = {
+          attributed_unrealized_pnl_usd: 0,
+          unattributed_unrealized_pnl_usd: 0,
+          attributed_position_count: 0,
+          unattributed_position_count: 0,
+        };
+        for (const position of Array.isArray(positions) ? positions : []) {
+          if (Math.abs(parseNum(position?.size)) <= MANUAL_POSITION_DUST_EPS) continue;
+          const attribution = dashboardPositionAttribution(position);
+          const pnl = parseNum(position?.pnl_usd);
+          if (attribution.owner === "unattributed") {
+            summary.unattributed_unrealized_pnl_usd += pnl;
+            summary.unattributed_position_count += 1;
+          } else {
+            summary.attributed_unrealized_pnl_usd += pnl;
+            summary.attributed_position_count += 1;
+          }
+        }
+        return summary;
+      }
+
+      function applyDashboardAttributionToPnl(pnl, positions) {
+        return {
+          ...(pnl || {}),
+          ...dashboardPositionAttributionSummary(positions),
+        };
+      }
+
       function deriveDashboardView(baseAccounts, fundingData, marketId, spotPriceByToken = {}) {
         const allowedAccounts = filteredAccountsForMarket(baseAccounts, marketId);
         const layerKey = dashboardLayerKey(marketId);
@@ -8994,7 +9202,12 @@
           total_unrealized_pnl_usd: dashboardAccounts.reduce((sum, account) => sum + parseNum(account.unrealized_pnl_usd), 0),
           total_position_value_usd: dashboardAccounts.reduce((sum, account) => sum + parseNum(account.position_value_usd), 0),
         };
-        return { dashboardAccounts, positions, pnl, hiddenSpotPairs: [...hiddenSpotPairs] };
+        return {
+          dashboardAccounts,
+          positions,
+          pnl: applyDashboardAttributionToPnl(pnl, positions),
+          hiddenSpotPairs: [...hiddenSpotPairs],
+        };
       }
 
       function renderDashboardMetrics(pnl) {
@@ -9002,6 +9215,17 @@
         setNodeText("available", money(pnl?.total_available_usdc));
         setNodeText("unrealized", money(pnl?.total_unrealized_pnl_usd));
         setNodeText("positionValue", money(pnl?.total_position_value_usd));
+        const attributed = parseNum(pnl?.attributed_unrealized_pnl_usd);
+        const unattributed = parseNum(pnl?.unattributed_unrealized_pnl_usd);
+        const attributedCount = Number(pnl?.attributed_position_count || 0);
+        const unattributedCount = Number(pnl?.unattributed_position_count || 0);
+        const hasAttribution = attributedCount > 0 || unattributedCount > 0;
+        setNodeText("unrealizedSub", hasAttribution
+          ? t("metric.unrealized_attribution_sub", {
+              attributed: money(attributed),
+              unattributed: money(unattributed),
+            })
+          : t("metric.unrealized_sub"));
       }
 
       function updateDashboardDexPill() {
@@ -9246,10 +9470,14 @@
           const slInputEffectiveTitle = controlsDisabled ? spotBlock.reason : slInputTitle;
           const applyButtonTitle = controlsDisabled ? spotBlock.reason : "";
           const closeButtonTitle = controlsDisabled ? spotBlock.reason : t("dashboard.position.close_tip");
+          const attribution = dashboardPositionAttribution(position);
           return `
             <tr data-row-key="${rowKey}" data-account-id="${position.account_id}" data-coin="${position.coin}" data-size="${position.size}" data-entry-price="${position.entry_price}" data-mark-price="${position.mark_price}" data-notional-usd="${notionalUsd}" data-entry-side="${entrySide}" data-operation-disabled="${controlsDisabled ? "1" : "0"}" data-operation-block-reason="${escapeHtml(spotBlock.reason || "")}">
               <td>${position.account_id}</td>
-              <td class="mono">${position.coin}</td>
+              <td class="mono">
+                <div>${position.coin}</div>
+                <span class="position-owner-badge" data-owner="${escapeHtml(attribution.owner)}">${escapeHtml(attribution.label)}</span>
+              </td>
               <td class="dashboard-pos-size">${position.size}</td>
               <td class="dashboard-pos-entry">${money(position.entry_price)}</td>
               <td class="dashboard-pos-mark">${money(position.mark_price)}</td>
@@ -10718,6 +10946,9 @@
             if (Number.isFinite(Number(saved.principal_cap_usd))) {
               $("copyPrincipalCap").value = String(saved.principal_cap_usd);
             }
+            if (Array.isArray(saved.markets) && saved.markets.length > 0) {
+              setCopyMarketSelections(saved.markets, { persist: false });
+            }
           }
         } catch {
           // Ignore malformed local settings; the visible defaults remain usable.
@@ -10737,10 +10968,14 @@
           if (Number.isFinite(Number(settings.principal_cap_usd))) {
             $("copyPrincipalCap").value = String(settings.principal_cap_usd);
           }
+          if (Array.isArray(settings.markets) && settings.markets.length > 0) {
+            setCopyMarketSelections(settings.markets);
+          }
           saveCopySimpleSettings(
             parseCopyLeaderAccounts($("copyLeaderAccounts")?.value || ""),
             Number($("copyRatio")?.value),
             Number($("copyPrincipalCap")?.value),
+            selectedCopyMarkets(),
           );
           renderCopyConfigPreview();
         } catch (error) {
@@ -10751,9 +10986,10 @@
         }
       }
 
-      function saveCopySimpleSettings(leaders, ratio, cap) {
+      function saveCopySimpleSettings(leaders, ratio, cap, markets = selectedCopyMarkets()) {
         localStorage.setItem("trade_xyz_copy_simple_settings", JSON.stringify({
           leaders,
+          markets,
           copy_ratio: ratio,
           principal_cap_usd: cap,
           saved_at_ms: Date.now(),
@@ -10766,15 +11002,17 @@
         const leaders = parseCopyLeaderAccounts($("copyLeaderAccounts")?.value || "");
         const ratio = Number($("copyRatio")?.value);
         const cap = Number($("copyPrincipalCap")?.value);
-        const ok = leaders.length > 0 && !invalidCopyLeaderAccount(leaders) && Number.isFinite(ratio) && ratio > 0 && Number.isFinite(cap) && cap > 0;
+        const markets = selectedCopyMarkets();
+        const marketText = markets.map((market) => marketLabel(market)).join(" / ");
+        const ok = leaders.length > 0 && markets.length > 0 && !invalidCopyLeaderAccount(leaders) && Number.isFinite(ratio) && ratio > 0 && Number.isFinite(cap) && cap > 0;
         root.classList.toggle("hidden", !ok);
         if (!ok) {
           root.textContent = "";
           return;
         }
         root.textContent = state.lang === "zh"
-          ? `已识别 ${leaders.length} 个目标跟单账号。系统将按 ${number(ratio, 4)} 倍比例跟随，每个交易对最多使用 ${money(cap)} 本金；杠杆、交易对识别、买卖方向、去重和风控由后台自动处理。`
-          : `Detected ${leaders.length} target copy account(s). The bot will copy at ${number(ratio, 4)}x, cap each pair at ${money(cap)} principal, and handle leverage, symbols, side detection, dedupe, and risk automatically.`;
+          ? `已识别 ${leaders.length} 个目标跟单账号。跟单市场：${marketText}。系统将按 ${number(ratio, 4)} 倍比例跟随，每个交易对最多使用 ${money(cap)} 本金；取消的市场只出不进，杠杆、交易对识别、买卖方向、去重和风控由后台自动处理。`
+          : `Detected ${leaders.length} target copy account(s). Copy markets: ${marketText}. The bot will copy at ${number(ratio, 4)}x, cap each pair at ${money(cap)} principal, keep unselected markets exit-only, and handle leverage, symbols, side detection, dedupe, and risk automatically.`;
       }
 
       function shortAddress(value) {
@@ -10888,6 +11126,23 @@
         `).join("");
       }
 
+      function copyRealtimeDashboardAttribution() {
+        const summary = {
+          pnl_usd: 0,
+          position_value_usd: 0,
+          position_count: 0,
+        };
+        for (const position of Array.isArray(state.dashboardPositions) ? state.dashboardPositions : []) {
+          if (Math.abs(parseNum(position?.size)) <= MANUAL_POSITION_DUST_EPS) continue;
+          const attribution = dashboardPositionAttribution(position);
+          if (attribution.owner !== "copy") continue;
+          summary.pnl_usd += parseNum(position?.pnl_usd);
+          summary.position_value_usd += parseNum(position?.position_value_usd);
+          summary.position_count += 1;
+        }
+        return summary;
+      }
+
       function renderCopySummary() {
         const root = $("copySummary");
         if (!root) return;
@@ -10903,17 +11158,35 @@
             : Number(summary.realized_pnl_usd || 0) + Number(summary.unrealized_pnl_usd || 0)
         );
         const myRealized = local.realized_pnl_usd ?? summary.realized_pnl_usd;
-        const myUnrealized = local.unrealized_pnl_usd ?? summary.unrealized_pnl_usd;
+        const ledgerRealtime = copyRealtimeDashboardAttribution();
+        const hasRealtimeCopyPnl = ledgerRealtime.position_count > 0;
+        const myUnrealized = hasRealtimeCopyPnl
+          ? ledgerRealtime.pnl_usd
+          : (local.unrealized_pnl_usd ?? summary.unrealized_pnl_usd);
+        const myDisplayTotal = myRealized == null && myUnrealized == null
+          ? myTotal
+          : Number(myRealized || 0) + Number(myUnrealized || 0);
         const myFees = local.fees_usd ?? summary.total_fees_usd;
         const targetTotal = summary.target_total_pnl_usd;
         const targetRealized = summary.target_realized_pnl_usd;
         const targetUnrealized = summary.target_unrealized_pnl_usd;
+        const dashboardPnl = state.dashboardPnl || {};
+        const unattributedPnl = dashboardPnl.unattributed_unrealized_pnl_usd;
+        const unattributedCount = Number(dashboardPnl.unattributed_position_count || 0);
         const runningText = summary.live_running
           ? t("copy.live_soak_running")
           : t("copy.live_soak_stopped");
         const tone = summary.live_running ? "live" : "waiting";
         const leaders = Array.isArray(summary.leader_summaries) ? summary.leader_summaries : [];
         const addressFallback = Array.isArray(summary.leader_addresses) ? summary.leader_addresses : [];
+        const summaryMarkets = Array.isArray(summary.markets) && summary.markets.length > 0
+          ? summary.markets
+          : selectedCopyMarkets();
+        const marketsHtml = summaryMarkets.map((market) => `
+          <span class="copy-address-chip">
+            <strong>${escapeHtml(marketLabel(market))}</strong>
+          </span>
+        `).join("");
         const addressHtml = leaders.length
           ? leaders.slice(0, 8).map((account, index) => `
               <span class="copy-address-chip" title="${escapeHtml(account?.address || "")}">
@@ -10942,7 +11215,9 @@
         const subtitle = t("copy.overview_subtitle", {
           leaders: number(summary.leader_count || 0, 0),
           orders: number(summary.submitted_reports || 0, 0),
-          signals: number(summary.shadow_signal_count || 0, 0),
+          approved: number(summary.shadow_signal_count || 0, 0),
+          rejected: number(summary.rejected_count || 0, 0),
+          deduped: number(summary.deduped_count || 0, 0),
         });
         const mySub = `${t("copy.realized")} ${myRealized == null ? "-" : signedMoney(myRealized)} · ${t("copy.unrealized")} ${myUnrealized == null ? "-" : signedMoney(myUnrealized)}`;
         const targetSub = `${t("copy.realized")} ${targetRealized == null ? "-" : signedMoney(targetRealized)} · ${t("copy.unrealized")} ${targetUnrealized == null ? "-" : signedMoney(targetUnrealized)}`;
@@ -10960,10 +11235,14 @@
               <span class="status-badge" data-status="${escapeHtml(tone)}">${escapeHtml(runningText)}</span>
             </div>
             <div class="copy-metric-grid">
-              ${copyMetricHtml(t("copy.my_pnl"), nullableMoney(myTotal), mySub, myTotal)}
+              ${copyMetricHtml(t("copy.my_pnl"), nullableMoney(myDisplayTotal), mySub, myDisplayTotal)}
               ${copyMetricHtml(t("copy.target_raw_pnl"), nullableMoney(targetTotal), targetSub, targetTotal)}
+              ${copyMetricHtml(t("copy.unattributed_pnl"), money(unattributedPnl || 0), t("copy.unattributed_positions", { count: number(unattributedCount, 0) }), unattributedPnl || 0)}
               ${copyMetricHtml(t("copy.target_accounts"), number(summary.leader_count || 0, 0), `${t("copy.open_positions")} ${number(summary.target_open_position_count || 0, 0)}`)}
-              ${copyMetricHtml(t("copy.trade_count"), number(summary.submitted_reports || 0, 0), `${t("copy.summary_notional")} ${money(summary.copied_notional_usd || 0)}`)}
+              ${copyMetricHtml(t("copy.current_run_orders"), number(summary.submitted_reports || 0, 0), `${t("copy.history_total_orders")} · ${t("copy.summary_notional")} ${money(summary.copied_notional_usd || 0)}`)}
+            </div>
+            <div class="copy-address-list">
+              ${marketsHtml || `<span class="quote-meta">${t("copy.market_exit_only")}</span>`}
             </div>
             <div class="copy-address-list">
               ${addressHtml || `<span class="quote-meta">${t("copy.no_leaders")}</span>`}
@@ -10975,8 +11254,9 @@
               </summary>
               <div class="copy-advanced-body">
                 <div class="fib-instance-kv">
-                  <div><span>${t("copy.my_pnl")}</span><strong class="${escapeHtml(pnlClass(myTotal))}">${escapeHtml(nullableMoney(myTotal))}</strong></div>
+                  <div><span>${t("copy.my_pnl")}</span><strong class="${escapeHtml(pnlClass(myDisplayTotal))}">${escapeHtml(nullableMoney(myDisplayTotal))}</strong></div>
                   <div><span>${t("copy.target_raw_pnl")}</span><strong class="${escapeHtml(pnlClass(targetTotal))}">${escapeHtml(nullableMoney(targetTotal))}</strong></div>
+                  <div><span>${t("copy.unattributed_pnl")}</span><strong class="${escapeHtml(pnlClass(unattributedPnl || 0))}">${escapeHtml(money(unattributedPnl || 0))}</strong></div>
                   <div><span>${t("copy.fees")}</span><strong>${escapeHtml(myFees == null ? "-" : money(myFees))}</strong></div>
                   <div><span>${t("copy.summary_rejected")}</span><strong>${escapeHtml(number(summary.rejected_count || 0, 0))} / ${escapeHtml(number(summary.deduped_count || 0, 0))}</strong></div>
                   <div><span>${t("copy.open_positions")}</span><strong>${escapeHtml(number(summary.target_open_position_count || 0, 0))}</strong></div>
@@ -10988,6 +11268,8 @@
                   <span>${escapeHtml(copyPnlReportStatusText(summary))}</span>
                   <span>${escapeHtml(reportText)}</span>
                   <span>${escapeHtml(t("copy.pnl_scope_note"))}</span>
+                  ${hasRealtimeCopyPnl ? `<span>${escapeHtml(t("copy.realtime_attribution_note"))}</span>` : ""}
+                  ${unattributedCount > 0 ? `<span>${escapeHtml(t("copy.unattributed_warning", { count: number(unattributedCount, 0), pnl: money(unattributedPnl || 0) }))}</span>` : ""}
                 </div>
                 <div class="fib-instance-section-title">${t("copy.leader_detail")}</div>
                 ${copyAccountRowsHtml(leaders)}
@@ -12343,6 +12625,11 @@
       function applyDashboardOpenOrdersPayload(data) {
         state.dashboardOpenOrders = Array.isArray(data?.open_orders) ? data.open_orders : [];
         state.fibInstances = Array.isArray(data?.fib_instances) ? data.fib_instances : [];
+        if (Array.isArray(state.dashboardPositions)) {
+          state.dashboardPnl = applyDashboardAttributionToPnl(state.dashboardPnl || {}, state.dashboardPositions);
+          renderDashboardMetrics(state.dashboardPnl);
+          renderPositions(state.dashboardPositions);
+        }
         const fetchedAt = data?.fetched_at_ms;
         $("openOrdersSnapshotTime").textContent = fetchedAt
           ? new Date(fetchedAt).toLocaleTimeString()
@@ -12551,6 +12838,10 @@
           if (!knownIds.has(state.manualMarket)) state.manualMarket = knownIds.has(defaultMarket) ? defaultMarket : "xyz_perp";
           if (!knownIds.has(state.fibMarket)) state.fibMarket = state.manualMarket;
           if (!knownIds.has(state.copyMarket)) state.copyMarket = state.manualMarket;
+          state.copyMarkets = (Array.isArray(state.copyMarkets) ? state.copyMarkets : []).filter((market) => knownIds.has(market));
+          if (state.copyMarkets.length === 0) {
+            state.copyMarkets = markets.map((item) => item.market);
+          }
           renderMarketSelectOptions();
           syncLeverageControlsForMarket();
         } catch (error) {
@@ -13762,10 +14053,10 @@
       $("copyAdvancedToggle").addEventListener("click", () => {
         setCopyAdvancedOpen(!state.copyAdvancedOpen);
       });
-      $("copyMarket").addEventListener("change", () => {
-        setModuleMarket("copy", $("copyMarket").value);
+      $("copyMarkets").addEventListener("change", () => {
+        setCopyMarketSelections(selectedCopyMarkets());
       });
-      ["copyLeaderAccounts", "copyRatio", "copyPrincipalCap"].forEach((id) => {
+      ["copyLeaderAccounts", "copyRatio", "copyPrincipalCap", "copyMarkets"].forEach((id) => {
         $(id)?.addEventListener("input", renderCopyConfigPreview);
       });
       $("copySaveWhitelistAction").addEventListener("click", async () => {
@@ -13832,6 +14123,7 @@
         const leaders = parseCopyLeaderAccounts($("copyLeaderAccounts").value);
         const ratio = Number($("copyRatio").value);
         const cap = Number($("copyPrincipalCap").value);
+        const markets = selectedCopyMarkets();
         if (leaders.length === 0) {
           showResult("copyResult", { ok: false, error: t("copy.error_requires_leader") });
           $("copyResult").classList.remove("hidden");
@@ -13856,14 +14148,15 @@
         $("copyLeaderId").value = "leader_1";
         $("copyAddress").value = leaders[0];
         $("copyLeaderNotional").value = String(Math.max(cap / Math.max(ratio, 0.0001), 1));
-        $("copyLeverage").value = "5";
+        $("copyLeverage").value = "10";
         $("copyReduce").checked = false;
-        saveCopySimpleSettings(leaders, ratio, cap);
+        saveCopySimpleSettings(leaders, ratio, cap, markets);
         const result = await api("/api/copy/settings", {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({
             leaders,
+            markets,
             copy_ratio: ratio,
             principal_cap_usd: cap,
             account_id: "addr_a",

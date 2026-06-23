@@ -21,10 +21,6 @@ $ErrorActionPreference = "Stop"
 $projectRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 Set-Location $projectRoot
 
-if (-not $env:TRADE_XYZ_VAULT_PASSWORD) {
-    throw "TRADE_XYZ_VAULT_PASSWORD must be set in the launching environment"
-}
-
 $runId = Get-Date -Format "yyyyMMdd-HHmmss"
 $prefix = ".codex-longrun\persistent-live-soak-$runId"
 $summaryPath = "$prefix-summary.jsonl"
@@ -151,6 +147,10 @@ function Stop-WithNotification {
     exit $Code
 }
 
+if (-not $env:TRADE_XYZ_VAULT_PASSWORD) {
+    Write-SoakLog "TRADE_XYZ_VAULT_PASSWORD is not set; relying on cached Vault session or pre-warmed signer state"
+}
+
 Write-SoakLog "starting persistent live soak window_secs=$WindowSecs max_rounds=$MaxRounds max_notional=$MaxTotalNotionalUsd max_fees=$MaxTotalFeesUsd hold_positions_after_submit=$([bool]$HoldPositionsAfterSubmit) settings=$SettingsPath persistence=$persistencePath shadow=$shadowPath"
 $holdPositionsArg = ([bool]$HoldPositionsAfterSubmit).ToString().ToLowerInvariant()
 $botExe = $BotExePath
@@ -158,7 +158,7 @@ if ([string]::IsNullOrWhiteSpace($botExe)) {
     $botExe = $env:TRADE_XYZ_BOT_EXE
 }
 if ([string]::IsNullOrWhiteSpace($botExe)) {
-    $botExe = Join-Path $env:USERPROFILE ".cargo\target-trade_xyz_bot\debug\trade_xyz_bot_v2.exe"
+    $botExe = "D:\CargoMoved\target-trade_xyz_bot\debug\trade_xyz_bot_v2.exe"
 }
 if (-not (Test-Path -LiteralPath $botExe)) {
     throw "trade_xyz_bot_v2.exe not found at $botExe; run cargo build --manifest-path V2\Cargo.toml before starting the soak"
@@ -194,6 +194,22 @@ if ($copySettings -and $copySettings.copy_ratio -and $copySettings.principal_cap
     if ($ratio -gt 0 -and $cap -gt 0) {
         $leaderNotionalUsd = [Math]::Max($cap * $leverage / $ratio, 1.0)
     }
+}
+
+$settingsMarkets = @()
+if ($copySettings -and $copySettings.markets) {
+    foreach ($market in @($copySettings.markets)) {
+        $text = ([string]$market).Trim()
+        if ([string]::IsNullOrWhiteSpace($text)) {
+            continue
+        }
+        if ($settingsMarkets -notcontains $text) {
+            $settingsMarkets += $text
+        }
+    }
+}
+if ($settingsMarkets.Count -eq 0) {
+    $settingsMarkets = @("xyz_perp", "hl_perp", "spot")
 }
 
 function Invoke-BotRound {
@@ -289,7 +305,11 @@ if ($settingsLeaders.Count -gt 0) {
         "--leader", "swing_2=0xd8c5228c515db3043dfa0c8cd6f22450ee9a99b0"
     )
 }
-Write-SoakLog "copy settings leaders=$($leaderArgs.Count / 2) leader_notional_usd=$leaderNotionalUsd"
+$marketArgs = @()
+foreach ($market in $settingsMarkets) {
+    $marketArgs += @("--market", $market)
+}
+Write-SoakLog "copy settings leaders=$($leaderArgs.Count / 2) markets=$($settingsMarkets -join ',') leader_notional_usd=$leaderNotionalUsd"
 
 $round = 0
 $consecutiveDegradedWatcherRounds = 0
@@ -308,9 +328,8 @@ while ($true) {
     $botArgs = @(
         "copy-live-daemon-supervisor",
         "--config", "V2\config\local.toml"
-    ) + $leaderArgs + @(
+    ) + $leaderArgs + $marketArgs + @(
         "--account-id", "addr_a",
-        "--coin", "xyz:XYZ100",
         "--side", "buy",
         "--persistence", $persistencePath,
         "--shadow-history", $shadowPath,

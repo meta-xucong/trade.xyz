@@ -609,9 +609,16 @@ Restart requirements:
 2. Seed local account positions/open orders.
 3. Seed leader positions.
 4. Reconcile pending local orders/fills.
-5. Resume WebSocket streams.
-6. Backfill only the bounded missed window.
-7. Do not emit new exposure until leader and local caches are fresh.
+5. For every V2-owned mapped local copy position, compare the latest leader
+   position snapshot for the same `leader_id + dex + coin`.
+6. If the leader is flat or now holds the opposite side while local still has
+   mapped exposure, synthesize a current-time reduce-only catch-up close for
+   the mapped local side. This catch-up close must use the copy ledger as
+   ownership proof, cap size to current local exposure, and avoid duplicating a
+   close already classified from a live leader fill in the same snapshot cycle.
+7. Resume WebSocket streams.
+8. Backfill only the bounded missed window.
+9. Do not emit new exposure until leader and local caches are fresh.
 
 ## Latency Targets
 
