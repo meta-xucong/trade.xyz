@@ -133,13 +133,6 @@ fn evaluate_copy_open_risk(
     if matches!(side, OrderSide::Sell) && !input.allow_short {
         return copy_risk_rejected("COPY_SHORT_NOT_ALLOWED");
     }
-    if input.action.kind.opens_or_increases()
-        && !input.action.kind.is_fresh_open()
-        && input.same_leader_effective_exposure_usd <= 0.0
-    {
-        return copy_risk_rejected("COPY_INCREASE_WITHOUT_LOCAL_MAPPING");
-    }
-
     let mut sizing = CopySizingInput {
         reduce_only: false,
         ..input.sizing

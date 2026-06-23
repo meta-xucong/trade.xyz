@@ -111,7 +111,7 @@ exe。本项目通过 `.cargo/config.toml` 固定：
 
 ```toml
 [build]
-target-dir = "C:/Users/T14S/.cargo/target-trade_xyz_bot"
+target-dir = "D:/CargoMoved/target-trade_xyz_bot"
 ```
 
 不要随意改回项目内 `target/`，否则可能重新触发 `os error 4551`。

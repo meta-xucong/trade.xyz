@@ -2,6 +2,7 @@ param(
     [string]$BaseUrl = "http://127.0.0.1:18844",
     [int]$PollSecs = 60,
     [int]$WindowSecs = 600,
+    [int]$StaleRoundGraceSecs = 900,
     [double]$PrincipalCapUsd = 35.0,
     [double]$Leverage = 10.0,
     [double]$MaxTotalNotionalUsd = 700.0,
@@ -11,6 +12,7 @@ param(
         "0x6d6d7c05ef7f31b31b618400495b4ce4092a5089",
         "0x6ac0b46b32dc429dbd129a503292f88649d2b8a0"
     ),
+    [string[]]$Markets = @("xyz_perp", "hl_perp", "spot"),
     [double]$CopyRatio = 0.2,
     [string]$PersistencePath = ".codex-longrun\persistent-live-soak-resume-current-snapshot.json",
     [string]$LogPath = ".codex-longrun\copy-health-monitor.log",
@@ -187,14 +189,48 @@ function Test-SoakProcessCommand {
         return $false
     }
     $commandLine = [string]$Process.CommandLine
-    return $Process.Name -match "^(powershell|pwsh)\.exe$" `
+    $isWrapper = $Process.Name -match "^(powershell|pwsh)\.exe$" `
         -and $commandLine -like "*run-persistent-live-soak.ps1*" `
         -and $commandLine -match "(?i)(^|\\s)-File\\s+" `
         -and $commandLine -notlike "*Get-CimInstance*"
+    $isRoundChild = $Process.Name -eq "trade_xyz_bot_v2.exe" `
+        -and $commandLine -like "*copy-live-daemon-supervisor*"
+    return $isWrapper -or $isRoundChild
 }
 
 function Test-SoakProcessRunning {
     return $null -ne (Get-SoakProcess)
+}
+
+function Get-LatestSoakRunLog {
+    return Get-ChildItem -LiteralPath ".codex-longrun" -Filter "persistent-live-soak-*-run.log" -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending |
+        Select-Object -First 1
+}
+
+function Test-SoakHeartbeatStale {
+    $log = Get-LatestSoakRunLog
+    if ($null -eq $log) {
+        return $false
+    }
+    $ageSecs = ((Get-Date) - $log.LastWriteTime).TotalSeconds
+    $limitSecs = [Math]::Max($WindowSecs + $StaleRoundGraceSecs, $PollSecs * 3)
+    return $ageSecs -gt $limitSecs
+}
+
+function Get-SoakHeartbeatDiagnostic {
+    $log = Get-LatestSoakRunLog
+    if ($null -eq $log) {
+        return "no persistent live soak run log found"
+    }
+    $ageSecs = [Math]::Round(((Get-Date) - $log.LastWriteTime).TotalSeconds, 1)
+    $lastLine = ""
+    try {
+        $lastLine = (Get-Content -LiteralPath $log.FullName -Tail 1 -Encoding utf8)
+    } catch {
+        $lastLine = "failed to read run log tail: $($_.Exception.Message)"
+    }
+    return "run_log=$($log.Name); age_secs=$ageSecs; stale_limit_secs=$([Math]::Max($WindowSecs + $StaleRoundGraceSecs, $PollSecs * 3)); last=$lastLine"
 }
 
 function Ensure-VaultUnlocked {
@@ -215,6 +251,7 @@ function Ensure-VaultUnlocked {
 function Set-CopyRuntimeSettings {
     $settings = Invoke-Json "/api/copy/settings" "POST" @{
         leaders = $Leaders
+        markets = $Markets
         copy_ratio = $CopyRatio
         principal_cap_usd = $PrincipalCapUsd
         leverage = $Leverage
@@ -272,15 +309,14 @@ function Start-CopyLiveSoak {
     }
     if (-not [string]::IsNullOrWhiteSpace($resolvedBotExePath)) {
         $body.bot_exe_path = $resolvedBotExePath
-    } else {
-        $start = Invoke-Json "/api/copy/live-soak/start" "POST" $body
-        if ($start.ok) {
-            $soakPid = Set-LatestSoakPid $startedAt
-            Write-MonitorLog "restart requested run_id=$($start.data.status.run_id) pid=$soakPid principal_cap=$PrincipalCapUsd leverage=$Leverage max_total_notional=$MaxTotalNotionalUsd max_total_fees=$MaxTotalFeesUsd"
-            return
-        }
-        Write-MonitorLog "frontend start failed; falling back to direct soak script: $($start.error)"
     }
+    $start = Invoke-Json "/api/copy/live-soak/start" "POST" $body
+    if ($start.ok) {
+        $soakPid = Set-LatestSoakPid $startedAt
+        Write-MonitorLog "restart requested run_id=$($start.data.status.run_id) pid=$soakPid principal_cap=$PrincipalCapUsd leverage=$Leverage markets=$($Markets -join ',') max_total_notional=$MaxTotalNotionalUsd max_total_fees=$MaxTotalFeesUsd"
+        return
+    }
+    Write-MonitorLog "frontend start failed; falling back to direct soak script: $($start.error)"
     $script = if (Test-Path ".codex-longrun\run-persistent-live-soak.ps1") {
         ".codex-longrun\run-persistent-live-soak.ps1"
     } else {
@@ -311,16 +347,47 @@ function Start-CopyLiveSoak {
     }
     $process = Start-Process -FilePath powershell -ArgumentList $args -WorkingDirectory $projectRoot -WindowStyle Hidden -PassThru
     Set-Content -LiteralPath ".codex-longrun\persistent-live-soak-detached-current.pid" -Value ([string]$process.Id) -Encoding ascii
-    Write-MonitorLog "direct soak restart requested pid=$($process.Id) principal_cap=$PrincipalCapUsd leverage=$Leverage max_total_notional=$MaxTotalNotionalUsd max_total_fees=$MaxTotalFeesUsd bot_exe=$resolvedBotExePath"
+    Write-MonitorLog "direct soak restart requested pid=$($process.Id) principal_cap=$PrincipalCapUsd leverage=$Leverage markets=$($Markets -join ',') max_total_notional=$MaxTotalNotionalUsd max_total_fees=$MaxTotalFeesUsd bot_exe=$resolvedBotExePath"
 }
 
-Write-MonitorLog "monitor started poll_secs=$PollSecs base_url=$BaseUrl principal_cap=$PrincipalCapUsd leverage=$Leverage max_total_notional=$MaxTotalNotionalUsd max_total_fees=$MaxTotalFeesUsd bot_exe=$BotExePath"
+Write-MonitorLog "monitor started poll_secs=$PollSecs base_url=$BaseUrl principal_cap=$PrincipalCapUsd leverage=$Leverage markets=$($Markets -join ',') max_total_notional=$MaxTotalNotionalUsd max_total_fees=$MaxTotalFeesUsd bot_exe=$BotExePath"
 
 while ($true) {
     try {
         $status = Invoke-Json "/api/copy/live-soak/status"
-        if ($status.ok -and $status.data.running) {
-            Write-MonitorLog "healthy run_id=$($status.data.run_id) round=$($status.data.latest_round) message=$($status.data.message)"
+        $soakProcess = Get-SoakProcess
+        if ($status.ok -and $status.data.running -and $null -ne $soakProcess -and (Test-SoakHeartbeatStale)) {
+            $diagnostic = "soak_heartbeat_stale; $(Get-SoakHeartbeatDiagnostic)"
+            Write-MonitorLog "detected stopped soak; diagnostic: $diagnostic"
+            Send-MonitorNotification -Status "stopped" -Reason "soak_heartbeat_stale" -Detail $diagnostic
+            try {
+                Start-CopyLiveSoak
+            } catch {
+                Send-MonitorNotification -Status "failed" -Reason "restart_failed" -Detail $_.Exception.Message
+                throw
+            }
+        } elseif ($status.ok -and $status.data.running -and $null -ne $soakProcess) {
+            Write-MonitorLog "healthy pid=$($soakProcess.ProcessId) run_id=$($status.data.run_id) round=$($status.data.latest_round) message=$($status.data.message)"
+        } elseif ($status.ok -and $status.data.running -and $null -eq $soakProcess) {
+            $diagnostic = "frontend_running_but_soak_process_missing run_id=$($status.data.run_id) round=$($status.data.latest_round) message=$($status.data.message)"
+            Write-MonitorLog "detected stopped soak; diagnostic: $diagnostic"
+            Send-MonitorNotification -Status "stopped" -Reason "soak_process_missing" -Detail $diagnostic
+            try {
+                Start-CopyLiveSoak
+            } catch {
+                Send-MonitorNotification -Status "failed" -Reason "restart_failed" -Detail $_.Exception.Message
+                throw
+            }
+        } elseif ((Test-SoakProcessRunning) -and (Test-SoakHeartbeatStale)) {
+            $diagnostic = "soak_heartbeat_stale_without_status; $(Get-SoakHeartbeatDiagnostic)"
+            Write-MonitorLog "detected stopped soak; diagnostic: $diagnostic"
+            Send-MonitorNotification -Status "stopped" -Reason "soak_heartbeat_stale" -Detail $diagnostic
+            try {
+                Start-CopyLiveSoak
+            } catch {
+                Send-MonitorNotification -Status "failed" -Reason "restart_failed" -Detail $_.Exception.Message
+                throw
+            }
         } elseif (Test-SoakProcessRunning) {
             $diagnostic = if ($status.ok) { "status_not_running message=$($status.data.message)" } else { "status_error=$($status.error)" }
             $proc = Get-SoakProcess
@@ -339,10 +406,29 @@ while ($true) {
     } catch {
         if (Test-SoakProcessRunning) {
             $proc = Get-SoakProcess
-            Write-MonitorLog "healthy_fallback pid=$($proc.ProcessId) status_exception=$($_.Exception.Message)"
+            if (Test-SoakHeartbeatStale) {
+                $diagnostic = "status_exception=$($_.Exception.Message); $(Get-SoakHeartbeatDiagnostic)"
+                Write-MonitorLog "detected stopped soak; diagnostic: $diagnostic"
+                Send-MonitorNotification -Status "stopped" -Reason "soak_heartbeat_stale" -Detail $diagnostic
+                try {
+                    Start-CopyLiveSoak
+                } catch {
+                    Send-MonitorNotification -Status "failed" -Reason "restart_failed" -Detail $_.Exception.Message
+                    throw
+                }
+            } else {
+                Write-MonitorLog "healthy_fallback pid=$($proc.ProcessId) status_exception=$($_.Exception.Message)"
+            }
         } else {
-            Write-MonitorLog "monitor loop error: $($_.Exception.Message)"
-            Send-MonitorNotification -Status "failed" -Reason "monitor_loop_error" -Detail $_.Exception.Message
+            $diagnostic = "status_exception=$($_.Exception.Message); no_soak_process=true"
+            Write-MonitorLog "detected stopped soak; diagnostic: $diagnostic"
+            Send-MonitorNotification -Status "stopped" -Reason "soak_not_running" -Detail $diagnostic
+            try {
+                Start-CopyLiveSoak
+            } catch {
+                Write-MonitorLog "monitor restart failed after status exception: $($_.Exception.Message)"
+                Send-MonitorNotification -Status "failed" -Reason "restart_failed" -Detail $_.Exception.Message
+            }
         }
     }
     Start-Sleep -Seconds $PollSecs

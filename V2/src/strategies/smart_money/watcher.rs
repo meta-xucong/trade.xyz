@@ -48,6 +48,7 @@ pub enum CopyLeaderWatcherEvent {
     PositionSnapshots {
         leader_id: String,
         leader_address: String,
+        dex: Option<String>,
         snapshots: Vec<LeaderPositionSnapshot>,
     },
     OrderUpdate {
@@ -235,17 +236,16 @@ pub fn parse_read_only_leader_watcher_message(
                 let snapshots = leader_position_snapshots_from_clearinghouse_state(
                     &leader.leader_id,
                     watcher_market_for_dex(Some(&dex)),
-                    Some(dex),
+                    Some(dex.clone()),
                     &state,
                     received_at_ms,
                 );
-                if !snapshots.is_empty() {
-                    events.push(CopyLeaderWatcherEvent::PositionSnapshots {
-                        leader_id: leader.leader_id.clone(),
-                        leader_address: leader.leader_address.clone(),
-                        snapshots,
-                    });
-                }
+                events.push(CopyLeaderWatcherEvent::PositionSnapshots {
+                    leader_id: leader.leader_id.clone(),
+                    leader_address: leader.leader_address.clone(),
+                    dex: Some(dex),
+                    snapshots,
+                });
             }
             Ok(events)
         }
@@ -264,15 +264,12 @@ pub fn parse_read_only_leader_watcher_message(
                 &data.state,
                 received_at_ms,
             );
-            if snapshots.is_empty() {
-                Ok(Vec::new())
-            } else {
-                Ok(vec![CopyLeaderWatcherEvent::PositionSnapshots {
-                    leader_id: leader.leader_id.clone(),
-                    leader_address: leader.leader_address.clone(),
-                    snapshots,
-                }])
-            }
+            Ok(vec![CopyLeaderWatcherEvent::PositionSnapshots {
+                leader_id: leader.leader_id.clone(),
+                leader_address: leader.leader_address.clone(),
+                dex: dex.map(str::to_string),
+                snapshots,
+            }])
         }
         "subscriptionResponse" | "pong" => Ok(Vec::new()),
         _ => Ok(Vec::new()),
@@ -572,6 +569,7 @@ fn normalized_optional_dex(dex: Option<&str>) -> Option<String> {
 
 fn watcher_market_for_dex(dex: Option<&str>) -> Option<String> {
     match normalized_optional_dex(dex) {
+        Some(dex) if dex == "spot" => Some("spot".to_string()),
         Some(dex) => Some(format!("{dex}_perp")),
         None => Some("hl_perp".to_string()),
     }
@@ -643,6 +641,19 @@ mod tests {
         assert_eq!(
             redact_copy_watcher_proxy_url("http://user:pass@127.0.0.1:7890"),
             "http://***@127.0.0.1:7890"
+        );
+    }
+
+    #[test]
+    fn watcher_market_for_dex_maps_supported_markets() {
+        assert_eq!(watcher_market_for_dex(None).as_deref(), Some("hl_perp"));
+        assert_eq!(
+            watcher_market_for_dex(Some("xyz")).as_deref(),
+            Some("xyz_perp")
+        );
+        assert_eq!(
+            watcher_market_for_dex(Some("spot")).as_deref(),
+            Some("spot")
         );
     }
 }

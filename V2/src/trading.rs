@@ -1317,8 +1317,8 @@ impl LiveExchangeExecutor {
             )
         })?;
         let base_url = sdk_base_url(&self.config.app.environment)?;
-        const MAX_ATTEMPTS: usize = 3;
-        let mut backoff_ms = 120_u64;
+        const MAX_ATTEMPTS: usize = 6;
+        let mut backoff_ms = 500_u64;
         for attempt in 1..=MAX_ATTEMPTS {
             let init = ExchangeClient::new(
                 None,
@@ -1345,7 +1345,7 @@ impl LiveExchangeExecutor {
                         });
                     }
                     tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                    backoff_ms = (backoff_ms * 2).min(1_000);
+                    backoff_ms = (backoff_ms * 2).min(4_000);
                 }
             }
         }

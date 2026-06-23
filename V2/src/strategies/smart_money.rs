@@ -666,6 +666,7 @@ pub struct CopyDryRunShadowPipeline {
     ledger: CopyLedger,
     last_positions: HashMap<String, LeaderPositionSnapshot>,
     pending_fills: Vec<PendingLeaderFill>,
+    seen_fill_events: HashSet<String>,
 }
 
 impl CopyDryRunShadowPipeline {
@@ -680,6 +681,7 @@ impl CopyDryRunShadowPipeline {
             ledger,
             last_positions: HashMap::new(),
             pending_fills: Vec::new(),
+            seen_fill_events: HashSet::new(),
         }
     }
 
@@ -690,6 +692,27 @@ impl CopyDryRunShadowPipeline {
     pub fn persistence_snapshot(&self, saved_at_ms: u64) -> CopyPersistenceSnapshot {
         self.strategy
             .persistence_snapshot(saved_at_ms, &self.ledger)
+    }
+
+    pub fn pending_fill_count(&self) -> usize {
+        self.pending_fills.len()
+    }
+
+    pub fn pending_fill_labels(&self, limit: usize) -> Vec<String> {
+        self.pending_fills
+            .iter()
+            .take(limit)
+            .map(|pending| {
+                let side = match pending.fill.side {
+                    OrderSide::Buy => "buy",
+                    OrderSide::Sell => "sell",
+                };
+                format!(
+                    "{}:{}:{}:{}",
+                    pending.fill.leader_id, pending.fill.coin, side, pending.fill.exchange_time_ms
+                )
+            })
+            .collect()
     }
 
     pub fn handle_watcher_event(
@@ -704,6 +727,16 @@ impl CopyDryRunShadowPipeline {
                 if is_snapshot {
                     return Vec::new();
                 }
+                if coin_belongs_to_snapshot_dex(&fill.coin, Some("spot")) {
+                    if !self.seen_fill_events.insert(fill.event_id.clone()) {
+                        return Vec::new();
+                    }
+                    let action = classify_spot_leader_fill(&fill);
+                    return self.shadow_records_from_action(action, now_ms);
+                }
+                if !self.seen_fill_events.insert(fill.event_id.clone()) {
+                    return Vec::new();
+                }
                 let before = self
                     .last_positions
                     .get(&position_key(&fill.leader_id, &fill.coin))
@@ -711,8 +744,23 @@ impl CopyDryRunShadowPipeline {
                 self.pending_fills.push(PendingLeaderFill { fill, before });
                 Vec::new()
             }
-            CopyLeaderWatcherEvent::PositionSnapshots { snapshots, .. } => {
+            CopyLeaderWatcherEvent::PositionSnapshots {
+                leader_id,
+                leader_address,
+                dex,
+                snapshots,
+            } => {
                 let mut records = Vec::new();
+                let scoped_coin_keys = snapshots
+                    .iter()
+                    .map(|snapshot| position_key(&snapshot.leader_id, &snapshot.coin))
+                    .collect::<HashSet<_>>();
+                let mut classified_coin_keys = HashSet::new();
+                self.prune_stale_positions_for_snapshot_scope(
+                    &leader_id,
+                    dex.as_deref(),
+                    &scoped_coin_keys,
+                );
                 for snapshot in snapshots {
                     let key = position_key(&snapshot.leader_id, &snapshot.coin);
                     let matching_pending = self
@@ -732,14 +780,120 @@ impl CopyDryRunShadowPipeline {
                             pending.before.as_ref(),
                             Some(&snapshot),
                         );
+                        classified_coin_keys.insert(key.clone());
                         records.extend(self.shadow_records_from_action(action, now_ms));
                     }
                     self.last_positions.insert(key, snapshot);
                 }
+                records.extend(self.reconnect_flat_catchup_records(
+                    &leader_id,
+                    &leader_address,
+                    dex.as_deref(),
+                    &classified_coin_keys,
+                    now_ms,
+                ));
                 records
             }
             CopyLeaderWatcherEvent::OrderUpdate { .. } => Vec::new(),
         }
+    }
+
+    fn reconnect_flat_catchup_records(
+        &mut self,
+        leader_id: &str,
+        leader_address: &str,
+        dex: Option<&str>,
+        classified_coin_keys: &HashSet<String>,
+        now_ms: u64,
+    ) -> Vec<CopyDryRunShadowRecord> {
+        let mut actions = Vec::new();
+        let mut seen = HashSet::new();
+        for entry in self.ledger.entries() {
+            if entry.local_account_id != self.config.local_account_id
+                || entry.leader_group != leader_id
+                || !matches!(
+                    entry.status,
+                    CopyLedgerStatus::Open | CopyLedgerStatus::PendingOpen
+                )
+            {
+                continue;
+            }
+            let exposure = self
+                .ledger
+                .submitted_effective_exposure_usd_for_leader_group(
+                    &self.config.local_account_id,
+                    leader_id,
+                    &entry.coin,
+                    entry.local_side,
+                );
+            if exposure <= 0.0 {
+                continue;
+            }
+            if !coin_belongs_to_snapshot_dex(&entry.coin, dex) {
+                continue;
+            }
+            let key = position_key(leader_id, &entry.coin);
+            if classified_coin_keys.contains(&key) {
+                continue;
+            }
+            if !seen.insert(format!(
+                "{}:{}:{:?}",
+                leader_id, entry.coin, entry.local_side
+            )) {
+                continue;
+            }
+            if let Some(snapshot) = self.last_positions.get(&key)
+                && leader_snapshot_still_has_side(snapshot, entry.local_side)
+            {
+                continue;
+            }
+            actions.push(SemanticLeaderAction {
+                leader_id: leader_id.to_string(),
+                leader_address: leader_address.to_string(),
+                market: Some(watcher_market_for_catchup_dex(dex)),
+                dex: dex
+                    .filter(|value| !value.trim().is_empty())
+                    .map(str::to_string),
+                coin: entry.coin.clone(),
+                event_id: format!(
+                    "copy-catchup-flat:{leader_id}:{}:{:?}:{now_ms}",
+                    entry.coin, entry.local_side
+                ),
+                kind: match entry.local_side {
+                    OrderSide::Buy => LeaderActionKind::CloseLong,
+                    OrderSide::Sell => LeaderActionKind::CloseShort,
+                },
+                confidence: LeaderActionConfidence::Strong,
+                leader_notional_usd: exposure,
+                close_leader_notional_usd: Some(exposure),
+                open_leader_notional_usd: None,
+                exchange_time_ms: now_ms,
+                received_at_ms: now_ms,
+                reason: "reconnect_target_flat_catchup".to_string(),
+            });
+        }
+        actions
+            .into_iter()
+            .flat_map(|action| self.shadow_records_from_action(action, now_ms))
+            .collect()
+    }
+
+    fn prune_stale_positions_for_snapshot_scope(
+        &mut self,
+        leader_id: &str,
+        dex: Option<&str>,
+        scoped_coin_keys: &HashSet<String>,
+    ) {
+        self.last_positions.retain(|key, snapshot| {
+            snapshot.leader_id != leader_id
+                || dex.is_some_and(|scope| {
+                    snapshot
+                        .dex
+                        .as_deref()
+                        .is_some_and(|snapshot_dex| !snapshot_dex.eq_ignore_ascii_case(scope))
+                })
+                || scoped_coin_keys.contains(key)
+        });
     }
 
     fn shadow_records_from_action(
@@ -998,6 +1152,71 @@ fn opposite_order_side(side: OrderSide) -> OrderSide {
 
 fn position_key(leader_id: &str, coin: &str) -> String {
     format!("{leader_id}:{coin}")
+}
+
+fn leader_snapshot_still_has_side(
+    snapshot: &LeaderPositionSnapshot,
+    local_side: OrderSide,
+) -> bool {
+    match local_side {
+        OrderSide::Buy => normalize_position(snapshot.signed_size) > 0.0,
+        OrderSide::Sell => normalize_position(snapshot.signed_size) < 0.0,
+    }
+}
+
+fn watcher_market_for_catchup_dex(dex: Option<&str>) -> String {
+    let normalized = dex
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase);
+    match normalized.as_deref() {
+        Some("xyz") => "xyz_perp".to_string(),
+        Some("spot") => "spot".to_string(),
+        Some(value) => format!("{value}_perp"),
+        None => "hl_perp".to_string(),
+    }
+}
+
+fn coin_belongs_to_snapshot_dex(coin: &str, dex: Option<&str>) -> bool {
+    let coin = coin.trim();
+    let normalized_dex = dex
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase);
+    match normalized_dex.as_deref() {
+        Some("spot") => coin.contains('/') || coin.starts_with('@'),
+        Some(dex) => coin
+            .split_once(':')
+            .is_some_and(|(prefix, _)| prefix.eq_ignore_ascii_case(dex)),
+        None => !coin.contains(':') && !coin.contains('/') && !coin.starts_with('@'),
+    }
+}
+
+fn classify_spot_leader_fill(fill: &LeaderFillEvent) -> SemanticLeaderAction {
+    let kind = match fill.side {
+        OrderSide::Buy => LeaderActionKind::OpenLong,
+        OrderSide::Sell => LeaderActionKind::CloseLong,
+    };
+    SemanticLeaderAction {
+        leader_id: fill.leader_id.clone(),
+        leader_address: fill.leader_address.clone(),
+        market: Some("spot".to_string()),
+        dex: Some("spot".to_string()),
+        coin: fill.coin.clone(),
+        event_id: fill.event_id.clone(),
+        kind,
+        confidence: LeaderActionConfidence::Strong,
+        leader_notional_usd: fill.notional_usd,
+        close_leader_notional_usd: matches!(kind, LeaderActionKind::CloseLong)
+            .then_some(fill.notional_usd),
+        open_leader_notional_usd: None,
+        exchange_time_ms: fill.exchange_time_ms,
+        received_at_ms: fill.received_at_ms,
+        reason: match fill.side {
+            OrderSide::Buy => "spot_fill_buy".to_string(),
+            OrderSide::Sell => "spot_fill_sell".to_string(),
+        },
+    }
 }
 
 fn same_position_scope(
@@ -1882,6 +2101,124 @@ mod tests {
     }
 
     #[test]
+    fn dry_run_shadow_dedupes_replayed_leader_fill_events() {
+        let now = now_ms();
+        let mut pipeline = CopyDryRunShadowPipeline::new(
+            dry_run_shadow_config(),
+            copy_strategy(),
+            CopyLedger::new(),
+        );
+
+        pipeline.handle_watcher_event(position_event("leader_a", 0.0, 0.0), now);
+        let event = CopyLeaderWatcherEvent::Fill {
+            leader_id: "leader_a".to_string(),
+            leader_address: "0xABC".to_string(),
+            fill: leader_fill("replayed-fill-1", "leader_a", OrderSide::Buy, 100.0),
+            is_snapshot: false,
+        };
+
+        assert!(
+            pipeline
+                .handle_watcher_event(event.clone(), now + 1)
+                .is_empty()
+        );
+        assert!(pipeline.handle_watcher_event(event, now + 2).is_empty());
+
+        let records = pipeline.handle_watcher_event(position_event("leader_a", 1.0, 20.0), now + 3);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].action.event_id, "replayed-fill-1");
+        assert_eq!(pipeline.pending_fill_count(), 0);
+    }
+
+    #[test]
+    fn dry_run_shadow_spot_buy_does_not_wait_for_position_snapshot() {
+        let now = now_ms();
+        let mut pipeline = CopyDryRunShadowPipeline::new(
+            dry_run_shadow_config(),
+            copy_strategy(),
+            CopyLedger::new(),
+        );
+        let mut fill = leader_fill("spot-buy-1", "leader_a", OrderSide::Buy, 100.0);
+        fill.coin = "PURR/USDC".to_string();
+
+        let records = pipeline.handle_watcher_event(
+            CopyLeaderWatcherEvent::Fill {
+                leader_id: "leader_a".to_string(),
+                leader_address: "0xABC".to_string(),
+                fill,
+                is_snapshot: false,
+            },
+            now,
+        );
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].action.market.as_deref(), Some("spot"));
+        assert_eq!(records[0].action.dex.as_deref(), Some("spot"));
+        assert_eq!(records[0].action.kind, LeaderActionKind::OpenLong);
+        assert_eq!(
+            records[0].risk_decision,
+            CopySignalRiskDecision::Approved {
+                side: OrderSide::Buy,
+                reduce_only: false,
+                notional_usd: 100.0,
+            }
+        );
+        let signal = records[0].signal.as_ref().expect("spot buy signal");
+        assert_eq!(signal.order.coin, "PURR/USDC");
+        assert_eq!(signal.order.side, OrderSide::Buy);
+        assert!(!signal.order.reduce_only);
+    }
+
+    #[test]
+    fn dry_run_shadow_spot_sell_closes_same_leader_mapping() {
+        let now = now_ms();
+        let mut pipeline = CopyDryRunShadowPipeline::new(
+            dry_run_shadow_config(),
+            copy_strategy(),
+            CopyLedger::new(),
+        );
+        let mut buy = leader_fill("spot-buy-before-sell", "leader_a", OrderSide::Buy, 100.0);
+        buy.coin = "PURR/USDC".to_string();
+        let buy_records = pipeline.handle_watcher_event(
+            CopyLeaderWatcherEvent::Fill {
+                leader_id: "leader_a".to_string(),
+                leader_address: "0xABC".to_string(),
+                fill: buy,
+                is_snapshot: false,
+            },
+            now,
+        );
+        assert_eq!(buy_records.len(), 1);
+
+        let mut sell = leader_fill("spot-sell-1", "leader_a", OrderSide::Sell, 50.0);
+        sell.coin = "PURR/USDC".to_string();
+        let sell_records = pipeline.handle_watcher_event(
+            CopyLeaderWatcherEvent::Fill {
+                leader_id: "leader_a".to_string(),
+                leader_address: "0xABC".to_string(),
+                fill: sell,
+                is_snapshot: false,
+            },
+            now + 1,
+        );
+
+        assert_eq!(sell_records.len(), 1);
+        assert_eq!(sell_records[0].action.kind, LeaderActionKind::CloseLong);
+        assert_eq!(
+            sell_records[0].risk_decision,
+            CopySignalRiskDecision::Approved {
+                side: OrderSide::Sell,
+                reduce_only: true,
+                notional_usd: 100.0,
+            }
+        );
+        let signal = sell_records[0].signal.as_ref().expect("spot sell signal");
+        assert_eq!(signal.order.coin, "PURR/USDC");
+        assert_eq!(signal.order.side, OrderSide::Sell);
+        assert!(signal.order.reduce_only);
+    }
+
+    #[test]
     fn dry_run_shadow_caps_approved_open_signal_to_configured_max() {
         let now = now_ms();
         let mut config = dry_run_shadow_config();
@@ -2128,6 +2465,133 @@ mod tests {
     }
 
     #[test]
+    fn dry_run_shadow_reconnect_empty_snapshot_closes_mapped_long() {
+        let now = now_ms();
+        let mut ledger = CopyLedger::new();
+        ledger.push(ledger_entry(
+            "sig-open",
+            OrderSide::Buy,
+            75.0,
+            0.0,
+            75.0,
+            75.0,
+            CopyLedgerStatus::Open,
+        ));
+        let mut pipeline =
+            CopyDryRunShadowPipeline::new(dry_run_shadow_config(), copy_strategy(), ledger);
+
+        pipeline.handle_watcher_event(position_event("leader_a", 1.0, 100.0), now);
+        let records = pipeline.handle_watcher_event(empty_position_event("leader_a"), now + 1);
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].action.kind, LeaderActionKind::CloseLong);
+        assert_eq!(records[0].action.reason, "reconnect_target_flat_catchup");
+        assert_eq!(
+            records[0].risk_decision,
+            CopySignalRiskDecision::Approved {
+                side: OrderSide::Sell,
+                reduce_only: true,
+                notional_usd: 75.0,
+            }
+        );
+        let signal = records[0].signal.as_ref().expect("catchup close signal");
+        assert_eq!(signal.order.side, OrderSide::Sell);
+        assert!(signal.order.reduce_only);
+        assert_eq!(signal.order.notional_usd, 75.0);
+    }
+
+    #[test]
+    fn dry_run_shadow_reconnect_empty_snapshot_is_scoped_to_snapshot_dex() {
+        let now = now_ms();
+        let mut ledger = CopyLedger::new();
+        ledger.push(ledger_entry(
+            "sig-open-xyz",
+            OrderSide::Buy,
+            75.0,
+            0.0,
+            75.0,
+            75.0,
+            CopyLedgerStatus::Open,
+        ));
+        let mut hl_entry = ledger_entry(
+            "sig-open-hl",
+            OrderSide::Buy,
+            80.0,
+            0.0,
+            80.0,
+            80.0,
+            CopyLedgerStatus::Open,
+        );
+        hl_entry.coin = "BTC".to_string();
+        ledger.push(hl_entry);
+        let mut pipeline =
+            CopyDryRunShadowPipeline::new(dry_run_shadow_config(), copy_strategy(), ledger);
+
+        let records = pipeline.handle_watcher_event(empty_position_event("leader_a"), now);
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].action.coin, "xyz:XYZ100");
+        assert_eq!(records[0].action.kind, LeaderActionKind::CloseLong);
+        assert_eq!(records[0].action.market.as_deref(), Some("xyz_perp"));
+    }
+
+    #[test]
+    fn dry_run_shadow_reconnect_opposite_snapshot_closes_mapped_short() {
+        let now = now_ms();
+        let mut ledger = CopyLedger::new();
+        ledger.push(ledger_entry(
+            "sig-open-short",
+            OrderSide::Sell,
+            80.0,
+            0.0,
+            80.0,
+            80.0,
+            CopyLedgerStatus::Open,
+        ));
+        let mut pipeline =
+            CopyDryRunShadowPipeline::new(dry_run_shadow_config(), copy_strategy(), ledger);
+
+        pipeline.handle_watcher_event(position_event("leader_a", -1.0, 100.0), now);
+        let records =
+            pipeline.handle_watcher_event(position_event("leader_a", 1.0, 100.0), now + 1);
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].action.kind, LeaderActionKind::CloseShort);
+        assert_eq!(
+            records[0].risk_decision,
+            CopySignalRiskDecision::Approved {
+                side: OrderSide::Buy,
+                reduce_only: true,
+                notional_usd: 80.0,
+            }
+        );
+        let signal = records[0].signal.as_ref().expect("catchup close signal");
+        assert_eq!(signal.order.side, OrderSide::Buy);
+        assert!(signal.order.reduce_only);
+    }
+
+    #[test]
+    fn dry_run_shadow_reconnect_same_side_snapshot_does_not_close() {
+        let now = now_ms();
+        let mut ledger = CopyLedger::new();
+        ledger.push(ledger_entry(
+            "sig-open-short",
+            OrderSide::Sell,
+            80.0,
+            0.0,
+            80.0,
+            80.0,
+            CopyLedgerStatus::Open,
+        ));
+        let mut pipeline =
+            CopyDryRunShadowPipeline::new(dry_run_shadow_config(), copy_strategy(), ledger);
+
+        let records = pipeline.handle_watcher_event(position_event("leader_a", -2.0, 100.0), now);
+
+        assert!(records.is_empty(), "{records:#?}");
+    }
+
+    #[test]
     fn dry_run_shadow_full_close_rejects_without_same_leader_mapping() {
         let now = now_ms();
         let mut pipeline = CopyDryRunShadowPipeline::new(
@@ -2202,7 +2666,7 @@ mod tests {
     }
 
     #[test]
-    fn dry_run_shadow_rejects_increase_without_same_leader_mapping() {
+    fn dry_run_shadow_allows_first_observed_increase_without_same_leader_mapping() {
         let now = now_ms();
         let mut pipeline = CopyDryRunShadowPipeline::new(
             dry_run_shadow_config(),
@@ -2226,12 +2690,14 @@ mod tests {
         assert_eq!(records[0].action.kind, LeaderActionKind::IncreaseLong);
         assert_eq!(
             records[0].risk_decision,
-            CopySignalRiskDecision::Rejected {
-                reason_code: "COPY_INCREASE_WITHOUT_LOCAL_MAPPING".to_string(),
+            CopySignalRiskDecision::Approved {
+                side: OrderSide::Buy,
+                reduce_only: false,
+                notional_usd: COPY_DEFAULT_MAX_SIGNAL_NOTIONAL_USD,
             }
         );
-        assert!(records[0].signal.is_none());
-        assert!(records[0].ledger_entry.is_none());
+        assert!(records[0].signal.is_some());
+        assert!(records[0].ledger_entry.is_some());
     }
 
     #[test]
@@ -3486,6 +3952,7 @@ mod tests {
             CopyLeaderWatcherEvent::PositionSnapshots {
                 leader_id,
                 leader_address,
+                dex: _,
                 snapshots,
             } => {
                 assert_eq!(leader_id, "leader_a");
@@ -3603,6 +4070,7 @@ mod tests {
         CopyLeaderWatcherEvent::PositionSnapshots {
             leader_id: leader_id.to_string(),
             leader_address: "0xABC".to_string(),
+            dex: Some("xyz".to_string()),
             snapshots: vec![LeaderPositionSnapshot {
                 leader_id: leader_id.to_string(),
                 market: Some("xyz_perp".to_string()),
@@ -3613,6 +4081,15 @@ mod tests {
                 snapshot_time_ms: now_ms(),
                 received_at_ms: now_ms(),
             }],
+        }
+    }
+
+    fn empty_position_event(leader_id: &str) -> CopyLeaderWatcherEvent {
+        CopyLeaderWatcherEvent::PositionSnapshots {
+            leader_id: leader_id.to_string(),
+            leader_address: "0xABC".to_string(),
+            dex: Some("xyz".to_string()),
+            snapshots: Vec::new(),
         }
     }
 
