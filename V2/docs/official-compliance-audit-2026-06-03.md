@@ -40,7 +40,7 @@ must communicate only through internal APIs.
 | Module | Status | Evidence | Notes |
 | --- | --- | --- | --- |
 | Hyperliquid adapter | Pass | Uses `/info` for `perpDexs`, `meta`, `metaAndAssetCtxs`, `spotMetaAndAssetCtxs`, `orderStatus`, `userRateLimit`, `candleSnapshot`, startup/reconnect snapshots, explicit reconciliation, and signed-action confirmation. Uses official websocket subscriptions for realtime `allMids`, `openOrders`, `orderUpdates`, `userEvents`, `userFills`, `allDexsClearinghouseState`, and `spotState`. Uses `/exchange` through the SDK or signed helper for actions. | 429 backoff, cache, stale fallback, Retry-After handling, WS reconnect, and heartbeat pings are present. |
-| Market and symbol normalization | Pass | XYZ symbols normalize to `xyz:<SYMBOL>`. HL perps use default perp names. Spot uses live `spotMetaAndAssetCtxs` labels and asset IDs. | Verified live universe/quote reads for `xyz_perp`, `hl_perp`, and `spot`. |
+| Market and symbol normalization | Pass | XYZ symbols normalize to `xyz:<SYMBOL>`. HL perps use default perp names. Spot uses live `spotMetaAndAssetCtxs` labels and asset IDs. Later V2 work added `cash_perp` for the HIP-3 `cash` perp DEX, distinct from trade[XYZ] `xyz_perp`. | Verified live universe/quote reads for `xyz_perp`, `hl_perp`, and `spot` in this audit; `cash_perp` is covered by later market-capability acceptance. |
 | Dashboard/account overview | Pass | `/api/state` and funding diagnostics read account state from the right account layer. Recent events are business-filtered and market-tagged. | The current state endpoint defaults to the configured market for summary, while the UI uses market selectors and funding/protective endpoints for market-specific reads. |
 | Manual trading | Pass for plan/readiness; live submit not executed in this audit | Mainnet readiness passed for 2 accounts on XYZ, HL perp, and Spot without submitting orders. Manual live path preflights before signed submit, applies perp leverage before order, and auto-arms TP/SL only after a live order succeeds. | No state-changing order was sent during this audit. |
 | Native TP/SL | Pass with legacy naming debt | Current arm path submits exchange-native trigger orders. Perps use `positionTpsl`; spot uses `normalTpsl`. Position TP/SL view is reconstructed from open orders/orderStatus. | Historical local-monitor audit labels and the serialized `local_trigger` field remain for compatibility; they should be renamed/deprecated in a future cleanup to avoid confusion. |
@@ -58,7 +58,7 @@ must communicate only through internal APIs.
 All calls below were non-state-changing.
 
 - Vault status: unlocked in the frontend process; 2 configured entries.
-- Market capabilities: `xyz_perp`, `hl_perp`, and `spot` are exposed and marked
+- Market capabilities in this audit: `xyz_perp`, `hl_perp`, and `spot` are exposed and marked
   live-trading capable.
 - Market universe and quote:
   - `xyz_perp / xyz:NVDA`: OK.

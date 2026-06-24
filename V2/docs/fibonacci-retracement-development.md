@@ -41,8 +41,10 @@ fib_price(level) = swing_high - (swing_high - swing_low) * level
 fib_price_short(level) = swing_low + (swing_high - swing_low) * level
 ```
 
-做空仅适用于 `hl_perp` 和 `xyz_perp`；`spot` 前端必须把做空置灰不可点击，后端也必须拒绝
-spot short payload。
+做空适用于合约市场：`hl_perp`、`xyz_perp` 和 `cash_perp`；`spot` 前端
+必须把做空置灰不可点击，后端也必须拒绝 spot short payload。`cash_perp`
+对应 HIP-3 `cash` perp DEX，应在 UI 中显示为 `Cash Perps`，不要归类为
+trade[XYZ] 的 `xyz` DEX。
 
 常用档位：
 
@@ -76,7 +78,7 @@ spot short payload。
 
 基础版页面应提供以下字段：
 
-- 市场：`xyz_perp` / `hl_perp` / `spot`。
+- 市场：`xyz_perp` / `hl_perp` / `cash_perp` / `spot`。
 - 方向：做多回撤 / 做空反弹。spot 只允许做多，做空按钮置灰不可点击。
 - 账户：支持单账号和多账号，按当前市场过滤可用账户。
 - 交易对：下拉列表 + 搜索，显示交易所前端友好的 label，同时内部保存 canonical coin。

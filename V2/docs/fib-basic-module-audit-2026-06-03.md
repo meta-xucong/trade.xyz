@@ -112,6 +112,10 @@ Fib Basic is now valid as a dry-run automatic entry-intent module across
 entry signals, pass risk, and fan out dry-run worker submissions to multiple
 accounts through internal APIs.
 
+Later V2 market-capability work added `cash_perp` as a fourth selectable perp
+market for the HIP-3 `cash` DEX. It should follow the same perp rules as
+`xyz_perp` and `hl_perp`, with UI labeling kept distinct from trade[XYZ].
+
 It is still not fully accepted as an unattended live bot. The remaining gaps are:
 
 1. A persistent official websocket runtime for Fib prices, order updates, and

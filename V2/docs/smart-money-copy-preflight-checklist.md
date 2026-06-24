@@ -15,7 +15,9 @@ module. The authoritative implementation spec is
 ## Exchange Data Ready
 
 - Confirm target environment: `testnet` or `mainnet`.
-- Confirm target market scope: `xyz_perp`, `hl_perp`, or `spot`.
+- Confirm target market scope: `xyz_perp`, `hl_perp`, `cash_perp`, and/or
+  `spot`. `cash_perp` maps to the HIP-3 `cash` perp DEX; it is displayed as
+  Cash Perps and must not be treated as trade[XYZ] `xyz_perp`.
 - Confirm configured `hyperliquid.dex` for trade[XYZ].
 - Confirm leader watcher subscription budget, including local account streams.
 - Confirm fallback plan if unique user-specific WS subscription limits are hit.
