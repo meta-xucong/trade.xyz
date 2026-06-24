@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
 use crate::{
-    config::{AppConfig, MARKET_HL_PERP, MARKET_SPOT, MARKET_XYZ_PERP},
+    config::{AppConfig, MARKET_CASH_PERP, MARKET_HL_PERP, MARKET_SPOT, MARKET_XYZ_PERP},
     domain::now_ms,
     hyperliquid::{
         ClearinghouseState, OpenOrder, SpotClearinghouseState, UserFill, fetch_clearinghouse_state,
@@ -789,6 +789,12 @@ fn apply_open_orders_snapshot(state: &RealtimeState, config: &AppConfig, data: &
         .is_some_and(|dex| dex.eq_ignore_ascii_case(&config.hyperliquid.dex))
     {
         vec![MARKET_XYZ_PERP.to_string()]
+    } else if data
+        .dex
+        .as_deref()
+        .is_some_and(|dex| dex.eq_ignore_ascii_case("cash"))
+    {
+        vec![MARKET_CASH_PERP.to_string()]
     } else {
         vec![MARKET_HL_PERP.to_string(), MARKET_SPOT.to_string()]
     };
@@ -848,10 +854,14 @@ async fn seed_account_snapshot_inner(
     let xyz_orders = fetch_open_orders(&config.app.environment, &config.hyperliquid.dex, address)
         .await
         .unwrap_or_default();
+    let cash_orders = fetch_open_orders(&config.app.environment, "cash", address)
+        .await
+        .unwrap_or_default();
     let spot_and_default = split_default_and_spot_orders(default_orders);
     state.replace_open_orders(MARKET_HL_PERP, address, spot_and_default.default_perp);
     state.replace_open_orders(MARKET_SPOT, address, spot_and_default.spot);
     state.replace_open_orders(MARKET_XYZ_PERP, address, xyz_orders);
+    state.replace_open_orders(MARKET_CASH_PERP, address, cash_orders);
 
     if let Ok(default_state) =
         fetch_default_clearinghouse_state(&config.app.environment, address).await
@@ -862,6 +872,11 @@ async fn seed_account_snapshot_inner(
         fetch_clearinghouse_state(&config.app.environment, &config.hyperliquid.dex, address).await
     {
         state.update_clearinghouse_state(MARKET_XYZ_PERP, address, xyz_state);
+    }
+    if let Ok(cash_state) =
+        fetch_clearinghouse_state(&config.app.environment, "cash", address).await
+    {
+        state.update_clearinghouse_state(MARKET_CASH_PERP, address, cash_state);
     }
     if let Ok(spot_state) = fetch_spot_clearinghouse_state(&config.app.environment, address).await {
         state.update_spot_state(address, spot_state);
@@ -972,8 +987,12 @@ fn classify_open_order_market<'a>(
 
 fn classify_coin_market(coin: &str) -> &'static str {
     let coin = coin.trim();
-    if coin.contains(':') {
-        MARKET_XYZ_PERP
+    if let Some((dex, _symbol)) = coin.split_once(':') {
+        if dex.trim().eq_ignore_ascii_case("cash") {
+            MARKET_CASH_PERP
+        } else {
+            MARKET_XYZ_PERP
+        }
     } else if coin.contains('/') || coin.starts_with('@') {
         MARKET_SPOT
     } else {
@@ -987,6 +1006,8 @@ fn market_id_for_clearinghouse_dex(dex: &str, xyz_dex: &str) -> Option<&'static 
         Some(MARKET_HL_PERP)
     } else if !xyz_dex.trim().is_empty() && dex == xyz_dex.trim().to_ascii_lowercase() {
         Some(MARKET_XYZ_PERP)
+    } else if dex == "cash" {
+        Some(MARKET_CASH_PERP)
     } else {
         None
     }

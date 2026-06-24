@@ -26,8 +26,28 @@ $prefix = ".codex-longrun\persistent-live-soak-$runId"
 $summaryPath = "$prefix-summary.jsonl"
 $logPath = "$prefix-run.log"
 $notificationSettingsPath = ".codex-longrun\notification-settings.json"
+$pidPath = ".codex-longrun\persistent-live-soak-detached-current.pid"
+$lockPath = ".codex-longrun\persistent-live-soak.lock"
+New-Item -ItemType Directory -Force -Path ".codex-longrun" | Out-Null
+$soakLockStream = $null
+try {
+    $soakLockStream = [System.IO.File]::Open(
+        $lockPath,
+        [System.IO.FileMode]::OpenOrCreate,
+        [System.IO.FileAccess]::ReadWrite,
+        [System.IO.FileShare]::None
+    )
+    $lockBytes = [System.Text.Encoding]::ASCII.GetBytes("$PID`n")
+    $soakLockStream.SetLength(0)
+    $soakLockStream.Write($lockBytes, 0, $lockBytes.Length)
+    $soakLockStream.Flush()
+} catch {
+    Write-Host "$(Get-Date -Format o) another persistent live soak is already holding $lockPath; refusing duplicate start: $($_.Exception.Message)"
+    exit 17
+}
+Set-Content -LiteralPath $pidPath -Value "$PID" -Encoding ascii
 if ([string]::IsNullOrWhiteSpace($PersistencePath)) {
-    $persistencePath = "$prefix-snapshot.json"
+    $persistencePath = ".codex-longrun\persistent-live-soak-resume-current-snapshot.json"
 } else {
     $persistencePath = $PersistencePath
 }
@@ -209,7 +229,29 @@ if ($copySettings -and $copySettings.markets) {
     }
 }
 if ($settingsMarkets.Count -eq 0) {
-    $settingsMarkets = @("xyz_perp", "hl_perp", "spot")
+    $settingsMarkets = @("xyz_perp", "hl_perp", "cash_perp", "spot")
+}
+
+$settingsAccounts = @()
+if ($copySettings -and $copySettings.account_ids) {
+    foreach ($accountId in @($copySettings.account_ids)) {
+        $text = ([string]$accountId).Trim()
+        if ([string]::IsNullOrWhiteSpace($text)) {
+            continue
+        }
+        if ($settingsAccounts -notcontains $text) {
+            $settingsAccounts += $text
+        }
+    }
+}
+if ($settingsAccounts.Count -eq 0 -and $copySettings -and $copySettings.account_id) {
+    $text = ([string]$copySettings.account_id).Trim()
+    if (-not [string]::IsNullOrWhiteSpace($text)) {
+        $settingsAccounts += $text
+    }
+}
+if ($settingsAccounts.Count -eq 0) {
+    $settingsAccounts = @("addr_a")
 }
 
 function Invoke-BotRound {
@@ -309,7 +351,12 @@ $marketArgs = @()
 foreach ($market in $settingsMarkets) {
     $marketArgs += @("--market", $market)
 }
-Write-SoakLog "copy settings leaders=$($leaderArgs.Count / 2) markets=$($settingsMarkets -join ',') leader_notional_usd=$leaderNotionalUsd"
+$accountArgs = @()
+foreach ($accountId in $settingsAccounts) {
+    $accountArgs += @("--account-id", $accountId)
+}
+$maxLiveOrders = [Math]::Max(1, $settingsAccounts.Count)
+Write-SoakLog "copy settings leaders=$($leaderArgs.Count / 2) accounts=$($settingsAccounts -join ',') markets=$($settingsMarkets -join ',') leader_notional_usd=$leaderNotionalUsd max_live_orders=$maxLiveOrders"
 
 $round = 0
 $consecutiveDegradedWatcherRounds = 0
@@ -328,8 +375,7 @@ while ($true) {
     $botArgs = @(
         "copy-live-daemon-supervisor",
         "--config", "V2\config\local.toml"
-    ) + $leaderArgs + $marketArgs + @(
-        "--account-id", "addr_a",
+    ) + $leaderArgs + $marketArgs + $accountArgs + @(
         "--side", "buy",
         "--persistence", $persistencePath,
         "--shadow-history", $shadowPath,
@@ -337,7 +383,7 @@ while ($true) {
         "--leader-size", "1",
         "--duration-secs", "$WindowSecs",
         "--max-events", "$MaxEvents",
-        "--max-live-orders", "1",
+        "--max-live-orders", "$maxLiveOrders",
         "--max-total-notional-usd", "$MaxTotalNotionalUsd",
         "--max-total-fees-usd", "$MaxTotalFeesUsd",
         "--max-slippage-bps", "50",
@@ -367,7 +413,20 @@ while ($true) {
     }
 
     $report = Read-JsonObjectFile -Path $reportPath
-    $submittedCount = @($report.persistent_live_submit.submitted_reports).Count
+    $submittedReports = @($report.persistent_live_submit.submitted_reports)
+    $submittedCount = @($submittedReports | Where-Object {
+        $kind = [string]$_.kind
+        $dryRun = $false
+        if ($null -ne $_.dry_run) {
+            $dryRun = [bool]$_.dry_run
+        }
+        $kind -eq "submitted" -and -not $dryRun
+    }).Count
+    $preSubmitSkippedCount = @($submittedReports | Where-Object {
+        $kind = [string]$_.kind
+        $message = [string]$_.message
+        $kind -eq "error" -and $message.ToLowerInvariant().Contains("copy submit skipped before exchange")
+    }).Count
     $evidenceCount = @($report.persistent_live_submit.order_evidence).Count
     $cleanupCount = @($report.persistent_live_submit.cleanup_runbooks).Count
     $cleanupErrors = @($report.persistent_live_submit.cleanup_errors).Count
@@ -418,6 +477,7 @@ while ($true) {
         ok = [bool]$report.ok
         ready_for_unattended_submit = [bool]$report.submit_evidence_contract.ready_for_unattended_submit
         submitted_reports = $submittedCount
+        pre_submit_skipped_reports = $preSubmitSkippedCount
         order_evidence = $evidenceCount
         cleanup_runbooks = $cleanupCount
         cleanup_errors = $cleanupErrors
@@ -438,7 +498,7 @@ while ($true) {
     }
     $summaryLine = $summary | ConvertTo-Json -Compress
     [System.IO.File]::AppendAllText($summaryPath, "$summaryLine`n", [System.Text.UTF8Encoding]::new($false))
-    Write-SoakLog "round=$round ok=$($summary.ok) submitted=$submittedCount evidence=$evidenceCount cleanup_errors=$cleanupErrors final_reconcile_health=$finalReconcileHealth hold_positions_after_submit=$($summary.hold_positions_after_submit) ready=$($summary.ready_for_unattended_submit)"
+    Write-SoakLog "round=$round ok=$($summary.ok) submitted=$submittedCount pre_submit_skipped=$preSubmitSkippedCount evidence=$evidenceCount cleanup_errors=$cleanupErrors final_reconcile_health=$finalReconcileHealth hold_positions_after_submit=$($summary.hold_positions_after_submit) ready=$($summary.ready_for_unattended_submit)"
     if ($failedChecks.Count -gt 0) {
         Write-SoakLog "round=$round failed_checks=$($failedChecks -join ' | ')"
     }

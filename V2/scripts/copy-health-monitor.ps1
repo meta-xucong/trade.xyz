@@ -1,5 +1,5 @@
 param(
-    [string]$BaseUrl = "http://127.0.0.1:18844",
+    [string]$BaseUrl = "http://127.0.0.1:18845",
     [int]$PollSecs = 60,
     [int]$WindowSecs = 600,
     [int]$StaleRoundGraceSecs = 900,
@@ -8,12 +8,17 @@ param(
     [double]$MaxTotalNotionalUsd = 700.0,
     [double]$MaxTotalFeesUsd = 1.0,
     [string]$AccountId = "addr_a",
+    [string[]]$AccountIds = @(),
     [string[]]$Leaders = @(
         "0x6d6d7c05ef7f31b31b618400495b4ce4092a5089",
-        "0x6ac0b46b32dc429dbd129a503292f88649d2b8a0"
+        "0x6ac0b46b32dc429dbd129a503292f88649d2b8a0",
+        "0x117a7c349b953d54154312d97a20c9a2769adbd4",
+        "0x9dead8fffcbf130e7658f672d2c081d91178d617",
+        "0xd8c5228c515db3043dfa0c8cd6f22450ee9a99b0"
     ),
-    [string[]]$Markets = @("xyz_perp", "hl_perp", "spot"),
+    [string[]]$Markets = @("xyz_perp", "hl_perp", "cash_perp", "spot"),
     [double]$CopyRatio = 0.2,
+    [string]$SettingsPath = ".codex-longrun\copy-ui-settings.json",
     [string]$PersistencePath = ".codex-longrun\persistent-live-soak-resume-current-snapshot.json",
     [string]$LogPath = ".codex-longrun\copy-health-monitor.log",
     [string]$VaultPasswordEnv = "TRADE_XYZ_VAULT_PASSWORD",
@@ -25,6 +30,7 @@ $projectRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 Set-Location $projectRoot
 New-Item -ItemType Directory -Force -Path ".codex-longrun" | Out-Null
 $notificationSettingsPath = ".codex-longrun\notification-settings.json"
+$copyLiveSoakPausePath = ".codex-longrun\copy-live-soak-paused.flag"
 
 function Write-MonitorLog {
     param([string]$Message)
@@ -134,7 +140,24 @@ function Get-LatestRunDiagnostic {
             $parts += "report_ok=$($report.ok)"
             $parts += "watcher_status=$($report.watcher_status)"
             $parts += "events=$($report.events_received)"
-            $parts += "submitted=$(@($report.persistent_live_submit.submitted_reports).Count)"
+            $submittedReports = @($report.persistent_live_submit.submitted_reports)
+            $submittedCount = @($submittedReports | Where-Object {
+                $kind = [string]$_.kind
+                $dryRun = $false
+                if ($null -ne $_.dry_run) {
+                    $dryRun = [bool]$_.dry_run
+                }
+                $kind -eq "submitted" -and -not $dryRun
+            }).Count
+            $preSubmitSkippedCount = @($submittedReports | Where-Object {
+                $kind = [string]$_.kind
+                $message = [string]$_.message
+                $kind -eq "error" -and $message.ToLowerInvariant().Contains("copy submit skipped before exchange")
+            }).Count
+            $parts += "submitted=$submittedCount"
+            if ($preSubmitSkippedCount -gt 0) {
+                $parts += "pre_submit_skipped=$preSubmitSkippedCount"
+            }
             $parts += "evidence=$(@($report.persistent_live_submit.order_evidence).Count)"
             if ($failed.Count -gt 0) {
                 $parts += "failed_checks=$($failed -join ' | ')"
@@ -189,17 +212,32 @@ function Test-SoakProcessCommand {
         return $false
     }
     $commandLine = [string]$Process.CommandLine
-    $isWrapper = $Process.Name -match "^(powershell|pwsh)\.exe$" `
-        -and $commandLine -like "*run-persistent-live-soak.ps1*" `
-        -and $commandLine -match "(?i)(^|\\s)-File\\s+" `
-        -and $commandLine -notlike "*Get-CimInstance*"
+    $isWrapper = Test-SoakWrapperCommand $Process
     $isRoundChild = $Process.Name -eq "trade_xyz_bot_v2.exe" `
         -and $commandLine -like "*copy-live-daemon-supervisor*"
     return $isWrapper -or $isRoundChild
 }
 
+function Test-SoakWrapperCommand {
+    param([object]$Process)
+    if ($null -eq $Process) {
+        return $false
+    }
+    $commandLine = [string]$Process.CommandLine
+    return $Process.Name -match "^(powershell|pwsh)\.exe$" `
+        -and $commandLine -like "*run-persistent-live-soak.ps1*" `
+        -and $commandLine -match "(?i)(^|\\s)-File\\s+" `
+        -and $commandLine -notlike "*Get-CimInstance*"
+}
+
 function Test-SoakProcessRunning {
     return $null -ne (Get-SoakProcess)
+}
+
+function Get-SoakProcesses {
+    return Get-CimInstance Win32_Process | Where-Object {
+        Test-SoakProcessCommand $_
+    } | Sort-Object CreationDate -Descending
 }
 
 function Get-LatestSoakRunLog {
@@ -248,14 +286,110 @@ function Ensure-VaultUnlocked {
     }
 }
 
+function Get-CopyUiSettings {
+    if ([string]::IsNullOrWhiteSpace($SettingsPath) -or -not (Test-Path -LiteralPath $SettingsPath)) {
+        return $null
+    }
+    try {
+        return Get-Content -LiteralPath $SettingsPath -Raw -Encoding utf8 | ConvertFrom-Json
+    } catch {
+        Write-MonitorLog "copy settings parse failed path=$SettingsPath error=$($_.Exception.Message)"
+        return $null
+    }
+}
+
+function Get-RuntimeAccountIds {
+    $runtimeAccountIds = @()
+    if ($AccountIds.Count -gt 0) {
+        foreach ($accountId in $AccountIds) {
+            $text = ([string]$accountId).Trim()
+            if (-not [string]::IsNullOrWhiteSpace($text) -and $runtimeAccountIds -notcontains $text) {
+                $runtimeAccountIds += $text
+            }
+        }
+    }
+    if ($runtimeAccountIds.Count -eq 0) {
+        $copySettings = Get-CopyUiSettings
+        if ($copySettings -and $copySettings.account_ids) {
+            foreach ($accountId in @($copySettings.account_ids)) {
+                $text = ([string]$accountId).Trim()
+                if (-not [string]::IsNullOrWhiteSpace($text) -and $runtimeAccountIds -notcontains $text) {
+                    $runtimeAccountIds += $text
+                }
+            }
+        }
+        if ($runtimeAccountIds.Count -eq 0 -and $copySettings -and $copySettings.account_id) {
+            $text = ([string]$copySettings.account_id).Trim()
+            if (-not [string]::IsNullOrWhiteSpace($text)) {
+                $runtimeAccountIds += $text
+            }
+        }
+    }
+    if ($runtimeAccountIds.Count -eq 0) {
+        $runtimeAccountIds = @($AccountId)
+    }
+    return $runtimeAccountIds
+}
+
+function Get-RuntimeLeaders {
+    $copySettings = Get-CopyUiSettings
+    $runtimeLeaders = @()
+    if ($copySettings -and $copySettings.leaders) {
+        foreach ($leader in @($copySettings.leaders)) {
+            $text = ([string]$leader).Trim()
+            if (-not [string]::IsNullOrWhiteSpace($text) -and $runtimeLeaders -notcontains $text) {
+                $runtimeLeaders += $text
+            }
+        }
+    }
+    if ($runtimeLeaders.Count -eq 0) {
+        foreach ($leader in $Leaders) {
+            $text = ([string]$leader).Trim()
+            if (-not [string]::IsNullOrWhiteSpace($text) -and $runtimeLeaders -notcontains $text) {
+                $runtimeLeaders += $text
+            }
+        }
+    }
+    return $runtimeLeaders
+}
+
+function Get-RuntimeMarkets {
+    $copySettings = Get-CopyUiSettings
+    $runtimeMarkets = @()
+    if ($copySettings -and $copySettings.markets) {
+        foreach ($market in @($copySettings.markets)) {
+            $text = ([string]$market).Trim()
+            if (-not [string]::IsNullOrWhiteSpace($text) -and $runtimeMarkets -notcontains $text) {
+                $runtimeMarkets += $text
+            }
+        }
+    }
+    if ($runtimeMarkets.Count -eq 0) {
+        foreach ($market in $Markets) {
+            $text = ([string]$market).Trim()
+            if (-not [string]::IsNullOrWhiteSpace($text) -and $runtimeMarkets -notcontains $text) {
+                $runtimeMarkets += $text
+            }
+        }
+    }
+    if ($runtimeMarkets.Count -eq 0) {
+        $runtimeMarkets = @("xyz_perp", "hl_perp", "cash_perp", "spot")
+    }
+    return $runtimeMarkets
+}
+
 function Set-CopyRuntimeSettings {
+    $runtimeAccountIds = Get-RuntimeAccountIds
+    $runtimeLeaders = Get-RuntimeLeaders
+    $runtimeMarkets = Get-RuntimeMarkets
     $settings = Invoke-Json "/api/copy/settings" "POST" @{
-        leaders = $Leaders
-        markets = $Markets
+        leaders = $runtimeLeaders
+        markets = $runtimeMarkets
         copy_ratio = $CopyRatio
         principal_cap_usd = $PrincipalCapUsd
         leverage = $Leverage
-        account_id = $AccountId
+        account_id = $runtimeAccountIds[0]
+        account_ids = $runtimeAccountIds
     }
     if (-not $settings.ok) {
         throw "copy settings update failed: $($settings.error)"
@@ -264,7 +398,7 @@ function Set-CopyRuntimeSettings {
     $manual = Invoke-Json "/api/manual-settings" "POST" @{
         max_manual_order_notional_usd = $notionalCap
         account_max_order_notional_usd = $notionalCap
-        account_ids = @($AccountId)
+        account_ids = $runtimeAccountIds
     }
     if (-not $manual.ok) {
         throw "manual settings update failed: $($manual.error)"
@@ -273,11 +407,18 @@ function Set-CopyRuntimeSettings {
 
 function Set-LatestSoakPid {
     param([datetime]$StartedAt)
-    Start-Sleep -Seconds 2
-    $proc = Get-CimInstance Win32_Process | Where-Object {
-        (Test-SoakProcessCommand $_) -and
-        $_.CreationDate -ge $StartedAt.AddSeconds(-5)
-    } | Sort-Object CreationDate -Descending | Select-Object -First 1
+    $deadline = (Get-Date).AddSeconds(12)
+    $proc = $null
+    while ((Get-Date) -lt $deadline -and $null -eq $proc) {
+        Start-Sleep -Milliseconds 750
+        $proc = Get-CimInstance Win32_Process | Where-Object {
+            (Test-SoakWrapperCommand $_) -and
+            $_.CreationDate -ge $StartedAt.AddSeconds(-5)
+        } | Sort-Object CreationDate -Descending | Select-Object -First 1
+    }
+    if (-not $proc) {
+        $proc = Get-SoakProcess
+    }
     if ($proc) {
         Set-Content -LiteralPath ".codex-longrun\persistent-live-soak-detached-current.pid" -Value ([string]$proc.ProcessId) -Encoding ascii
         return $proc.ProcessId
@@ -286,12 +427,18 @@ function Set-LatestSoakPid {
 }
 
 function Start-CopyLiveSoak {
+    if (Test-CopyLiveSoakPaused) {
+        Write-MonitorLog "restart skipped; copy live soak is paused by operator"
+        return
+    }
     $existing = Get-SoakProcess
     if ($existing) {
         Write-MonitorLog "restart skipped; soak process already running pid=$($existing.ProcessId)"
         return
     }
     Ensure-VaultUnlocked
+    $runtimeAccountIds = Get-RuntimeAccountIds
+    $runtimeMarkets = Get-RuntimeMarkets
     Set-CopyRuntimeSettings
     $startedAt = Get-Date
     $resolvedBotExePath = $BotExePath
@@ -313,14 +460,33 @@ function Start-CopyLiveSoak {
     $start = Invoke-Json "/api/copy/live-soak/start" "POST" $body
     if ($start.ok) {
         $soakPid = Set-LatestSoakPid $startedAt
-        Write-MonitorLog "restart requested run_id=$($start.data.status.run_id) pid=$soakPid principal_cap=$PrincipalCapUsd leverage=$Leverage markets=$($Markets -join ',') max_total_notional=$MaxTotalNotionalUsd max_total_fees=$MaxTotalFeesUsd"
+        if ($soakPid) {
+            Write-MonitorLog "restart requested run_id=$($start.data.status.run_id) pid=$soakPid accounts=$($runtimeAccountIds -join ',') principal_cap=$PrincipalCapUsd leverage=$Leverage markets=$($runtimeMarkets -join ',') max_total_notional=$MaxTotalNotionalUsd max_total_fees=$MaxTotalFeesUsd"
+            return
+        }
+        $existingAfterStart = Get-SoakProcess
+        if ($existingAfterStart) {
+            Set-Content -LiteralPath ".codex-longrun\persistent-live-soak-detached-current.pid" -Value ([string]$existingAfterStart.ProcessId) -Encoding ascii
+            Write-MonitorLog "frontend start returned ok and an existing soak process was found before fallback pid=$($existingAfterStart.ProcessId) run_id=$($start.data.status.run_id)"
+            return
+        }
+        Write-MonitorLog "frontend start returned ok but no soak process was detected after wait; falling back to direct soak script run_id=$($start.data.status.run_id)"
+    } else {
+        Write-MonitorLog "frontend start failed; falling back to direct soak script: $($start.error)"
+    }
+    $existingBeforeFallback = Get-SoakProcess
+    if ($existingBeforeFallback) {
+        Set-Content -LiteralPath ".codex-longrun\persistent-live-soak-detached-current.pid" -Value ([string]$existingBeforeFallback.ProcessId) -Encoding ascii
+        Write-MonitorLog "direct soak fallback skipped; soak process appeared pid=$($existingBeforeFallback.ProcessId)"
         return
     }
-    Write-MonitorLog "frontend start failed; falling back to direct soak script: $($start.error)"
-    $script = if (Test-Path ".codex-longrun\run-persistent-live-soak.ps1") {
-        ".codex-longrun\run-persistent-live-soak.ps1"
-    } else {
+    if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($VaultPasswordEnv))) {
+        throw "direct live soak fallback is blocked because $VaultPasswordEnv is not set in the monitor process; restart through the frontend/Vault session or set the env var before using direct fallback"
+    }
+    $script = if (Test-Path "V2\scripts\run-persistent-live-soak.ps1") {
         "V2\scripts\run-persistent-live-soak.ps1"
+    } else {
+        ".codex-longrun\run-persistent-live-soak.ps1"
     }
     $args = @(
         "-NoProfile",
@@ -337,7 +503,7 @@ function Start-CopyLiveSoak {
         "-MaxTotalFeesUsd",
         [string]$MaxTotalFeesUsd,
         "-SettingsPath",
-        ".codex-longrun/copy-ui-settings.json",
+        $SettingsPath,
         "-PersistencePath",
         $PersistencePath,
         "-HoldPositionsAfterSubmit"
@@ -347,21 +513,65 @@ function Start-CopyLiveSoak {
     }
     $process = Start-Process -FilePath powershell -ArgumentList $args -WorkingDirectory $projectRoot -WindowStyle Hidden -PassThru
     Set-Content -LiteralPath ".codex-longrun\persistent-live-soak-detached-current.pid" -Value ([string]$process.Id) -Encoding ascii
-    Write-MonitorLog "direct soak restart requested pid=$($process.Id) principal_cap=$PrincipalCapUsd leverage=$Leverage markets=$($Markets -join ',') max_total_notional=$MaxTotalNotionalUsd max_total_fees=$MaxTotalFeesUsd bot_exe=$resolvedBotExePath"
+    Write-MonitorLog "direct soak restart requested pid=$($process.Id) accounts=$($runtimeAccountIds -join ',') principal_cap=$PrincipalCapUsd leverage=$Leverage markets=$($runtimeMarkets -join ',') max_total_notional=$MaxTotalNotionalUsd max_total_fees=$MaxTotalFeesUsd bot_exe=$resolvedBotExePath"
 }
 
-Write-MonitorLog "monitor started poll_secs=$PollSecs base_url=$BaseUrl principal_cap=$PrincipalCapUsd leverage=$Leverage markets=$($Markets -join ',') max_total_notional=$MaxTotalNotionalUsd max_total_fees=$MaxTotalFeesUsd bot_exe=$BotExePath"
+function Stop-SoakProcessesForRestart {
+    param([string]$Reason)
+    $processes = @(Get-SoakProcesses)
+    if ($processes.Count -eq 0) {
+        Write-MonitorLog "restart cleanup found no existing soak process reason=$Reason"
+        return
+    }
+    $ids = @($processes | ForEach-Object { $_.ProcessId })
+    Write-MonitorLog "restart cleanup stopping existing soak processes reason=$Reason pids=$($ids -join ',')"
+    foreach ($process in $processes) {
+        try {
+            Stop-Process -Id $process.ProcessId -Force -ErrorAction Stop
+        } catch {
+            Write-MonitorLog "restart cleanup stop failed pid=$($process.ProcessId) error=$($_.Exception.Message)"
+        }
+    }
+    Start-Sleep -Seconds 3
+    $remaining = @(Get-SoakProcesses)
+    if ($remaining.Count -gt 0) {
+        $remainingIds = @($remaining | ForEach-Object { $_.ProcessId })
+        throw "existing soak process(es) still running after restart cleanup: $($remainingIds -join ',')"
+    }
+}
+
+function Restart-CopyLiveSoakAfterStale {
+    param(
+        [string]$Reason,
+        [string]$Diagnostic
+    )
+    Send-MonitorNotification -Status "stopped" -Reason $Reason -Detail $Diagnostic
+    Stop-SoakProcessesForRestart -Reason $Reason
+    Start-CopyLiveSoak
+}
+
+function Test-CopyLiveSoakPaused {
+    return Test-Path -LiteralPath $copyLiveSoakPausePath
+}
+
+$monitorAccountIds = Get-RuntimeAccountIds
+$monitorMarkets = Get-RuntimeMarkets
+Write-MonitorLog "monitor started poll_secs=$PollSecs base_url=$BaseUrl accounts=$($monitorAccountIds -join ',') principal_cap=$PrincipalCapUsd leverage=$Leverage markets=$($monitorMarkets -join ',') max_total_notional=$MaxTotalNotionalUsd max_total_fees=$MaxTotalFeesUsd bot_exe=$BotExePath"
 
 while ($true) {
     try {
+        if (Test-CopyLiveSoakPaused) {
+            Write-MonitorLog "paused_by_operator; automatic restart disabled"
+            Start-Sleep -Seconds $PollSecs
+            continue
+        }
         $status = Invoke-Json "/api/copy/live-soak/status"
         $soakProcess = Get-SoakProcess
         if ($status.ok -and $status.data.running -and $null -ne $soakProcess -and (Test-SoakHeartbeatStale)) {
             $diagnostic = "soak_heartbeat_stale; $(Get-SoakHeartbeatDiagnostic)"
             Write-MonitorLog "detected stopped soak; diagnostic: $diagnostic"
-            Send-MonitorNotification -Status "stopped" -Reason "soak_heartbeat_stale" -Detail $diagnostic
             try {
-                Start-CopyLiveSoak
+                Restart-CopyLiveSoakAfterStale -Reason "soak_heartbeat_stale" -Diagnostic $diagnostic
             } catch {
                 Send-MonitorNotification -Status "failed" -Reason "restart_failed" -Detail $_.Exception.Message
                 throw
@@ -381,9 +591,8 @@ while ($true) {
         } elseif ((Test-SoakProcessRunning) -and (Test-SoakHeartbeatStale)) {
             $diagnostic = "soak_heartbeat_stale_without_status; $(Get-SoakHeartbeatDiagnostic)"
             Write-MonitorLog "detected stopped soak; diagnostic: $diagnostic"
-            Send-MonitorNotification -Status "stopped" -Reason "soak_heartbeat_stale" -Detail $diagnostic
             try {
-                Start-CopyLiveSoak
+                Restart-CopyLiveSoakAfterStale -Reason "soak_heartbeat_stale" -Diagnostic $diagnostic
             } catch {
                 Send-MonitorNotification -Status "failed" -Reason "restart_failed" -Detail $_.Exception.Message
                 throw
@@ -409,9 +618,8 @@ while ($true) {
             if (Test-SoakHeartbeatStale) {
                 $diagnostic = "status_exception=$($_.Exception.Message); $(Get-SoakHeartbeatDiagnostic)"
                 Write-MonitorLog "detected stopped soak; diagnostic: $diagnostic"
-                Send-MonitorNotification -Status "stopped" -Reason "soak_heartbeat_stale" -Detail $diagnostic
                 try {
-                    Start-CopyLiveSoak
+                    Restart-CopyLiveSoakAfterStale -Reason "soak_heartbeat_stale" -Diagnostic $diagnostic
                 } catch {
                     Send-MonitorNotification -Status "failed" -Reason "restart_failed" -Detail $_.Exception.Message
                     throw

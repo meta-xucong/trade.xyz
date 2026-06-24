@@ -36,6 +36,7 @@ const COPY_CANARY_FILL_LOOKAHEAD_MS: u64 = 180_000;
 const COPY_RECONCILE_RETRIES: usize = 3;
 const COPY_RECONCILE_RETRY_DELAY_MS: u64 = 1_500;
 const COPY_DAEMON_MARGIN_BUFFER_RATIO: f64 = 0.10;
+const COPY_DAEMON_FEE_BUFFER_RATIO: f64 = 0.001;
 
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
@@ -47,6 +48,7 @@ struct Cli {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::HashSet,
         fs,
         process::Command,
         sync::atomic::{AtomicU64, Ordering},
@@ -67,13 +69,15 @@ mod tests {
         CopyShadowSmokeOptions, append_unique_copy_daemon_would_submit_orders,
         append_unique_copy_daemon_would_submit_refs, approved_copy_daemon_order_from_ref,
         build_synthetic_copy_shadow_records, copy_bounded_live_window_ok,
-        copy_daemon_live_leverage_update_options, copy_daemon_submitted_reports_needing_cleanup,
-        copy_execution_canary_report, copy_live_daemon_live_submit_health_ok,
+        copy_daemon_live_leverage_update_options,
+        copy_daemon_live_leverage_update_options_with_max,
+        copy_daemon_submitted_reports_needing_cleanup, copy_execution_canary_report,
+        copy_live_daemon_error_is_safe_pre_submit_skip, copy_live_daemon_live_submit_health_ok,
         copy_live_daemon_merge_persistence_snapshots_for_save,
         copy_live_daemon_merge_persistent_live_submit_reports,
-        copy_live_daemon_open_notional_usd_from_refs,
-        copy_live_daemon_persistence_snapshot_for_save, copy_live_daemon_persistent_live_submit,
-        copy_live_daemon_persistent_submit_dry_run,
+        copy_live_daemon_open_notional_usd_from_refs, copy_live_daemon_pending_plan_refs,
+        copy_live_daemon_pending_suppressed_refs, copy_live_daemon_persistence_snapshot_for_save,
+        copy_live_daemon_persistent_live_submit, copy_live_daemon_persistent_submit_dry_run,
         copy_live_daemon_persistent_submit_snapshot_safe_to_save,
         copy_live_daemon_prepare_refs_for_follow_position_limits,
         copy_live_daemon_reconcile_healthy_for_mode,
@@ -81,7 +85,8 @@ mod tests {
         copy_live_daemon_reduce_only_matching_position_notional_usd,
         copy_live_daemon_reduce_only_ref_has_matching_position,
         copy_live_daemon_submit_evidence_contract, copy_live_daemon_submit_plan_contract,
-        copy_live_daemon_supervisor_ok, copy_live_daemon_suppress_refs_rejected_by_submit_contract,
+        copy_live_daemon_submitted_report_cloids, copy_live_daemon_supervisor_ok,
+        copy_live_daemon_suppress_refs_rejected_by_submit_contract,
         copy_live_daemon_watcher_progress_check, copy_live_stability_round_submission_totals,
         copy_live_stability_soak_ok, copy_shadow_smoke_check, normalize_report_zero,
         partition_copy_live_daemon_would_submit_refs, plan_copy_daemon_acceptance_order_refs,
@@ -1326,6 +1331,121 @@ mod tests {
     }
 
     #[test]
+    fn copy_live_daemon_live_submit_health_accepts_safe_pre_submit_skip() {
+        let report = CopyLiveDaemonPersistentLiveSubmitReport {
+            ok: false,
+            mode: "persistent_live_submit".to_string(),
+            submit_requested: true,
+            submit_plan_contract_ok: true,
+            submitted_reports: vec![crate::domain::WorkerReport::Error(
+                crate::domain::WorkerError {
+                    worker_id: "worker-addr_b".to_string(),
+                    account_id: "addr_b".to_string(),
+                    message:
+                        "exchange returned action-level order error: Order must have minimum value of $10. asset=110052"
+                            .to_string(),
+                    error_at_ms: 1782240035380,
+                },
+            )],
+            order_evidence: Vec::new(),
+            cleanup_runbooks: Vec::new(),
+            cleanup_errors: Vec::new(),
+            ledger_reconciliations: Vec::new(),
+            ledger_reconciliation_snapshot:
+                crate::strategies::smart_money::CopyPersistenceSnapshot::new(
+                    1782240035380,
+                    Vec::new(),
+                    &crate::strategies::smart_money::CopyLedger::new(),
+                ),
+            checks: vec![
+                CopyShadowSmokeCheck {
+                    name: "submitted_reports".to_string(),
+                    ok: false,
+                    detail: "0 live submitted report(s), 1 pre-submit skipped ref(s)"
+                        .to_string(),
+                },
+                CopyShadowSmokeCheck {
+                    name: "persistent_live_submit_chunks".to_string(),
+                    ok: false,
+                    detail: "1 persistent live submit chunk(s) merged".to_string(),
+                },
+            ],
+        };
+
+        assert!(copy_live_daemon_live_submit_health_ok(&report));
+    }
+
+    #[test]
+    fn copy_live_daemon_live_submit_health_accepts_evidenced_submit_plus_safe_skip() {
+        let report = CopyLiveDaemonPersistentLiveSubmitReport {
+            ok: false,
+            mode: "persistent_live_submit".to_string(),
+            submit_requested: true,
+            submit_plan_contract_ok: true,
+            submitted_reports: vec![
+                crate::domain::WorkerReport::Submitted(crate::domain::OrderSubmitted {
+                    signal_id: "signal".to_string(),
+                    intent_id: "intent".to_string(),
+                    worker_id: "worker-addr_a".to_string(),
+                    account_id: "addr_a".to_string(),
+                    cloid: "3e45b7c8-8322-5e0c-81a2-7cafc276de89".to_string(),
+                    coin: "xyz:SP500".to_string(),
+                    side: crate::domain::OrderSide::Buy,
+                    notional_usd: 14.7592,
+                    submitted_price: Some(7379.6),
+                    submitted_size: Some(0.002),
+                    exchange_status: Some("filled".to_string()),
+                    oid: Some(477403388270),
+                    filled_size: Some(0.002),
+                    avg_fill_price: Some(7379.6),
+                    dry_run: false,
+                    submitted_at_ms: 1782239875081,
+                }),
+                crate::domain::WorkerReport::Error(crate::domain::WorkerError {
+                    worker_id: "worker-addr_b".to_string(),
+                    account_id: "addr_b".to_string(),
+                    message:
+                        "copy submit skipped before exchange: addr_b xyz:SP500 requested_notional=11.172000 effective_notional=7.416100 below exchange minimum 10.000000"
+                            .to_string(),
+                    error_at_ms: 1782239875081,
+                }),
+            ],
+            order_evidence: vec![CopyExecutionCanaryOrderEvidence {
+                account_id: "addr_a".to_string(),
+                worker_id: "worker-addr_a".to_string(),
+                signal_id: "signal".to_string(),
+                coin: "xyz:SP500".to_string(),
+                oid: Some(477403388270),
+                cloid: "3e45b7c8-8322-5e0c-81a2-7cafc276de89".to_string(),
+                order_status: Some(crate::hyperliquid::OrderStatusResponse {
+                    status: "order".to_string(),
+                    order: None,
+                }),
+                user_fill_count: 1,
+                matching_fill_count: 1,
+                matching_fills: Vec::new(),
+                error: None,
+            }],
+            cleanup_runbooks: Vec::new(),
+            cleanup_errors: Vec::new(),
+            ledger_reconciliations: Vec::new(),
+            ledger_reconciliation_snapshot:
+                crate::strategies::smart_money::CopyPersistenceSnapshot::new(
+                    1782239875081,
+                    Vec::new(),
+                    &crate::strategies::smart_money::CopyLedger::new(),
+                ),
+            checks: vec![CopyShadowSmokeCheck {
+                name: "submitted_reports".to_string(),
+                ok: false,
+                detail: "1 live submitted report(s), 1 pre-submit skipped ref(s)".to_string(),
+            }],
+        };
+
+        assert!(copy_live_daemon_live_submit_health_ok(&report));
+    }
+
+    #[test]
     fn copy_live_daemon_follow_position_mode_allows_bounded_open_position_health() {
         let mut options = CopyLiveDaemonSupervisorOptions {
             leaders: Vec::new(),
@@ -1754,6 +1874,126 @@ mod tests {
     }
 
     #[test]
+    fn copy_live_daemon_ref_partition_keeps_multi_account_fanout_together_under_cap() {
+        let options = CopyLiveDaemonSupervisorOptions {
+            leaders: Vec::new(),
+            account_ids: vec!["addr_a".to_string(), "addr_b".to_string()],
+            local_account_id: Some("addr_a".to_string()),
+            markets: Vec::new(),
+            coin: "xyz:XYZ100".to_string(),
+            side: crate::domain::OrderSide::Buy,
+            persistence_path: std::env::temp_dir().join("unused-daemon-fanout-partition.json"),
+            shadow_history_path: std::env::temp_dir().join("unused-daemon-fanout-partition.jsonl"),
+            leader_notional_usd: 120.0,
+            leader_size: 1.0,
+            live_gate: true,
+            allow_live_submit: true,
+            confirm_mainnet_live: false,
+            submit: false,
+            hold_positions_after_submit: true,
+            cleanup_max_slippage_bps: 50.0,
+            duration_secs: 900,
+            max_events: 1000,
+            max_live_orders: 2,
+            max_total_notional_usd: 1000.0,
+            max_total_fees_usd: 1.0,
+            max_slippage_bps: 50.0,
+            environment: None,
+            ws_url: None,
+        };
+        let refs = vec![
+            CopyLiveDaemonWouldSubmitRef {
+                record_index: 0,
+                signal_id: "copy-leader_a-event-one-IncreaseLong-open-1001".to_string(),
+                leader_id: "leader_a".to_string(),
+                leader_address: "0x00000000000000000000000000000000000000aa".to_string(),
+                order: CopyExecutionCanaryWouldSubmit {
+                    account_id: "addr_a".to_string(),
+                    worker_id: "worker-addr_a".to_string(),
+                    coin: "xyz:JPY".to_string(),
+                    side: crate::domain::OrderSide::Buy,
+                    notional_usd: 120.0,
+                    reduce_only: false,
+                    cloid: "00000000-0000-0000-0000-000000000021".to_string(),
+                },
+            },
+            CopyLiveDaemonWouldSubmitRef {
+                record_index: 1,
+                signal_id: "copy-leader_a-event-two-IncreaseLong-open-1002".to_string(),
+                leader_id: "leader_a".to_string(),
+                leader_address: "0x00000000000000000000000000000000000000aa".to_string(),
+                order: CopyExecutionCanaryWouldSubmit {
+                    account_id: "addr_a".to_string(),
+                    worker_id: "worker-addr_a".to_string(),
+                    coin: "xyz:JPY".to_string(),
+                    side: crate::domain::OrderSide::Buy,
+                    notional_usd: 120.0,
+                    reduce_only: false,
+                    cloid: "00000000-0000-0000-0000-000000000022".to_string(),
+                },
+            },
+            CopyLiveDaemonWouldSubmitRef {
+                record_index: 2,
+                signal_id: "copy-leader_a-event-one-IncreaseLong-open-2001".to_string(),
+                leader_id: "leader_a".to_string(),
+                leader_address: "0x00000000000000000000000000000000000000aa".to_string(),
+                order: CopyExecutionCanaryWouldSubmit {
+                    account_id: "addr_b".to_string(),
+                    worker_id: "worker-addr_b".to_string(),
+                    coin: "xyz:JPY".to_string(),
+                    side: crate::domain::OrderSide::Buy,
+                    notional_usd: 120.0,
+                    reduce_only: false,
+                    cloid: "00000000-0000-0000-0000-000000000023".to_string(),
+                },
+            },
+            CopyLiveDaemonWouldSubmitRef {
+                record_index: 3,
+                signal_id: "copy-leader_a-event-two-IncreaseLong-open-2002".to_string(),
+                leader_id: "leader_a".to_string(),
+                leader_address: "0x00000000000000000000000000000000000000aa".to_string(),
+                order: CopyExecutionCanaryWouldSubmit {
+                    account_id: "addr_b".to_string(),
+                    worker_id: "worker-addr_b".to_string(),
+                    coin: "xyz:JPY".to_string(),
+                    side: crate::domain::OrderSide::Buy,
+                    notional_usd: 120.0,
+                    reduce_only: false,
+                    cloid: "00000000-0000-0000-0000-000000000024".to_string(),
+                },
+            },
+        ];
+
+        let (executable, suppressed) =
+            super::partition_copy_live_daemon_would_submit_refs(&refs, &options);
+
+        assert_eq!(executable.len(), 2);
+        assert_eq!(
+            executable
+                .iter()
+                .map(|plan| plan.order.account_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["addr_a", "addr_b"]
+        );
+        assert!(
+            executable
+                .iter()
+                .all(|plan| plan.signal_id.contains("event-one"))
+        );
+        assert_eq!(suppressed.len(), 2);
+        assert!(
+            suppressed
+                .iter()
+                .all(|suppressed| suppressed.plan.signal_id.contains("event-two"))
+        );
+        assert!(
+            suppressed
+                .iter()
+                .all(|suppressed| suppressed.reason_code == "COPY_DAEMON_MAX_LIVE_ORDERS")
+        );
+    }
+
+    #[test]
     fn copy_live_daemon_ref_partition_does_not_suppress_reduce_only_close_by_open_order_cap() {
         let options = CopyLiveDaemonSupervisorOptions {
             leaders: Vec::new(),
@@ -1839,6 +2079,98 @@ mod tests {
         assert_eq!(suppressed.len(), 1);
         assert_eq!(suppressed[0].plan.signal_id, "sig-open-2");
         assert_eq!(suppressed[0].reason_code, "COPY_DAEMON_MAX_LIVE_ORDERS");
+    }
+
+    #[test]
+    fn copy_live_daemon_ref_partition_does_not_charge_reduce_only_against_open_budget() {
+        let options = CopyLiveDaemonSupervisorOptions {
+            leaders: Vec::new(),
+            account_ids: vec!["addr_a".to_string()],
+            local_account_id: Some("addr_a".to_string()),
+            markets: Vec::new(),
+            coin: "xyz:XYZ100".to_string(),
+            side: crate::domain::OrderSide::Buy,
+            persistence_path: std::env::temp_dir().join("unused-daemon-close-budget.json"),
+            shadow_history_path: std::env::temp_dir().join("unused-daemon-close-budget.jsonl"),
+            leader_notional_usd: 120.0,
+            leader_size: 1.0,
+            live_gate: true,
+            allow_live_submit: true,
+            confirm_mainnet_live: false,
+            submit: false,
+            hold_positions_after_submit: true,
+            cleanup_max_slippage_bps: 50.0,
+            duration_secs: 900,
+            max_events: 1000,
+            max_live_orders: 2,
+            max_total_notional_usd: 12.0,
+            max_total_fees_usd: 0.012,
+            max_slippage_bps: 50.0,
+            environment: None,
+            ws_url: None,
+        };
+        let refs = vec![
+            CopyLiveDaemonWouldSubmitRef {
+                record_index: 0,
+                signal_id: "sig-open".to_string(),
+                leader_id: "leader_a".to_string(),
+                leader_address: "0x00000000000000000000000000000000000000aa".to_string(),
+                order: CopyExecutionCanaryWouldSubmit {
+                    account_id: "addr_a".to_string(),
+                    worker_id: "worker-addr_a".to_string(),
+                    coin: "xyz:SP500".to_string(),
+                    side: crate::domain::OrderSide::Buy,
+                    notional_usd: 12.0,
+                    reduce_only: false,
+                    cloid: "00000000-0000-0000-0000-000000000011".to_string(),
+                },
+            },
+            CopyLiveDaemonWouldSubmitRef {
+                record_index: 1,
+                signal_id: "sig-close-large".to_string(),
+                leader_id: "leader_a".to_string(),
+                leader_address: "0x00000000000000000000000000000000000000aa".to_string(),
+                order: CopyExecutionCanaryWouldSubmit {
+                    account_id: "addr_a".to_string(),
+                    worker_id: "worker-addr_a".to_string(),
+                    coin: "xyz:SP500".to_string(),
+                    side: crate::domain::OrderSide::Sell,
+                    notional_usd: 500.0,
+                    reduce_only: true,
+                    cloid: "00000000-0000-0000-0000-000000000012".to_string(),
+                },
+            },
+            CopyLiveDaemonWouldSubmitRef {
+                record_index: 2,
+                signal_id: "sig-open-extra".to_string(),
+                leader_id: "leader_b".to_string(),
+                leader_address: "0x00000000000000000000000000000000000000bb".to_string(),
+                order: CopyExecutionCanaryWouldSubmit {
+                    account_id: "addr_a".to_string(),
+                    worker_id: "worker-addr_a".to_string(),
+                    coin: "xyz:XYZ100".to_string(),
+                    side: crate::domain::OrderSide::Buy,
+                    notional_usd: 1.0,
+                    reduce_only: false,
+                    cloid: "00000000-0000-0000-0000-000000000013".to_string(),
+                },
+            },
+        ];
+
+        let (executable, suppressed) =
+            super::partition_copy_live_daemon_would_submit_refs(&refs, &options);
+
+        assert_eq!(
+            executable
+                .iter()
+                .map(|plan| plan.signal_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["sig-open", "sig-close-large"]
+        );
+        assert!(executable[1].order.reduce_only);
+        assert_eq!(suppressed.len(), 1);
+        assert_eq!(suppressed[0].plan.signal_id, "sig-open-extra");
+        assert_eq!(suppressed[0].reason_code, "COPY_DAEMON_MAX_TOTAL_NOTIONAL");
     }
 
     #[test]
@@ -2643,6 +2975,125 @@ mod tests {
     }
 
     #[test]
+    fn copy_live_daemon_supervisor_pipelines_size_each_local_account_independently() -> Result<()> {
+        let config_path = write_test_config("127.0.0.1:18040")?;
+        let mut config = crate::config::load_config(std::path::Path::new(&config_path))?;
+        for account in &mut config.accounts {
+            match account.account_id.as_str() {
+                "addr_a" => {
+                    account.copy_ratio = 0.2;
+                    account.max_order_notional_usd = 100.0;
+                }
+                "addr_b" => {
+                    account.copy_ratio = 0.5;
+                    account.max_order_notional_usd = 300.0;
+                }
+                _ => {}
+            }
+        }
+        let leader = crate::strategies::smart_money::SmartMoneyLeaderWatch {
+            leader_id: "leader_a".to_string(),
+            leader_address: "0x00000000000000000000000000000000000000aa".to_string(),
+        };
+        let options = CopyLiveDaemonSupervisorOptions {
+            leaders: Vec::new(),
+            account_ids: vec!["addr_a".to_string(), "addr_b".to_string()],
+            local_account_id: Some("addr_a".to_string()),
+            markets: vec!["xyz_perp".to_string()],
+            coin: "xyz:XYZ100".to_string(),
+            side: crate::domain::OrderSide::Buy,
+            persistence_path: std::env::temp_dir().join("unused-multi-pipeline-sizing.json"),
+            shadow_history_path: std::env::temp_dir().join("unused-multi-pipeline-sizing.jsonl"),
+            leader_notional_usd: 1000.0,
+            leader_size: 1.0,
+            live_gate: true,
+            allow_live_submit: true,
+            confirm_mainnet_live: true,
+            submit: true,
+            hold_positions_after_submit: true,
+            cleanup_max_slippage_bps: 50.0,
+            duration_secs: 60,
+            max_events: 1000,
+            max_live_orders: 2,
+            max_total_notional_usd: 1000.0,
+            max_total_fees_usd: 1.0,
+            max_slippage_bps: 50.0,
+            environment: Some("mainnet".to_string()),
+            ws_url: None,
+        };
+        let persistence = crate::strategies::smart_money::CopyPersistenceSnapshot::new(
+            0,
+            Vec::new(),
+            &crate::strategies::smart_money::CopyLedger::new(),
+        );
+        let now = crate::domain::now_ms();
+        let before = crate::copy_shadow_position_event(&leader, "xyz:XYZ100", 0.0, 0.0, now, "xyz");
+        let fill_event = crate::strategies::smart_money::CopyLeaderWatcherEvent::Fill {
+            leader_id: leader.leader_id.clone(),
+            leader_address: leader.leader_address.clone(),
+            fill: crate::strategy::LeaderFillEvent {
+                event_id: format!("multi-account-sizing-fill-{now}"),
+                leader_id: leader.leader_id.clone(),
+                leader_address: leader.leader_address.clone(),
+                coin: "xyz:XYZ100".to_string(),
+                side: crate::domain::OrderSide::Buy,
+                price: 1.0,
+                size: 1000.0,
+                notional_usd: 1000.0,
+                reduce_only: false,
+                exchange_time_ms: now + 1,
+                received_at_ms: now + 1,
+            },
+            is_snapshot: false,
+        };
+        let after = crate::copy_shadow_position_event(
+            &leader,
+            "xyz:XYZ100",
+            1000.0,
+            1000.0,
+            now + 2,
+            "xyz",
+        );
+
+        let mut records = Vec::new();
+        let mut merged_snapshot = persistence.clone();
+        for account_id in ["addr_a", "addr_b"] {
+            let account = config.account(account_id).context("test account")?;
+            let mut pipeline = crate::copy_live_daemon_supervisor_pipeline(
+                &config,
+                &options,
+                account,
+                &[account.account_id.clone()],
+                std::slice::from_ref(&leader),
+                &persistence,
+            );
+            records.extend(pipeline.handle_watcher_event(before.clone(), now));
+            records.extend(pipeline.handle_watcher_event(fill_event.clone(), now + 1));
+            records.extend(pipeline.handle_watcher_event(after.clone(), now + 2));
+            merged_snapshot = crate::copy_live_daemon_merge_persistence_snapshots(
+                merged_snapshot,
+                pipeline.persistence_snapshot(now + 3),
+            );
+        }
+
+        let refs = plan_copy_daemon_acceptance_order_refs(&config, &records)?;
+        let by_account = refs
+            .iter()
+            .map(|plan| (plan.order.account_id.as_str(), plan.order.notional_usd))
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(by_account.get("addr_a").copied(), Some(100.0));
+        assert_eq!(by_account.get("addr_b").copied(), Some(300.0));
+        assert_eq!(merged_snapshot.ledger_entries.len(), 2);
+        assert!(merged_snapshot.ledger_entries.iter().any(|entry| {
+            entry.local_account_id == "addr_a" && (entry.planned_notional_usd - 100.0).abs() < 1e-9
+        }));
+        assert!(merged_snapshot.ledger_entries.iter().any(|entry| {
+            entry.local_account_id == "addr_b" && (entry.planned_notional_usd - 300.0).abs() < 1e-9
+        }));
+        Ok(())
+    }
+
+    #[test]
     fn copy_live_daemon_contract_exposure_failure_suppresses_open_ref() {
         let options = CopyLiveDaemonSupervisorOptions {
             leaders: Vec::new(),
@@ -2878,8 +3329,11 @@ mod tests {
             "COPY_DAEMON_MARGIN_RESIZED_BELOW_MIN"
         );
         assert_eq!(prepared[0].signal_id, "sig-open-low-margin");
+        let expected_resized_notional = 3.267497
+            / ((1.0 + super::COPY_DAEMON_MARGIN_BUFFER_RATIO) / 10.0
+                + super::COPY_DAEMON_FEE_BUFFER_RATIO);
         assert!(
-            (prepared[0].order.notional_usd - 29.7045181818).abs() < 0.0001,
+            (prepared[0].order.notional_usd - expected_resized_notional).abs() < 0.0001,
             "{prepared:#?}"
         );
     }
@@ -4036,6 +4490,277 @@ mod tests {
     }
 
     #[test]
+    fn copy_live_daemon_signer_preflight_fails_before_runtime_submit_when_secret_missing() {
+        let mut config = crate::config::AppConfig::default();
+        config.secrets.vault_path = std::env::temp_dir()
+            .join(format!("missing-copy-vault-{}.vault", now_ms()))
+            .display()
+            .to_string();
+        config.secrets.allow_env_fallback = false;
+        config.accounts = vec![
+            crate::config::AccountConfig {
+                account_id: "addr_a".to_string(),
+                address: "0x0000000000000000000000000000000000000001".to_string(),
+                secret_id: "addr_a_api_wallet".to_string(),
+                api_wallet_env: String::new(),
+                transfer_secret_id: String::new(),
+                transfer_wallet_env: String::new(),
+                enabled: true,
+                worker_enabled: true,
+                copy_ratio: 1.0,
+                max_order_notional_usd: 100.0,
+                blocked_markets: Vec::new(),
+            },
+            crate::config::AccountConfig {
+                account_id: "addr_b".to_string(),
+                address: "0x0000000000000000000000000000000000000002".to_string(),
+                secret_id: "addr_b_api_wallet".to_string(),
+                api_wallet_env: String::new(),
+                transfer_secret_id: String::new(),
+                transfer_wallet_env: String::new(),
+                enabled: true,
+                worker_enabled: true,
+                copy_ratio: 1.0,
+                max_order_notional_usd: 100.0,
+                blocked_markets: Vec::new(),
+            },
+        ];
+
+        let checks = super::copy_live_daemon_signer_preflight_checks(
+            &config,
+            &["addr_a".to_string(), "addr_b".to_string()],
+            true,
+        );
+
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].name, "copy_signers_available");
+        assert!(!checks[0].ok);
+        assert!(checks[0].detail.contains("addr_a"));
+        assert!(checks[0].detail.contains("addr_b"));
+    }
+
+    #[test]
+    fn copy_live_daemon_submit_contract_accepts_multi_account_fanout_from_one_signal() {
+        let mut options = follow_position_options();
+        options.account_ids = vec!["addr_a".to_string(), "addr_b".to_string()];
+        options.max_live_orders = 2;
+        options.max_total_notional_usd = 1000.0;
+        options.max_total_fees_usd = 1.0;
+        let refs = vec![
+            CopyLiveDaemonWouldSubmitRef {
+                record_index: 7,
+                signal_id: "sig-shared-target-fill".to_string(),
+                leader_id: "leader_a".to_string(),
+                leader_address: "0x00000000000000000000000000000000000000aa".to_string(),
+                order: CopyExecutionCanaryWouldSubmit {
+                    account_id: "addr_a".to_string(),
+                    worker_id: "worker-addr_a".to_string(),
+                    coin: "xyz:SILVER".to_string(),
+                    side: crate::domain::OrderSide::Sell,
+                    notional_usd: 120.0,
+                    reduce_only: false,
+                    cloid: "99999999-9999-5999-8999-999999999991".to_string(),
+                },
+            },
+            CopyLiveDaemonWouldSubmitRef {
+                record_index: 7,
+                signal_id: "sig-shared-target-fill".to_string(),
+                leader_id: "leader_a".to_string(),
+                leader_address: "0x00000000000000000000000000000000000000aa".to_string(),
+                order: CopyExecutionCanaryWouldSubmit {
+                    account_id: "addr_b".to_string(),
+                    worker_id: "worker-addr_b".to_string(),
+                    coin: "xyz:SILVER".to_string(),
+                    side: crate::domain::OrderSide::Sell,
+                    notional_usd: 120.0,
+                    reduce_only: false,
+                    cloid: "99999999-9999-5999-8999-999999999992".to_string(),
+                },
+            },
+        ];
+        let reconciliations = vec![
+            CopyBoundedLiveWindowReconcile {
+                account_id: "addr_a".to_string(),
+                ok: true,
+                open_order_count: Some(0),
+                asset_positions: Some(0),
+                position_summaries: Vec::new(),
+                account_value: Some("200".to_string()),
+                withdrawable: Some("50".to_string()),
+                total_ntl_pos: Some("0".to_string()),
+                total_margin_used: Some("0".to_string()),
+                error: None,
+            },
+            CopyBoundedLiveWindowReconcile {
+                account_id: "addr_b".to_string(),
+                ok: true,
+                open_order_count: Some(0),
+                asset_positions: Some(0),
+                position_summaries: Vec::new(),
+                account_value: Some("200".to_string()),
+                withdrawable: Some("50".to_string()),
+                total_ntl_pos: Some("0".to_string()),
+                total_margin_used: Some("0".to_string()),
+                error: None,
+            },
+        ];
+
+        let contract = copy_live_daemon_submit_plan_contract(
+            &options,
+            &refs,
+            &[],
+            240.0,
+            0.24,
+            &reconciliations,
+        );
+
+        assert!(
+            contract.ok,
+            "multi-account fanout should pass submit contract: {:#?}",
+            contract.checks
+        );
+        assert!(
+            contract
+                .checks
+                .iter()
+                .any(|check| check.name == "account_signal_refs_unique" && check.ok)
+        );
+    }
+
+    #[test]
+    fn copy_live_daemon_acceptance_live_order_cap_scales_with_selected_accounts() -> Result<()> {
+        let config_path = write_test_config("127.0.0.1:18041")?;
+        let mut config = crate::config::load_config(std::path::Path::new(&config_path))?;
+        for (account_id, address_suffix) in [("addr_c", "3"), ("addr_d", "4")] {
+            config.accounts.push(crate::config::AccountConfig {
+                account_id: account_id.to_string(),
+                address: format!("0x000000000000000000000000000000000000000{address_suffix}"),
+                secret_id: String::new(),
+                api_wallet_env: format!(
+                    "HL_API_WALLET_PRIVATE_KEY_{}",
+                    account_id.to_ascii_uppercase()
+                ),
+                transfer_secret_id: String::new(),
+                transfer_wallet_env: format!(
+                    "HL_EVM_TRANSFER_PRIVATE_KEY_{}",
+                    account_id.to_ascii_uppercase()
+                ),
+                enabled: true,
+                worker_enabled: true,
+                copy_ratio: 0.05,
+                max_order_notional_usd: 100.0,
+                blocked_markets: Vec::new(),
+            });
+        }
+        config.app.dry_run = false;
+        config.manual_ops.manual_live_enabled = true;
+        let dir = std::env::temp_dir().join(format!(
+            "trade_xyz_copy_acceptance_live_order_cap_{}",
+            now_ms()
+        ));
+        fs::create_dir_all(&dir).context("failed to create acceptance test dir")?;
+        let account_ids = vec![
+            "addr_a".to_string(),
+            "addr_b".to_string(),
+            "addr_c".to_string(),
+            "addr_d".to_string(),
+        ];
+        let base_options = CopyLiveDaemonAcceptanceOptions {
+            leaders: vec!["leader_a=0x00000000000000000000000000000000000000aa".to_string()],
+            account_ids: account_ids.clone(),
+            coin: "xyz:XYZ100".to_string(),
+            side: crate::domain::OrderSide::Buy,
+            persistence_path: dir.join("acceptance-persistence.json"),
+            shadow_history_path: dir.join("acceptance-shadow.jsonl"),
+            leader_notional_usd: 120.0,
+            leader_size: 1.0,
+            live: true,
+            allow_live_submit: true,
+            confirm_mainnet_live: false,
+            max_duration_secs: 300,
+            max_live_orders: account_ids.len(),
+            max_total_notional_usd: 1000.0,
+            max_total_fees_usd: 1.0,
+            max_slippage_bps: 50.0,
+            require_cleanup_after_submit: true,
+            require_flat_reconcile_after_submit: true,
+        };
+
+        let accepted = run_copy_live_daemon_acceptance(&config, base_options.clone())?;
+        let bounded = accepted
+            .checks
+            .iter()
+            .find(|check| check.name == "bounded_live_orders")
+            .expect("bounded_live_orders check");
+        assert!(bounded.ok, "{bounded:#?}");
+
+        let mut too_low = base_options;
+        too_low.max_live_orders = account_ids.len() - 1;
+        let rejected = run_copy_live_daemon_acceptance(&config, too_low)?;
+        let bounded = rejected
+            .checks
+            .iter()
+            .find(|check| check.name == "bounded_live_orders")
+            .expect("bounded_live_orders check");
+        assert!(!bounded.ok, "{bounded:#?}");
+        Ok(())
+    }
+
+    #[test]
+    fn copy_live_daemon_margin_resize_accounts_for_fee_buffer() {
+        let mut options = follow_position_options();
+        options.max_total_notional_usd = 1000.0;
+        options.max_total_fees_usd = 1.0;
+        let refs = vec![CopyLiveDaemonWouldSubmitRef {
+            record_index: 2,
+            signal_id: "sig-tight-margin-open".to_string(),
+            leader_id: "leader_a".to_string(),
+            leader_address: "0x00000000000000000000000000000000000000aa".to_string(),
+            order: CopyExecutionCanaryWouldSubmit {
+                account_id: "addr_a".to_string(),
+                worker_id: "worker-addr_a".to_string(),
+                coin: "xyz:SILVER".to_string(),
+                side: crate::domain::OrderSide::Sell,
+                notional_usd: 350.0,
+                reduce_only: false,
+                cloid: "88888888-8888-5888-8888-888888888888".to_string(),
+            },
+        }];
+        let reconciliations = vec![CopyBoundedLiveWindowReconcile {
+            account_id: "addr_a".to_string(),
+            ok: true,
+            open_order_count: Some(0),
+            asset_positions: Some(0),
+            position_summaries: Vec::new(),
+            account_value: Some("50".to_string()),
+            withdrawable: Some("14.275086".to_string()),
+            total_ntl_pos: Some("0".to_string()),
+            total_margin_used: Some("0".to_string()),
+            error: None,
+        }];
+        let (prepared, suppressed) =
+            super::copy_live_daemon_resize_open_refs_for_margin(&refs, &reconciliations);
+
+        assert!(suppressed.is_empty(), "{suppressed:#?}");
+        assert_eq!(prepared.len(), 1);
+        assert!(prepared[0].order.notional_usd < refs[0].order.notional_usd);
+        let planned_notional = prepared[0].order.notional_usd;
+        let contract = copy_live_daemon_submit_plan_contract(
+            &options,
+            &prepared,
+            &[],
+            planned_notional,
+            planned_notional * 0.001,
+            &reconciliations,
+        );
+        assert!(
+            contract.ok,
+            "resized plan should satisfy final margin contract: {:#?}",
+            contract.checks
+        );
+    }
+
+    #[test]
     fn copy_live_daemon_persistent_submit_dry_run_plans_only_executable_refs() -> Result<()> {
         let config_path = write_test_config("127.0.0.1:18014")?;
         let config = crate::config::load_config(std::path::Path::new(&config_path))?;
@@ -4243,6 +4968,17 @@ mod tests {
         assert_eq!(other_order.dex.as_deref(), Some("otherdex"));
         assert_eq!(other_order.market.as_deref(), Some("otherdex_perp"));
 
+        plan.order.coin = "cash:USA500".to_string();
+        plan.signal_id = "sig-cash-perp".to_string();
+        plan.order.cloid = "11111111-1111-5111-8111-111111111114".to_string();
+        let cash_order =
+            approved_copy_daemon_order_from_ref(&config, &options, account, &plan, false)?;
+        assert_eq!(cash_order.dex.as_deref(), Some("cash"));
+        assert_eq!(
+            cash_order.market.as_deref(),
+            Some(crate::config::MARKET_CASH_PERP)
+        );
+
         plan.order.coin = "BTC".to_string();
         plan.signal_id = "sig-hl-perp".to_string();
         plan.order.cloid = "11111111-1111-5111-8111-111111111113".to_string();
@@ -4312,6 +5048,60 @@ mod tests {
         assert_eq!(leverage_options.margin_mode, "isolated");
         assert!(leverage_options.submit);
         assert!(leverage_options.confirm_mainnet_live);
+        Ok(())
+    }
+
+    #[test]
+    fn copy_live_daemon_open_ref_caps_leverage_to_asset_max() -> Result<()> {
+        let options = CopyLiveDaemonSupervisorOptions {
+            leaders: Vec::new(),
+            account_ids: vec!["addr_a".to_string()],
+            local_account_id: Some("addr_a".to_string()),
+            markets: Vec::new(),
+            coin: "xyz:HYUNDAI".to_string(),
+            side: crate::domain::OrderSide::Buy,
+            persistence_path: std::env::temp_dir().join("unused-live-leverage-cap.json"),
+            shadow_history_path: std::env::temp_dir().join("unused-live-leverage-cap.jsonl"),
+            leader_notional_usd: 120.0,
+            leader_size: 1.0,
+            live_gate: true,
+            allow_live_submit: true,
+            confirm_mainnet_live: true,
+            submit: true,
+            hold_positions_after_submit: true,
+            cleanup_max_slippage_bps: 50.0,
+            duration_secs: 60,
+            max_events: 1000,
+            max_live_orders: 1,
+            max_total_notional_usd: 200.0,
+            max_total_fees_usd: 1.0,
+            max_slippage_bps: 50.0,
+            environment: None,
+            ws_url: None,
+        };
+        let plan = CopyLiveDaemonWouldSubmitRef {
+            record_index: 8,
+            signal_id: "sig-live-leverage-cap".to_string(),
+            leader_id: "leader_a".to_string(),
+            leader_address: "0x00000000000000000000000000000000000000aa".to_string(),
+            order: CopyExecutionCanaryWouldSubmit {
+                account_id: "addr_a".to_string(),
+                worker_id: "worker-addr_a".to_string(),
+                coin: "xyz:HYUNDAI".to_string(),
+                side: crate::domain::OrderSide::Buy,
+                notional_usd: 50.0,
+                reduce_only: false,
+                cloid: "22222222-2222-5222-8222-222222222223".to_string(),
+            },
+        };
+
+        let leverage_options =
+            copy_daemon_live_leverage_update_options_with_max(&options, &plan, Some(5))?
+                .context("opening copy order should require leverage update")?;
+
+        assert_eq!(leverage_options.leverage, 5);
+        assert_eq!(leverage_options.margin_mode, "isolated");
+        assert!(leverage_options.submit);
         Ok(())
     }
 
@@ -4451,14 +5241,15 @@ mod tests {
     }
 
     #[test]
-    fn copy_live_daemon_persistent_live_submit_accepts_empty_executable_window() -> Result<()> {
+    fn copy_live_daemon_persistent_live_submit_accepts_multi_account_empty_executable_window()
+    -> Result<()> {
         let config_path = write_test_config("127.0.0.1:18020")?;
         let mut config = crate::config::load_config(std::path::Path::new(&config_path))?;
         config.app.dry_run = false;
         config.manual_ops.manual_live_enabled = true;
         let options = CopyLiveDaemonSupervisorOptions {
             leaders: Vec::new(),
-            account_ids: vec!["addr_a".to_string()],
+            account_ids: vec!["addr_a".to_string(), "addr_b".to_string()],
             local_account_id: Some("addr_a".to_string()),
             markets: Vec::new(),
             coin: "xyz:XYZ100".to_string(),
@@ -4509,6 +5300,80 @@ mod tests {
                 .iter()
                 .any(|check| check.name == "cleanup_runbook_completed" && check.ok)
         );
+        assert!(
+            live_submit
+                .checks
+                .iter()
+                .any(|check| check.name == "selected_submit_accounts" && check.ok)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn copy_live_daemon_submit_accounts_scope_allows_selected_multi_account_refs() -> Result<()> {
+        let config_path = write_test_config("127.0.0.1:18020")?;
+        let config = crate::config::load_config(std::path::Path::new(&config_path))?;
+        let options = CopyLiveDaemonSupervisorOptions {
+            leaders: Vec::new(),
+            account_ids: vec!["addr_a".to_string(), "addr_b".to_string()],
+            local_account_id: Some("addr_a".to_string()),
+            markets: Vec::new(),
+            coin: "xyz:XYZ100".to_string(),
+            side: crate::domain::OrderSide::Buy,
+            persistence_path: std::env::temp_dir().join("unused-live-submit-scope.json"),
+            shadow_history_path: std::env::temp_dir().join("unused-live-submit-scope.jsonl"),
+            leader_notional_usd: 120.0,
+            leader_size: 1.0,
+            live_gate: true,
+            allow_live_submit: true,
+            confirm_mainnet_live: false,
+            submit: true,
+            hold_positions_after_submit: true,
+            cleanup_max_slippage_bps: 50.0,
+            duration_secs: 60,
+            max_events: 1000,
+            max_live_orders: 2,
+            max_total_notional_usd: 100.0,
+            max_total_fees_usd: 0.10,
+            max_slippage_bps: 50.0,
+            environment: None,
+            ws_url: None,
+        };
+        let selected_ref = CopyLiveDaemonWouldSubmitRef {
+            record_index: 0,
+            signal_id: "sig-selected-account".to_string(),
+            leader_id: "leader_a".to_string(),
+            leader_address: "0x00000000000000000000000000000000000000aa".to_string(),
+            order: CopyExecutionCanaryWouldSubmit {
+                account_id: "addr_b".to_string(),
+                worker_id: "worker-addr_b".to_string(),
+                coin: "xyz:XYZ100".to_string(),
+                side: crate::domain::OrderSide::Buy,
+                notional_usd: 25.0,
+                reduce_only: false,
+                cloid: "66666666-6666-5666-8666-666666666666".to_string(),
+            },
+        };
+        let unselected_ref = CopyLiveDaemonWouldSubmitRef {
+            order: CopyExecutionCanaryWouldSubmit {
+                account_id: "addr_c".to_string(),
+                worker_id: "worker-addr_c".to_string(),
+                cloid: "77777777-7777-5777-8777-777777777777".to_string(),
+                ..selected_ref.order.clone()
+            },
+            ..selected_ref.clone()
+        };
+
+        assert!(super::copy_live_daemon_submit_accounts_in_scope(
+            &config,
+            &options,
+            &[selected_ref]
+        ));
+        assert!(!super::copy_live_daemon_submit_accounts_in_scope(
+            &config,
+            &options,
+            &[unselected_ref]
+        ));
         Ok(())
     }
 
@@ -4830,6 +5695,25 @@ mod tests {
     }
 
     #[test]
+    fn copy_live_daemon_classifies_safe_pre_submit_skips_only() {
+        assert!(copy_live_daemon_error_is_safe_pre_submit_skip(
+            "failed to set xyz:HYUNDAI leverage to 10x before copy submit"
+        ));
+        assert!(copy_live_daemon_error_is_safe_pre_submit_skip(
+            "copy submit skipped before exchange: addr_b xyz:SP500 requested_notional=11.172000 effective_notional=7.416100 below exchange minimum 10.000000"
+        ));
+        assert!(copy_live_daemon_error_is_safe_pre_submit_skip(
+            "exchange returned action-level order error: Order must have minimum value of $10. asset=110052"
+        ));
+        assert!(!copy_live_daemon_error_is_safe_pre_submit_skip(
+            "exchange submit failed after order was sent"
+        ));
+        assert!(!copy_live_daemon_error_is_safe_pre_submit_skip(
+            "failed to fetch order evidence after copy submit"
+        ));
+    }
+
+    #[test]
     fn copy_live_daemon_persistent_submit_dry_run_blocks_when_plan_contract_fails() -> Result<()> {
         let config_path = write_test_config("127.0.0.1:18015")?;
         let config = crate::config::load_config(std::path::Path::new(&config_path))?;
@@ -4925,6 +5809,189 @@ mod tests {
 
         assert_eq!(refs.len(), 2);
         assert_eq!(refs[1].signal_id, "sig-2");
+    }
+
+    #[test]
+    fn copy_live_daemon_pending_plan_refs_excludes_already_submitted_cloids() {
+        let submitted = CopyLiveDaemonWouldSubmitRef {
+            record_index: 0,
+            signal_id: "sig-submitted".to_string(),
+            leader_id: "leader_a".to_string(),
+            leader_address: "0x00000000000000000000000000000000000000aa".to_string(),
+            order: CopyExecutionCanaryWouldSubmit {
+                account_id: "addr_a".to_string(),
+                worker_id: "worker-addr_a".to_string(),
+                coin: "xyz:XYZ100".to_string(),
+                side: crate::domain::OrderSide::Buy,
+                notional_usd: 12.0,
+                reduce_only: false,
+                cloid: "00000000-0000-0000-0000-000000000001".to_string(),
+            },
+        };
+        let pending = CopyLiveDaemonWouldSubmitRef {
+            record_index: 1,
+            signal_id: "sig-pending".to_string(),
+            leader_id: "leader_a".to_string(),
+            leader_address: "0x00000000000000000000000000000000000000aa".to_string(),
+            order: CopyExecutionCanaryWouldSubmit {
+                account_id: "addr_b".to_string(),
+                worker_id: "worker-addr_b".to_string(),
+                coin: "xyz:XYZ100".to_string(),
+                side: crate::domain::OrderSide::Buy,
+                notional_usd: 12.0,
+                reduce_only: false,
+                cloid: "00000000-0000-0000-0000-000000000002".to_string(),
+            },
+        };
+        let mut submitted_cloids = HashSet::new();
+        submitted_cloids.insert(submitted.order.cloid.clone());
+
+        let refs = copy_live_daemon_pending_plan_refs(&[submitted, pending], &submitted_cloids);
+
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].signal_id, "sig-pending");
+        assert_eq!(refs[0].order.account_id, "addr_b");
+    }
+
+    #[test]
+    fn copy_live_daemon_pending_suppressed_refs_excludes_already_submitted_cloids() {
+        let submitted = CopyLiveDaemonWouldSubmitRef {
+            record_index: 0,
+            signal_id: "sig-submitted".to_string(),
+            leader_id: "leader_a".to_string(),
+            leader_address: "0x00000000000000000000000000000000000000aa".to_string(),
+            order: CopyExecutionCanaryWouldSubmit {
+                account_id: "addr_a".to_string(),
+                worker_id: "worker-addr_a".to_string(),
+                coin: "xyz:XYZ100".to_string(),
+                side: crate::domain::OrderSide::Buy,
+                notional_usd: 12.0,
+                reduce_only: false,
+                cloid: "00000000-0000-0000-0000-000000000001".to_string(),
+            },
+        };
+        let pending = CopyLiveDaemonWouldSubmitRef {
+            record_index: 1,
+            signal_id: "sig-pending".to_string(),
+            leader_id: "leader_a".to_string(),
+            leader_address: "0x00000000000000000000000000000000000000aa".to_string(),
+            order: CopyExecutionCanaryWouldSubmit {
+                account_id: "addr_b".to_string(),
+                worker_id: "worker-addr_b".to_string(),
+                coin: "xyz:XYZ100".to_string(),
+                side: crate::domain::OrderSide::Buy,
+                notional_usd: 12.0,
+                reduce_only: false,
+                cloid: "00000000-0000-0000-0000-000000000002".to_string(),
+            },
+        };
+        let refs = vec![
+            CopyLiveDaemonSuppressedWouldSubmitRef {
+                plan: submitted.clone(),
+                reason_code: "COPY_DAEMON_MARGIN_RESIZED_BELOW_MIN".to_string(),
+                message: "submitted cloid should not remain suppressed".to_string(),
+            },
+            CopyLiveDaemonSuppressedWouldSubmitRef {
+                plan: pending.clone(),
+                reason_code: "COPY_DAEMON_MARGIN_RESIZED_BELOW_MIN".to_string(),
+                message: "pending cloid remains suppressed".to_string(),
+            },
+        ];
+        let mut submitted_cloids = HashSet::new();
+        submitted_cloids.insert(submitted.order.cloid.clone());
+
+        let refs = copy_live_daemon_pending_suppressed_refs(&refs, &submitted_cloids);
+
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].plan.signal_id, "sig-pending");
+        assert_eq!(refs[0].plan.order.account_id, "addr_b");
+    }
+
+    #[test]
+    fn copy_live_daemon_submitted_report_cloids_drive_final_suppression_cleanup() {
+        let submitted_cloid = "00000000-0000-0000-0000-000000000001".to_string();
+        let report = CopyLiveDaemonPersistentLiveSubmitReport {
+            ok: true,
+            mode: "persistent_live_submit".to_string(),
+            submit_requested: true,
+            submit_plan_contract_ok: true,
+            submitted_reports: vec![crate::domain::WorkerReport::Submitted(
+                crate::domain::OrderSubmitted {
+                    signal_id: "sig-submitted".to_string(),
+                    intent_id: "intent-submitted".to_string(),
+                    worker_id: "worker-addr_a".to_string(),
+                    account_id: "addr_a".to_string(),
+                    cloid: submitted_cloid.clone(),
+                    coin: "xyz:XYZ100".to_string(),
+                    side: crate::domain::OrderSide::Buy,
+                    notional_usd: 12.0,
+                    submitted_price: Some(100.0),
+                    submitted_size: Some(0.12),
+                    exchange_status: Some("filled".to_string()),
+                    oid: Some(42),
+                    filled_size: Some(0.12),
+                    avg_fill_price: Some(100.0),
+                    dry_run: false,
+                    submitted_at_ms: now_ms(),
+                },
+            )],
+            order_evidence: Vec::new(),
+            cleanup_runbooks: Vec::new(),
+            cleanup_errors: Vec::new(),
+            ledger_reconciliations: Vec::new(),
+            ledger_reconciliation_snapshot:
+                crate::strategies::smart_money::CopyPersistenceSnapshot::empty(),
+            checks: Vec::new(),
+        };
+        let submitted = CopyLiveDaemonWouldSubmitRef {
+            record_index: 0,
+            signal_id: "sig-submitted".to_string(),
+            leader_id: "leader_a".to_string(),
+            leader_address: "0x00000000000000000000000000000000000000aa".to_string(),
+            order: CopyExecutionCanaryWouldSubmit {
+                account_id: "addr_a".to_string(),
+                worker_id: "worker-addr_a".to_string(),
+                coin: "xyz:XYZ100".to_string(),
+                side: crate::domain::OrderSide::Buy,
+                notional_usd: 12.0,
+                reduce_only: false,
+                cloid: submitted_cloid.clone(),
+            },
+        };
+        let pending = CopyLiveDaemonWouldSubmitRef {
+            record_index: 1,
+            signal_id: "sig-pending".to_string(),
+            leader_id: "leader_a".to_string(),
+            leader_address: "0x00000000000000000000000000000000000000aa".to_string(),
+            order: CopyExecutionCanaryWouldSubmit {
+                account_id: "addr_b".to_string(),
+                worker_id: "worker-addr_b".to_string(),
+                coin: "xyz:XYZ100".to_string(),
+                side: crate::domain::OrderSide::Buy,
+                notional_usd: 12.0,
+                reduce_only: false,
+                cloid: "00000000-0000-0000-0000-000000000002".to_string(),
+            },
+        };
+        let suppressed = vec![
+            CopyLiveDaemonSuppressedWouldSubmitRef {
+                plan: submitted,
+                reason_code: "COPY_DAEMON_MARGIN_RESIZED_BELOW_MIN".to_string(),
+                message: "already submitted inside watcher loop".to_string(),
+            },
+            CopyLiveDaemonSuppressedWouldSubmitRef {
+                plan: pending,
+                reason_code: "COPY_DAEMON_MARGIN_RESIZED_BELOW_MIN".to_string(),
+                message: "still pending".to_string(),
+            },
+        ];
+
+        let submitted_cloids = copy_live_daemon_submitted_report_cloids(&report);
+        let filtered = copy_live_daemon_pending_suppressed_refs(&suppressed, &submitted_cloids);
+
+        assert!(submitted_cloids.contains(&submitted_cloid));
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].plan.signal_id, "sig-pending");
     }
 
     #[test]
@@ -7981,12 +9048,18 @@ fn run_copy_live_daemon_acceptance(
             options.max_duration_secs
         ),
     ));
+    let min_live_orders_for_accounts = target_accounts.len().max(1);
+    let max_live_orders_for_acceptance = min_live_orders_for_accounts.saturating_mul(3).max(3);
     checks.push(copy_shadow_smoke_check(
         "bounded_live_orders",
-        (1..=3).contains(&options.max_live_orders),
+        options.max_live_orders >= min_live_orders_for_accounts
+            && options.max_live_orders <= max_live_orders_for_acceptance,
         format!(
-            "max_live_orders={} must be between 1 and 3 for acceptance",
-            options.max_live_orders
+            "max_live_orders={} must be between {} and {} for {} selected account(s)",
+            options.max_live_orders,
+            min_live_orders_for_accounts,
+            max_live_orders_for_acceptance,
+            target_accounts.len()
         ),
     ));
     checks.push(copy_shadow_smoke_check(
@@ -8292,6 +9365,11 @@ async fn run_copy_live_daemon_supervisor(
             ),
         ),
     ];
+    checks.extend(copy_live_daemon_signer_preflight_checks(
+        config,
+        &target_accounts,
+        options.submit,
+    ));
 
     let mut input = CopyShadowWatchReportInput::new(CopyShadowWatchReportBase {
         environment: environment.clone(),
@@ -8312,15 +9390,25 @@ async fn run_copy_live_daemon_supervisor(
     let started = Instant::now();
 
     if acceptance.ok && local_account.is_some() && !watcher_leaders.is_empty() {
-        let account = local_account.expect("checked local account");
-        let mut pipeline = copy_live_daemon_supervisor_pipeline(
-            config,
-            &options,
-            account,
-            &target_accounts,
-            &watcher_leaders,
-            &persistence,
-        );
+        let _account = local_account.expect("checked local account");
+        let mut pipelines = target_accounts
+            .iter()
+            .filter_map(|account_id| {
+                config.account(account_id).map(|account| {
+                    (
+                        account.account_id.clone(),
+                        copy_live_daemon_supervisor_pipeline(
+                            config,
+                            &options,
+                            account,
+                            &[account.account_id.clone()],
+                            &watcher_leaders,
+                            &persistence,
+                        ),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
         let (sender, mut receiver) = tokio::sync::mpsc::channel(1024);
         let watcher_config = strategies::smart_money::ReadOnlyLeaderWatcherConfig {
             environment: environment.clone(),
@@ -8347,7 +9435,10 @@ async fn run_copy_live_daemon_supervisor(
                     input.events_received += 1;
                     count_copy_shadow_watch_event(&mut input, &event);
                     let now = domain::now_ms();
-                    let records = pipeline.handle_watcher_event(event, now);
+                    let mut records = Vec::new();
+                    for (_, pipeline) in &mut pipelines {
+                        records.extend(pipeline.handle_watcher_event(event.clone(), now));
+                    }
                     if !records.is_empty() {
                         strategies::smart_money::append_copy_shadow_history_records(
                             &options.shadow_history_path,
@@ -8381,13 +9472,34 @@ async fn run_copy_live_daemon_supervisor(
                             let immediate_reconciliations =
                                 reconcile_copy_bounded_window_accounts(config, &target_accounts)
                                     .await;
-                            let (candidate_executable_refs, candidate_suppressed_refs) =
+                            let immediate_snapshot = pipelines.iter().fold(
+                                persistence.clone(),
+                                |snapshot, (_, pipeline)| {
+                                    copy_live_daemon_merge_persistence_snapshots(
+                                        snapshot,
+                                        pipeline.persistence_snapshot(now),
+                                    )
+                                },
+                            );
+                            let pending_candidate_plan_refs = copy_live_daemon_pending_plan_refs(
+                                &would_submit_plan_refs,
+                                &submitted_plan_cloids,
+                            );
+                            let (candidate_executable_refs, mut candidate_suppressed_refs) =
                                 copy_live_daemon_executable_refs_for_snapshot(
-                                    &would_submit_plan_refs,
+                                    &pending_candidate_plan_refs,
                                     &options,
-                                    &pipeline.persistence_snapshot(now),
+                                    &immediate_snapshot,
                                     &immediate_reconciliations,
                                 );
+                            let (candidate_executable_refs, mut effective_min_suppressed_refs) =
+                                copy_live_daemon_suppress_refs_below_effective_min(
+                                    config,
+                                    &options,
+                                    &candidate_executable_refs,
+                                )
+                                .await;
+                            candidate_suppressed_refs.append(&mut effective_min_suppressed_refs);
                             let pending_executable_refs = candidate_executable_refs
                                 .into_iter()
                                 .filter(|plan| !submitted_plan_cloids.contains(&plan.order.cloid))
@@ -8501,11 +9613,24 @@ async fn run_copy_live_daemon_supervisor(
             watcher_handle.abort();
         }
 
-        let snapshot = copy_live_daemon_persistence_snapshot_for_save(
-            pipeline.persistence_snapshot(domain::now_ms()),
-        );
-        pending_unclassified_fill_count = pipeline.pending_fill_count();
-        pending_unclassified_fill_labels = pipeline.pending_fill_labels(20);
+        let now = domain::now_ms();
+        let mut snapshot = persistence.clone();
+        pending_unclassified_fill_labels = Vec::new();
+        for (account_id, pipeline) in &pipelines {
+            snapshot = copy_live_daemon_merge_persistence_snapshots(
+                snapshot,
+                pipeline.persistence_snapshot(now),
+            );
+            pending_unclassified_fill_count += pipeline.pending_fill_count();
+            pending_unclassified_fill_labels.extend(
+                pipeline
+                    .pending_fill_labels(20)
+                    .into_iter()
+                    .map(|label| format!("{account_id}:{label}")),
+            );
+        }
+        pending_unclassified_fill_labels.truncate(20);
+        let snapshot = copy_live_daemon_persistence_snapshot_for_save(snapshot);
         strategies::smart_money::save_copy_persistence_snapshot(
             &options.persistence_path,
             &snapshot,
@@ -8530,13 +9655,23 @@ async fn run_copy_live_daemon_supervisor(
         &options,
     )?;
     strategies::smart_money::save_copy_persistence_snapshot(&options.persistence_path, &saved)?;
-    let (executable_submit_plan_refs, suppressed_submit_plan_refs) =
+    let pending_would_submit_plan_refs =
+        copy_live_daemon_pending_plan_refs(&would_submit_plan_refs, &submitted_plan_cloids);
+    let (executable_submit_plan_refs, mut suppressed_submit_plan_refs) =
         copy_live_daemon_executable_refs_for_snapshot(
-            &would_submit_plan_refs,
+            &pending_would_submit_plan_refs,
             &options,
             &saved,
             &pre_submit_reconciliations,
         );
+    let (executable_submit_plan_refs, mut effective_min_suppressed_refs) =
+        copy_live_daemon_suppress_refs_below_effective_min(
+            config,
+            &options,
+            &executable_submit_plan_refs,
+        )
+        .await;
+    suppressed_submit_plan_refs.append(&mut effective_min_suppressed_refs);
     let would_submit_orders = copy_live_daemon_order_refs_to_orders(&would_submit_plan_refs);
     let executable_would_submit_orders =
         copy_live_daemon_order_refs_to_orders(&executable_submit_plan_refs);
@@ -8554,7 +9689,7 @@ async fn run_copy_live_daemon_supervisor(
     let (
         executable_submit_plan_refs,
         mut contract_suppressed_submit_plan_refs,
-        submit_plan_contract,
+        mut submit_plan_contract,
     ) = copy_live_daemon_suppress_refs_rejected_by_submit_contract(
         &options,
         executable_submit_plan_refs,
@@ -8566,9 +9701,13 @@ async fn run_copy_live_daemon_supervisor(
     );
     let mut suppressed_submit_plan_refs = suppressed_submit_plan_refs;
     suppressed_submit_plan_refs.append(&mut contract_suppressed_submit_plan_refs);
+    suppressed_submit_plan_refs = copy_live_daemon_pending_suppressed_refs(
+        &suppressed_submit_plan_refs,
+        &submitted_plan_cloids,
+    );
     let executable_would_submit_orders =
         copy_live_daemon_order_refs_to_orders(&executable_submit_plan_refs);
-    let suppressed_would_submit_orders = suppressed_submit_plan_refs
+    let mut suppressed_would_submit_orders = suppressed_submit_plan_refs
         .iter()
         .map(|suppressed| CopyLiveDaemonSuppressedWouldSubmit {
             order: suppressed.plan.order.clone(),
@@ -8635,6 +9774,30 @@ async fn run_copy_live_daemon_supervisor(
         submit_plan_contract.ok,
         live_submit_chunks,
     );
+    let persistent_submitted_cloids =
+        copy_live_daemon_submitted_report_cloids(&persistent_live_submit);
+    if !persistent_submitted_cloids.is_empty() {
+        suppressed_submit_plan_refs = copy_live_daemon_pending_suppressed_refs(
+            &suppressed_submit_plan_refs,
+            &persistent_submitted_cloids,
+        );
+        suppressed_would_submit_orders = suppressed_submit_plan_refs
+            .iter()
+            .map(|suppressed| CopyLiveDaemonSuppressedWouldSubmit {
+                order: suppressed.plan.order.clone(),
+                reason_code: suppressed.reason_code.clone(),
+                message: suppressed.message.clone(),
+            })
+            .collect::<Vec<_>>();
+        submit_plan_contract = copy_live_daemon_submit_plan_contract(
+            &options,
+            &executable_submit_plan_refs,
+            &suppressed_submit_plan_refs,
+            planned_notional_usd,
+            estimated_fees_usd,
+            &pre_submit_reconciliations,
+        );
+    }
     if options.submit
         && !persistent_live_submit.submitted_reports.is_empty()
         && copy_live_daemon_persistent_submit_snapshot_safe_to_save(&persistent_live_submit)
@@ -8894,20 +10057,33 @@ fn copy_live_daemon_live_submit_health_ok(
     if report.ok {
         return true;
     }
-    if !report.checks.iter().all(|check| check.ok) || !report.cleanup_errors.is_empty() {
+    if !report.cleanup_errors.is_empty() {
         return false;
     }
     let live_submitted = copy_canary_live_submitted_reports(&report.submitted_reports);
-    !live_submitted.is_empty()
-        && report
-            .submitted_reports
-            .iter()
-            .all(|submitted| !matches!(submitted, domain::WorkerReport::Error(_)))
-        && report.order_evidence.len() == live_submitted.len()
-        && report
-            .order_evidence
-            .iter()
-            .all(copy_execution_canary_order_evidence_ok)
+    let all_reports_accounted_for = report.submitted_reports.iter().all(|submitted| {
+        matches!(submitted, domain::WorkerReport::Submitted(_))
+            || copy_live_daemon_report_is_safe_pre_submit_skip(submitted)
+    });
+    if !all_reports_accounted_for {
+        return false;
+    }
+    let non_critical_checks_ok = report.checks.iter().all(|check| {
+        check.ok
+            || matches!(
+                check.name.as_str(),
+                "submitted_reports" | "persistent_live_submit_chunks"
+            )
+    });
+    if !non_critical_checks_ok {
+        return false;
+    }
+    live_submitted.is_empty()
+        || (report.order_evidence.len() == live_submitted.len()
+            && report
+                .order_evidence
+                .iter()
+                .all(copy_execution_canary_order_evidence_ok))
 }
 
 fn copy_live_daemon_supervisor_ok(
@@ -9263,13 +10439,15 @@ fn copy_live_daemon_submit_plan_contract(
         .iter()
         .map(|plan| plan.order.cloid.as_str())
         .collect::<HashSet<_>>();
-    let executable_signal_ids = executable_refs
+    let executable_account_signal_refs = executable_refs
         .iter()
-        .map(|plan| plan.signal_id.as_str())
-        .collect::<HashSet<_>>();
-    let executable_record_indexes = executable_refs
-        .iter()
-        .map(|plan| plan.record_index)
+        .map(|plan| {
+            (
+                plan.record_index,
+                plan.signal_id.as_str(),
+                plan.order.account_id.as_str(),
+            )
+        })
         .collect::<HashSet<_>>();
     let suppressed_cloids = suppressed_refs
         .iter()
@@ -9339,18 +10517,17 @@ fn copy_live_daemon_submit_plan_contract(
             "signal_refs_present",
             executable_refs
                 .iter()
-                .all(|plan| !plan.signal_id.trim().is_empty())
-                && executable_signal_ids.len() == executable_refs.len(),
+                .all(|plan| !plan.signal_id.trim().is_empty()),
             format!(
-                "{} executable plan ref(s) have unique signal ids",
+                "{} executable plan ref(s) have non-empty signal ids",
                 executable_refs.len()
             ),
         ),
         copy_shadow_smoke_check(
-            "record_refs_unique",
-            executable_record_indexes.len() == executable_refs.len(),
+            "account_signal_refs_unique",
+            executable_account_signal_refs.len() == executable_refs.len(),
             format!(
-                "{} executable plan ref(s) map to unique shadow record indexes",
+                "{} executable plan ref(s) map to unique record/signal/account tuples",
                 executable_refs.len()
             ),
         ),
@@ -9439,25 +10616,20 @@ struct CopyLiveDaemonOpenMarginCheck {
 
 fn copy_live_daemon_open_margin_requirements(
     executable_refs: &[CopyLiveDaemonWouldSubmitRef],
-    estimated_fees_usd: f64,
+    _estimated_fees_usd: f64,
 ) -> HashMap<String, f64> {
     let mut requirements = HashMap::new();
     let leverage = strategies::smart_money::COPY_MAX_LEVERAGE.max(1.0);
+    let notional_to_margin =
+        (1.0 + COPY_DAEMON_MARGIN_BUFFER_RATIO) / leverage + COPY_DAEMON_FEE_BUFFER_RATIO;
     for plan in executable_refs
         .iter()
         .filter(|plan| !plan.order.reduce_only)
     {
-        let principal =
-            (plan.order.notional_usd.max(0.0) / leverage) * (1.0 + COPY_DAEMON_MARGIN_BUFFER_RATIO);
+        let principal = plan.order.notional_usd.max(0.0) * notional_to_margin;
         *requirements
             .entry(plan.order.account_id.clone())
             .or_insert(0.0) += principal;
-    }
-    if !requirements.is_empty() && estimated_fees_usd.is_finite() && estimated_fees_usd > 0.0 {
-        let fee_buffer_per_account = estimated_fees_usd / requirements.len() as f64;
-        for required in requirements.values_mut() {
-            *required += fee_buffer_per_account;
-        }
     }
     requirements
 }
@@ -9936,6 +11108,22 @@ async fn copy_live_daemon_filter_submit_refs_for_live_reduce_exposure(
     )
 }
 
+fn copy_live_daemon_submit_accounts_in_scope(
+    config: &config::AppConfig,
+    options: &CopyLiveDaemonSupervisorOptions,
+    executable_refs: &[CopyLiveDaemonWouldSubmitRef],
+) -> bool {
+    let selected_accounts =
+        copy_execution_canary_target_accounts(config, &options.account_ids, None)
+            .into_iter()
+            .collect::<HashSet<_>>();
+    !selected_accounts.is_empty()
+        && executable_refs.iter().all(|plan| {
+            selected_accounts.contains(&plan.order.account_id)
+                && config.account(&plan.order.account_id).is_some()
+        })
+}
+
 async fn copy_live_daemon_persistent_live_submit(
     config: &config::AppConfig,
     options: &CopyLiveDaemonSupervisorOptions,
@@ -10000,9 +11188,13 @@ async fn copy_live_daemon_persistent_live_submit(
             "mainnet persistent live submit requires manual_ops.mainnet_live_enabled=true",
         ),
         copy_shadow_smoke_check(
-            "single_account_submit",
-            options.account_ids.len() == 1,
-            "initial persistent live submit bridge is restricted to one target account",
+            "selected_submit_accounts",
+            copy_live_daemon_submit_accounts_in_scope(config, options, executable_refs),
+            format!(
+                "{} selected account(s); {} submit-eligible ref(s) must belong to configured selected accounts",
+                options.account_ids.len(),
+                executable_refs.len()
+            ),
         ),
         copy_shadow_smoke_check(
             "single_open_order_submit",
@@ -10136,15 +11328,22 @@ async fn copy_live_daemon_persistent_live_submit(
     let (ledger_reconciliations, ledger_reconciliation_snapshot) =
         reconcile_copy_canary_ledger(approved_records, &submitted_reports, &order_evidence);
 
-    let submitted_reports_ok = submitted_reports
+    let pre_submit_skipped_count = submitted_reports
         .iter()
-        .all(|report| matches!(report, domain::WorkerReport::Submitted(_)));
+        .filter(|report| copy_live_daemon_report_is_safe_pre_submit_skip(report))
+        .count();
+    let submitted_reports_ok = submitted_reports.iter().all(|report| {
+        matches!(report, domain::WorkerReport::Submitted(_))
+            || copy_live_daemon_report_is_safe_pre_submit_skip(report)
+    });
     checks.push(copy_shadow_smoke_check(
         "submitted_reports",
-        live_submitted_count == submit_ready_refs.len() && submitted_reports_ok,
+        live_submitted_count + pre_submit_skipped_count == submit_ready_refs.len()
+            && submitted_reports_ok,
         format!(
-            "{} live submitted report(s) for {} submit-eligible ref(s); {} reduce-only no-op ref(s) skipped",
+            "{} live submitted report(s), {} pre-submit skipped ref(s), for {} submit-eligible ref(s); {} reduce-only no-op ref(s) skipped",
             live_submitted_count,
+            pre_submit_skipped_count,
             submit_ready_refs.len(),
             executable_refs.len().saturating_sub(submit_ready_refs.len())
         ),
@@ -10221,6 +11420,92 @@ async fn copy_live_daemon_persistent_live_submit(
         ledger_reconciliation_snapshot,
         checks,
     }
+}
+
+fn copy_live_daemon_report_is_safe_pre_submit_skip(report: &domain::WorkerReport) -> bool {
+    let domain::WorkerReport::Error(error) = report else {
+        return false;
+    };
+    copy_live_daemon_error_is_safe_pre_submit_skip(&error.message)
+}
+
+fn copy_live_daemon_error_is_safe_pre_submit_skip(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    normalized.contains("failed to set ")
+        && normalized.contains(" leverage to ")
+        && normalized.contains(" before copy submit")
+        || normalized.contains("copy submit skipped before exchange")
+            && normalized.contains("below exchange minimum")
+        || normalized.contains("exchange returned action-level order error")
+            && normalized.contains("minimum value")
+}
+
+async fn copy_live_daemon_suppress_refs_below_effective_min(
+    config: &config::AppConfig,
+    options: &CopyLiveDaemonSupervisorOptions,
+    refs: &[CopyLiveDaemonWouldSubmitRef],
+) -> (
+    Vec<CopyLiveDaemonWouldSubmitRef>,
+    Vec<CopyLiveDaemonSuppressedWouldSubmitRef>,
+) {
+    let mut executable = Vec::new();
+    let mut suppressed = Vec::new();
+    for plan in refs {
+        if plan.order.reduce_only {
+            executable.push(plan.clone());
+            continue;
+        }
+
+        let scoped_config = copy_daemon_config_for_coin(config, &plan.order.coin);
+        let account = match scoped_config.account(&plan.order.account_id).cloned() {
+            Some(account) => account,
+            None => {
+                suppressed.push(CopyLiveDaemonSuppressedWouldSubmitRef {
+                    plan: plan.clone(),
+                    reason_code: "COPY_DAEMON_ACCOUNT_NOT_CONFIGURED".to_string(),
+                    message: format!(
+                        "{} is not configured for copy submit",
+                        plan.order.account_id
+                    ),
+                });
+                continue;
+            }
+        };
+
+        let approved_order = match approved_copy_daemon_order_from_ref(
+            &scoped_config,
+            options,
+            &account,
+            plan,
+            false,
+        ) {
+            Ok(order) => order,
+            Err(error) => {
+                suppressed.push(CopyLiveDaemonSuppressedWouldSubmitRef {
+                    plan: plan.clone(),
+                    reason_code: "COPY_DAEMON_ORDER_PREPARE_FAILED".to_string(),
+                    message: error.to_string(),
+                });
+                continue;
+            }
+        };
+
+        match copy_live_daemon_open_order_effective_min_check(&scoped_config, &approved_order).await
+        {
+            Ok(Some(message)) => suppressed.push(CopyLiveDaemonSuppressedWouldSubmitRef {
+                plan: plan.clone(),
+                reason_code: "COPY_DAEMON_EFFECTIVE_NOTIONAL_BELOW_MIN".to_string(),
+                message,
+            }),
+            Ok(None) => executable.push(plan.clone()),
+            Err(error) => suppressed.push(CopyLiveDaemonSuppressedWouldSubmitRef {
+                plan: plan.clone(),
+                reason_code: "COPY_DAEMON_EFFECTIVE_MIN_CHECK_FAILED".to_string(),
+                message: error.to_string(),
+            }),
+        }
+    }
+    (executable, suppressed)
 }
 
 fn copy_daemon_submitted_reports_needing_cleanup(
@@ -10335,8 +11620,22 @@ async fn execute_copy_daemon_submit_ref(
         .with_context(|| format!("account {} not found", plan.order.account_id))?;
     let approved_order =
         approved_copy_daemon_order_from_ref(&scoped_config, options, &account, plan, false)?;
-    let vault_password = std::env::var("TRADE_XYZ_VAULT_PASSWORD").ok();
-    if let Some(leverage_options) = copy_daemon_live_leverage_update_options(options, plan)? {
+    if let Some(message) =
+        copy_live_daemon_open_order_effective_min_check(&scoped_config, &approved_order).await?
+    {
+        return Ok(domain::WorkerReport::Error(domain::WorkerError {
+            worker_id: approved_order.worker_id.clone(),
+            account_id: approved_order.account_id.clone(),
+            message,
+            error_at_ms: domain::now_ms(),
+        }));
+    }
+    let vault_password = copy_daemon_vault_password(&scoped_config)?;
+    let max_leverage = copy_daemon_live_plan_max_leverage(&scoped_config, plan).await?;
+    if let Some(leverage_options) =
+        copy_daemon_live_leverage_update_options_with_max(options, plan, max_leverage)?
+    {
+        let leverage = leverage_options.leverage;
         trading::execute_manual_leverage_update(
             scoped_config.clone(),
             leverage_options,
@@ -10346,14 +11645,137 @@ async fn execute_copy_daemon_submit_ref(
         .with_context(|| {
             format!(
                 "failed to set {} leverage to {}x before copy submit",
-                plan.order.coin,
-                strategies::smart_money::COPY_MAX_LEVERAGE
+                plan.order.coin, leverage
             )
         })?;
     }
     let secret = secrets::load_account_secret(&scoped_config, &account, vault_password.as_deref())?;
     let executor = trading::AccountExecutor::live(scoped_config, account, secret);
     Ok(executor.submit(approved_order).await)
+}
+
+fn copy_daemon_vault_password(config: &config::AppConfig) -> Result<Option<String>> {
+    if let Ok(password) = std::env::var("TRADE_XYZ_VAULT_PASSWORD")
+        && !password.trim().is_empty()
+    {
+        return Ok(Some(password));
+    }
+    let vault_path = std::path::PathBuf::from(&config.secrets.vault_path);
+    secrets::read_cached_vault_password(&vault_path, domain::now_ms())
+}
+
+fn copy_live_daemon_signer_preflight_checks(
+    config: &config::AppConfig,
+    target_accounts: &[String],
+    submit_requested: bool,
+) -> Vec<CopyShadowSmokeCheck> {
+    if !submit_requested {
+        return vec![copy_shadow_smoke_check(
+            "copy_signers_available",
+            true,
+            "signer preflight skipped in no-submit mode",
+        )];
+    }
+    let vault_password = match copy_daemon_vault_password(config) {
+        Ok(password) => password,
+        Err(error) => {
+            return vec![copy_shadow_smoke_check(
+                "copy_signers_available",
+                false,
+                format!("failed to read Vault session cache for signer preflight: {error:#}"),
+            )];
+        }
+    };
+    let mut missing = Vec::new();
+    for account_id in target_accounts {
+        match config.account(account_id) {
+            Some(account) => {
+                if let Err(error) =
+                    secrets::load_account_secret(config, account, vault_password.as_deref())
+                {
+                    missing.push(format!("{account_id}: {error:#}"));
+                }
+            }
+            None => missing.push(format!("{account_id}: account is not configured")),
+        }
+    }
+    if missing.is_empty() {
+        vec![copy_shadow_smoke_check(
+            "copy_signers_available",
+            true,
+            format!(
+                "all {} selected local account signer(s) can be loaded from the current Vault session/cache",
+                target_accounts.len()
+            ),
+        )]
+    } else {
+        vec![copy_shadow_smoke_check(
+            "copy_signers_available",
+            false,
+            format!(
+                "selected local account signer preflight failed: {}",
+                missing.join("; ")
+            ),
+        )]
+    }
+}
+
+async fn copy_live_daemon_open_order_effective_min_check(
+    config: &config::AppConfig,
+    order: &domain::ApprovedOrder,
+) -> Result<Option<String>> {
+    if order.reduce_only {
+        return Ok(None);
+    }
+
+    let (_, dex) = copy_daemon_market_dex_for_coin(&order.coin);
+    let effective_notional = if dex.as_deref() == Some("spot") {
+        let snapshot =
+            hyperliquid::fetch_spot_market_snapshot_cached(&config.app.environment, 15_000)
+                .await
+                .context("failed to fetch spot market metadata for copy submit min check")?;
+        let plan = hyperliquid::build_spot_order_plan(
+            &snapshot,
+            &order.coin,
+            matches!(order.side, domain::OrderSide::Buy),
+            order.notional_usd,
+            order.price,
+            order.max_slippage_bps,
+        )
+        .context("failed to build spot copy submit precision plan")?;
+        trading::effective_order_notional_usd(plan.limit_price, plan.size)
+    } else {
+        let snapshot = hyperliquid::fetch_xyz_market_snapshot_cached(
+            &config.app.environment,
+            dex.as_deref().unwrap_or(config.hyperliquid.dex.as_str()),
+            15_000,
+        )
+        .await
+        .context("failed to fetch perp market metadata for copy submit min check")?;
+        let plan = trading::build_signed_order_plan(
+            &snapshot,
+            &order.coin,
+            order.side,
+            order.notional_usd,
+            order.max_slippage_bps,
+            order.execution_mode,
+            order.exact_size,
+        )
+        .context("failed to build perp copy submit precision plan")?;
+        trading::effective_order_notional_usd(plan.limit_price, plan.size)
+    };
+
+    if effective_notional + 1e-9 < trading::HYPERLIQUID_MIN_ORDER_NOTIONAL_USD {
+        return Ok(Some(format!(
+            "copy submit skipped before exchange: {} {} requested_notional={:.6} effective_notional={:.6} below exchange minimum {:.6}",
+            order.account_id,
+            order.coin,
+            order.notional_usd,
+            effective_notional,
+            trading::HYPERLIQUID_MIN_ORDER_NOTIONAL_USD
+        )));
+    }
+    Ok(None)
 }
 
 fn copy_daemon_config_for_coin(config: &config::AppConfig, coin: &str) -> config::AppConfig {
@@ -10418,9 +11840,18 @@ fn copy_daemon_market_scope_allows_open(
         .any(|allowed| allowed == &market)
 }
 
+#[cfg(test)]
 fn copy_daemon_live_leverage_update_options(
     options: &CopyLiveDaemonSupervisorOptions,
     plan: &CopyLiveDaemonWouldSubmitRef,
+) -> Result<Option<trading::ManualLeverageUpdateOptions>> {
+    copy_daemon_live_leverage_update_options_with_max(options, plan, None)
+}
+
+fn copy_daemon_live_leverage_update_options_with_max(
+    options: &CopyLiveDaemonSupervisorOptions,
+    plan: &CopyLiveDaemonWouldSubmitRef,
+    max_leverage: Option<u32>,
 ) -> Result<Option<trading::ManualLeverageUpdateOptions>> {
     if plan.order.reduce_only {
         return Ok(None);
@@ -10430,7 +11861,11 @@ fn copy_daemon_live_leverage_update_options(
         return Ok(None);
     }
 
-    let leverage = copy_daemon_live_target_leverage()?;
+    let target = copy_daemon_live_target_leverage()?;
+    let leverage = max_leverage
+        .filter(|max| *max >= 1)
+        .map(|max| target.min(max))
+        .unwrap_or(target);
     Ok(Some(trading::ManualLeverageUpdateOptions {
         account_id: plan.order.account_id.clone(),
         coin: plan.order.coin.clone(),
@@ -10439,6 +11874,28 @@ fn copy_daemon_live_leverage_update_options(
         submit: true,
         confirm_mainnet_live: options.confirm_mainnet_live,
     }))
+}
+
+async fn copy_daemon_live_plan_max_leverage(
+    config: &config::AppConfig,
+    plan: &CopyLiveDaemonWouldSubmitRef,
+) -> Result<Option<u32>> {
+    if plan.order.reduce_only {
+        return Ok(None);
+    }
+    let (_, dex) = copy_daemon_market_dex_for_coin(&plan.order.coin);
+    if dex.as_deref() == Some("spot") {
+        return Ok(None);
+    }
+    let snapshot = hyperliquid::fetch_xyz_market_snapshot_cached(
+        &config.app.environment,
+        dex.as_deref().unwrap_or(config.hyperliquid.dex.as_str()),
+        15_000,
+    )
+    .await
+    .context("failed to fetch copy submit market metadata")?;
+    let asset = snapshot.asset(&plan.order.coin)?;
+    Ok(asset.meta.max_leverage)
 }
 
 fn copy_daemon_live_target_leverage() -> Result<u32> {
@@ -11445,6 +12902,42 @@ fn append_unique_copy_daemon_would_submit_refs(
     }
 }
 
+fn copy_live_daemon_pending_plan_refs(
+    refs: &[CopyLiveDaemonWouldSubmitRef],
+    submitted_plan_cloids: &HashSet<String>,
+) -> Vec<CopyLiveDaemonWouldSubmitRef> {
+    refs.iter()
+        .filter(|plan| !submitted_plan_cloids.contains(&plan.order.cloid))
+        .cloned()
+        .collect()
+}
+
+fn copy_live_daemon_pending_suppressed_refs(
+    refs: &[CopyLiveDaemonSuppressedWouldSubmitRef],
+    submitted_plan_cloids: &HashSet<String>,
+) -> Vec<CopyLiveDaemonSuppressedWouldSubmitRef> {
+    refs.iter()
+        .filter(|suppressed| !submitted_plan_cloids.contains(&suppressed.plan.order.cloid))
+        .cloned()
+        .collect()
+}
+
+fn copy_live_daemon_submitted_report_cloids(
+    report: &CopyLiveDaemonPersistentLiveSubmitReport,
+) -> HashSet<String> {
+    report
+        .submitted_reports
+        .iter()
+        .filter_map(|report| match report {
+            domain::WorkerReport::Submitted(submitted) => {
+                let cloid = submitted.cloid.trim();
+                (!cloid.is_empty()).then(|| cloid.to_string())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 fn partition_copy_live_daemon_would_submit_orders(
     orders: &[CopyExecutionCanaryWouldSubmit],
@@ -11460,7 +12953,11 @@ fn partition_copy_live_daemon_would_submit_orders(
     for order in orders {
         let is_open_candidate = !order.reduce_only;
         let next_open_order_count = planned_open_order_count + usize::from(is_open_candidate);
-        let next_notional_usd = planned_notional_usd + order.notional_usd.max(0.0);
+        let next_notional_usd = if is_open_candidate {
+            planned_notional_usd + order.notional_usd.max(0.0)
+        } else {
+            planned_notional_usd
+        };
         let next_fee_estimate_usd = normalize_report_zero(next_notional_usd * 0.001);
         let suppression = if is_open_candidate && next_open_order_count > options.max_live_orders {
             Some((
@@ -11518,10 +13015,87 @@ fn partition_copy_live_daemon_would_submit_refs(
     let mut suppressed = Vec::new();
     let mut planned_notional_usd = 0.0;
     let mut planned_open_order_count = 0usize;
+    let mut processed_open_groups = HashSet::new();
     for plan in refs {
         let is_open_candidate = !plan.order.reduce_only;
-        let next_open_order_count = planned_open_order_count + usize::from(is_open_candidate);
-        let next_notional_usd = planned_notional_usd + plan.order.notional_usd.max(0.0);
+        if is_open_candidate {
+            let group_key = copy_live_daemon_open_fanout_group_key(plan);
+            if !processed_open_groups.insert(group_key.clone()) {
+                continue;
+            }
+            let group = refs
+                .iter()
+                .filter(|candidate| {
+                    !candidate.order.reduce_only
+                        && copy_live_daemon_open_fanout_group_key(candidate) == group_key
+                })
+                .collect::<Vec<_>>();
+            let group_notional_usd = group
+                .iter()
+                .map(|candidate| candidate.order.notional_usd.max(0.0))
+                .sum::<f64>();
+            let next_open_order_count = planned_open_order_count + group.len();
+            let next_notional_usd = planned_notional_usd + group_notional_usd;
+            let next_fee_estimate_usd = normalize_report_zero(next_notional_usd * 0.001);
+            let suppression = if !copy_daemon_market_scope_allows_open(options, &plan.order.coin) {
+                let (market, _) = copy_daemon_market_dex_for_coin(&plan.order.coin);
+                Some((
+                    "COPY_DAEMON_MARKET_EXIT_ONLY".to_string(),
+                    format!(
+                        "{} is not selected for new copy entries; reduce-only exits remain enabled",
+                        market.unwrap_or_else(|| "unknown_market".to_string())
+                    ),
+                ))
+            } else if next_open_order_count > options.max_live_orders {
+                Some((
+                    "COPY_DAEMON_MAX_LIVE_ORDERS".to_string(),
+                    format!(
+                        "open fan-out group would exceed max_live_orders {}; kept as observation only",
+                        options.max_live_orders
+                    ),
+                ))
+            } else if next_notional_usd > options.max_total_notional_usd {
+                Some((
+                    "COPY_DAEMON_MAX_TOTAL_NOTIONAL".to_string(),
+                    format!(
+                        "fan-out group would raise executable notional to {next_notional_usd:.6}, above cap {:.6}",
+                        options.max_total_notional_usd
+                    ),
+                ))
+            } else if next_fee_estimate_usd > options.max_total_fees_usd {
+                Some((
+                    "COPY_DAEMON_MAX_TOTAL_FEES".to_string(),
+                    format!(
+                        "fan-out group would raise estimated fees to {next_fee_estimate_usd:.6}, above cap {:.6}",
+                        options.max_total_fees_usd
+                    ),
+                ))
+            } else {
+                None
+            };
+
+            if let Some((reason_code, message)) = suppression {
+                for grouped_plan in group {
+                    suppressed.push(CopyLiveDaemonSuppressedWouldSubmitRef {
+                        plan: grouped_plan.clone(),
+                        reason_code: reason_code.clone(),
+                        message: message.clone(),
+                    });
+                }
+            } else {
+                planned_notional_usd = next_notional_usd;
+                planned_open_order_count = next_open_order_count;
+                executable.extend(group.into_iter().cloned());
+            }
+            continue;
+        }
+
+        let next_open_order_count = planned_open_order_count;
+        let next_notional_usd = if is_open_candidate {
+            planned_notional_usd + plan.order.notional_usd.max(0.0)
+        } else {
+            planned_notional_usd
+        };
         let next_fee_estimate_usd = normalize_report_zero(next_notional_usd * 0.001);
         let suppression = if is_open_candidate
             && !copy_daemon_market_scope_allows_open(options, &plan.order.coin)
@@ -11579,6 +13153,25 @@ fn partition_copy_live_daemon_would_submit_refs(
     (executable, suppressed)
 }
 
+fn copy_live_daemon_open_fanout_group_key(plan: &CopyLiveDaemonWouldSubmitRef) -> String {
+    format!(
+        "{}|{}|{:?}|{}|{}",
+        plan.leader_id,
+        plan.order.coin,
+        plan.order.side,
+        plan.order.reduce_only,
+        copy_live_daemon_signal_id_without_timestamp(&plan.signal_id)
+    )
+}
+
+fn copy_live_daemon_signal_id_without_timestamp(signal_id: &str) -> &str {
+    signal_id
+        .rsplit_once('-')
+        .filter(|(_, suffix)| suffix.chars().all(|ch| ch.is_ascii_digit()))
+        .map(|(prefix, _)| prefix)
+        .unwrap_or(signal_id)
+}
+
 fn copy_live_daemon_executable_refs_for_snapshot(
     refs: &[CopyLiveDaemonWouldSubmitRef],
     options: &CopyLiveDaemonSupervisorOptions,
@@ -11625,6 +13218,7 @@ fn copy_live_daemon_resize_open_refs_for_margin(
         .collect::<HashMap<_, _>>();
     let leverage = strategies::smart_money::COPY_MAX_LEVERAGE.max(1.0);
     let margin_multiplier = 1.0 + COPY_DAEMON_MARGIN_BUFFER_RATIO;
+    let notional_to_margin = margin_multiplier / leverage + COPY_DAEMON_FEE_BUFFER_RATIO;
 
     for plan in refs {
         if plan.order.reduce_only {
@@ -11646,15 +13240,14 @@ fn copy_live_daemon_resize_open_refs_for_margin(
         };
 
         let requested_notional = plan.order.notional_usd.max(0.0);
-        let requested_margin = (requested_notional / leverage) * margin_multiplier;
+        let requested_margin = requested_notional * notional_to_margin;
         if *remaining_margin + 1e-9 >= requested_margin {
             *remaining_margin = (*remaining_margin - requested_margin).max(0.0);
             prepared.push(plan.clone());
             continue;
         }
 
-        let resized_notional =
-            normalize_report_zero((*remaining_margin * leverage) / margin_multiplier);
+        let resized_notional = normalize_report_zero(*remaining_margin / notional_to_margin);
         if resized_notional + 1e-9 < trading::HYPERLIQUID_MIN_ORDER_NOTIONAL_USD {
             suppressed.push(CopyLiveDaemonSuppressedWouldSubmitRef {
                 plan: plan.clone(),
@@ -12025,7 +13618,7 @@ fn copy_live_daemon_local_side_from_position_szi(szi: &str) -> Option<domain::Or
     }
 }
 
-fn copy_live_daemon_merge_persistence_snapshots_for_save(
+fn copy_live_daemon_merge_persistence_snapshots(
     existing: strategies::smart_money::CopyPersistenceSnapshot,
     incoming: strategies::smart_money::CopyPersistenceSnapshot,
 ) -> strategies::smart_money::CopyPersistenceSnapshot {
@@ -12049,14 +13642,21 @@ fn copy_live_daemon_merge_persistence_snapshots_for_save(
             .cmp(&copy_live_daemon_ledger_entry_identity(right))
     });
 
-    copy_live_daemon_persistence_snapshot_for_save(
-        strategies::smart_money::CopyPersistenceSnapshot {
-            schema_version: 1,
-            saved_at_ms: domain::now_ms(),
-            seen_event_keys,
-            ledger_entries,
-        },
-    )
+    strategies::smart_money::CopyPersistenceSnapshot {
+        schema_version: 1,
+        saved_at_ms: domain::now_ms(),
+        seen_event_keys,
+        ledger_entries,
+    }
+}
+
+fn copy_live_daemon_merge_persistence_snapshots_for_save(
+    existing: strategies::smart_money::CopyPersistenceSnapshot,
+    incoming: strategies::smart_money::CopyPersistenceSnapshot,
+) -> strategies::smart_money::CopyPersistenceSnapshot {
+    copy_live_daemon_persistence_snapshot_for_save(copy_live_daemon_merge_persistence_snapshots(
+        existing, incoming,
+    ))
 }
 
 fn copy_live_daemon_ledger_entry_identity(

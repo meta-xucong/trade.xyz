@@ -107,9 +107,6 @@ pub fn evaluate_copy_signal_risk(input: CopySignalRiskInput<'_>) -> CopySignalRi
     if !input.leader_enabled {
         return copy_risk_rejected("COPY_LEADER_DISABLED");
     }
-    if input.symbol_blocked {
-        return copy_risk_rejected("COPY_SYMBOL_BLOCKED");
-    }
     if input.now_ms.saturating_sub(input.action.received_at_ms) > input.max_signal_delay_ms {
         return copy_risk_rejected("COPY_SIGNAL_TOO_OLD");
     }
@@ -130,6 +127,9 @@ fn evaluate_copy_open_risk(
     input: CopySignalRiskInput<'_>,
     side: OrderSide,
 ) -> CopySignalRiskDecision {
+    if input.symbol_blocked {
+        return copy_risk_rejected("COPY_SYMBOL_BLOCKED");
+    }
     if matches!(side, OrderSide::Sell) && !input.allow_short {
         return copy_risk_rejected("COPY_SHORT_NOT_ALLOWED");
     }

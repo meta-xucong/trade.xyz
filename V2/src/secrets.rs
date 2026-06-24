@@ -27,6 +27,7 @@ const KEY_LEN: usize = 32;
 const DEFAULT_ARGON2_MEMORY_KIB: u32 = 64 * 1024;
 const DEFAULT_ARGON2_ITERATIONS: u32 = 3;
 const DEFAULT_ARGON2_PARALLELISM: u32 = 1;
+pub const VAULT_SESSION_CACHE_PATH: &str = ".codex-longrun/vault-session-cache.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VaultFile {
@@ -200,6 +201,131 @@ pub fn load_account_secret(
         account.account_id,
         account_secret_id(account)
     )
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedVaultSession {
+    version: u32,
+    vault_path: String,
+    vault_modified_at_ms: u64,
+    unlocked_at_ms: u64,
+    expires_at_ms: u64,
+    protected_password_b64: String,
+}
+
+pub fn read_cached_vault_password(vault_path: &Path, now_ms_value: u64) -> Result<Option<String>> {
+    read_cached_vault_password_from_path(
+        &PathBuf::from(VAULT_SESSION_CACHE_PATH),
+        vault_path,
+        now_ms_value,
+    )
+}
+
+pub fn read_cached_vault_password_from_path(
+    cache_path: &Path,
+    vault_path: &Path,
+    now_ms_value: u64,
+) -> Result<Option<String>> {
+    if !cache_path.exists() || !vault_path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read(cache_path).with_context(|| {
+        format!(
+            "failed to read Vault session cache {}",
+            cache_path.display()
+        )
+    })?;
+    let cache = serde_json::from_slice::<PersistedVaultSession>(&raw)
+        .context("failed to parse Vault session cache")?;
+    if cache.version != 1
+        || PathBuf::from(&cache.vault_path) != vault_path
+        || now_ms_value > cache.expires_at_ms
+    {
+        return Ok(None);
+    }
+    if file_modified_at_ms(vault_path).unwrap_or(0) != cache.vault_modified_at_ms {
+        return Ok(None);
+    }
+    let protected = STANDARD_NO_PAD
+        .decode(cache.protected_password_b64)
+        .context("failed to decode cached Vault session password")?;
+    let mut plain =
+        unprotect_local_secret(&protected).context("failed to unprotect cached Vault session")?;
+    let password =
+        String::from_utf8(plain.clone()).context("cached Vault session password is not UTF-8")?;
+    plain.zeroize();
+    Ok(Some(password))
+}
+
+fn file_modified_at_ms(path: &Path) -> Result<u64> {
+    let modified = fs::metadata(path)
+        .with_context(|| format!("failed to stat {}", path.display()))?
+        .modified()
+        .with_context(|| format!("failed to read modified time for {}", path.display()))?;
+    let duration = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    Ok(duration.as_millis().min(u128::from(u64::MAX)) as u64)
+}
+
+#[cfg(windows)]
+fn unprotect_local_secret(secret: &[u8]) -> Result<Vec<u8>> {
+    use std::ptr;
+    use windows_sys::Win32::Security::Cryptography::{
+        CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptUnprotectData,
+    };
+
+    let mut input = CRYPT_INTEGER_BLOB {
+        cbData: secret
+            .len()
+            .try_into()
+            .context("secret is too large for DPAPI")?,
+        pbData: secret.as_ptr() as *mut u8,
+    };
+    let mut output = CRYPT_INTEGER_BLOB::default();
+    // SAFETY: input points to `secret` for the duration of the call; output is freed with LocalFree.
+    let ok = unsafe {
+        CryptUnprotectData(
+            &mut input,
+            ptr::null_mut(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut output,
+        )
+    };
+    if ok == 0 {
+        anyhow::bail!("CryptUnprotectData failed");
+    }
+    let bytes = unsafe { protected_blob_to_vec_and_free(output) };
+    Ok(bytes)
+}
+
+#[cfg(windows)]
+unsafe fn protected_blob_to_vec_and_free(
+    blob: windows_sys::Win32::Security::Cryptography::CRYPT_INTEGER_BLOB,
+) -> Vec<u8> {
+    use windows_sys::Win32::Foundation::LocalFree;
+
+    let bytes = if blob.pbData.is_null() || blob.cbData == 0 {
+        Vec::new()
+    } else {
+        // SAFETY: DPAPI returned `pbData` with `cbData` bytes; caller frees it below.
+        unsafe { std::slice::from_raw_parts(blob.pbData, blob.cbData as usize) }.to_vec()
+    };
+    if !blob.pbData.is_null() {
+        // SAFETY: DPAPI buffers must be released with LocalFree.
+        unsafe {
+            LocalFree(blob.pbData.cast());
+        }
+    }
+    bytes
+}
+
+#[cfg(not(windows))]
+fn unprotect_local_secret(_secret: &[u8]) -> Result<Vec<u8>> {
+    anyhow::bail!("persistent Vault session cache is only supported on Windows")
 }
 
 pub fn load_transfer_secret(

@@ -28,8 +28,8 @@ use zeroize::Zeroize;
 use crate::{
     audit::{AuditEvent, append_audit_event, read_recent_audit_events},
     config::{
-        AccountConfig, AppConfig, MARKET_HL_PERP, MARKET_SPOT, MARKET_XYZ_PERP, load_config,
-        normalize_market_id, normalize_market_list, save_config, supported_market_ids,
+        AccountConfig, AppConfig, MARKET_CASH_PERP, MARKET_HL_PERP, MARKET_SPOT, MARKET_XYZ_PERP,
+        load_config, normalize_market_id, normalize_market_list, save_config, supported_market_ids,
     },
     domain::{
         CoordinatorSignal, ExecutionMode, OrderSide, SignalOrder, SignalSource, WorkerReport,
@@ -114,6 +114,7 @@ const COPY_SHADOW_HISTORY_PATH: &str = "logs/copy_shadow_history.jsonl";
 const COPY_LIVE_SOAK_DIR: &str = ".codex-longrun";
 const COPY_LIVE_SOAK_CURRENT_SNAPSHOT: &str = "persistent-live-soak-resume-current-snapshot.json";
 const COPY_UI_SETTINGS_PATH: &str = ".codex-longrun/copy-ui-settings.json";
+const COPY_LIVE_SOAK_PAUSE_PATH: &str = ".codex-longrun/copy-live-soak-paused.flag";
 const NOTIFICATION_SETTINGS_PATH: &str = ".codex-longrun/notification-settings.json";
 const VAULT_SESSION_CACHE_PATH: &str = ".codex-longrun/vault-session-cache.json";
 const VAULT_SESSION_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000;
@@ -842,7 +843,11 @@ fn apply_copy_settings_to_config(config: &mut AppConfig, settings: &CopyUiSettin
         .iter_mut()
         .filter(|account| account.enabled && account.worker_enabled)
     {
-        if account.account_id == settings.account_id {
+        if settings
+            .account_ids
+            .iter()
+            .any(|account_id| account_id == &account.account_id)
+        {
             let desired_cap = settings.principal_cap_usd * settings.leverage.max(1.0);
             if (account.max_order_notional_usd - desired_cap).abs() > f64::EPSILON {
                 account.max_order_notional_usd = desired_cap;
@@ -3443,6 +3448,8 @@ async fn copy_settings_update(
         "copy_ratio": payload.copy_ratio,
         "principal_cap_usd": payload.principal_cap_usd,
         "account_id": payload.account_id.clone(),
+        "account_ids": payload.account_ids.clone(),
+        "markets": payload.markets.clone(),
     });
     let result = state.apply_copy_settings(payload);
     let response = ApiResult::from_result(result);
@@ -7565,9 +7572,14 @@ async fn build_copy_summary_response(state: &FrontendAppState) -> Result<CopySum
     let copy_settings = read_copy_ui_settings().ok();
     let ledger_positions =
         read_copy_ledger_position_summaries(&copy_live_soak_dir()).unwrap_or_default();
-    let live_accounts = read_copy_live_account_summaries(state, copy_settings.as_ref())
-        .await
-        .unwrap_or_default();
+    let live_accounts = tokio::time::timeout(
+        Duration::from_secs(5),
+        read_copy_live_account_summaries(state, copy_settings.as_ref()),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .unwrap_or_default();
     Ok(build_copy_summary_response_from_entries(
         entries,
         live_soak,
@@ -7611,10 +7623,45 @@ fn read_copy_ui_settings() -> Result<CopyUiSettings> {
         "principal_cap_usd must be positive"
     );
     settings.leverage = COPY_MAX_LEVERAGE;
-    if settings.account_id.trim().is_empty() {
-        settings.account_id = "addr_a".to_string();
-    }
+    let raw_account_id = settings.account_id.trim().to_string();
+    let account_ids = normalize_copy_account_ids(String::new(), settings.account_ids);
+    let account_id = if raw_account_id.is_empty() {
+        account_ids
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "addr_a".to_string())
+    } else {
+        raw_account_id
+    };
+    settings.account_id = account_id.clone();
+    settings.account_ids = normalize_copy_account_ids(account_id, account_ids);
     Ok(settings)
+}
+
+fn normalize_copy_account_ids(primary: String, raw: Vec<String>) -> Vec<String> {
+    let primary = primary.trim().to_string();
+    let mut account_ids = Vec::new();
+    for item in raw {
+        for token in item.split(|ch: char| {
+            ch.is_whitespace() || ch == ',' || ch == ';' || ch == '，' || ch == '；'
+        }) {
+            let account_id = token.trim();
+            if account_id.is_empty() {
+                continue;
+            }
+            if !account_ids
+                .iter()
+                .any(|existing: &String| existing == account_id)
+            {
+                account_ids.push(account_id.to_string());
+            }
+        }
+    }
+    if !primary.is_empty() {
+        account_ids.retain(|account_id| account_id != &primary);
+        account_ids.insert(0, primary);
+    }
+    account_ids
 }
 
 fn default_copy_markets() -> Vec<String> {
@@ -7967,11 +8014,16 @@ fn start_copy_live_soak_from_frontend(
     let settings = read_copy_ui_settings()
         .or_else(|_| build_copy_settings_response(state).map(|response| response.settings))?;
     let config = state.config_snapshot()?;
-    let account_exists = config.account(&settings.account_id).is_some();
+    let missing_accounts = settings
+        .account_ids
+        .iter()
+        .filter(|account_id| config.account(account_id).is_none())
+        .cloned()
+        .collect::<Vec<_>>();
     anyhow::ensure!(
-        account_exists,
-        "copy account {} is not configured",
-        settings.account_id
+        missing_accounts.is_empty(),
+        "copy account(s) are not configured: {}",
+        missing_accounts.join(", ")
     );
     anyhow::ensure!(payload.window_secs > 0, "window_secs must be positive");
     if config.app.environment == "mainnet" && !payload.confirm_mainnet_live {
@@ -8024,6 +8076,7 @@ fn start_copy_live_soak_from_frontend(
             command.arg("-BotExePath").arg(bot_exe_path);
         }
     }
+    clear_copy_live_soak_pause_flag()?;
     command.env("TRADE_XYZ_VAULT_PASSWORD", vault_password);
     let child = command
         .spawn()
@@ -8040,22 +8093,45 @@ fn start_copy_live_soak_from_frontend(
 }
 
 fn copy_live_soak_script_path() -> PathBuf {
-    let local_override = PathBuf::from(COPY_LIVE_SOAK_DIR).join("run-persistent-live-soak.ps1");
-    if local_override.exists() {
-        return local_override;
-    }
-    PathBuf::from("V2")
+    let versioned = PathBuf::from("V2")
         .join("scripts")
-        .join("run-persistent-live-soak.ps1")
+        .join("run-persistent-live-soak.ps1");
+    if versioned.exists() {
+        return versioned;
+    }
+    PathBuf::from(COPY_LIVE_SOAK_DIR).join("run-persistent-live-soak.ps1")
+}
+
+fn write_copy_live_soak_pause_flag() -> Result<()> {
+    fs::create_dir_all(COPY_LIVE_SOAK_DIR)
+        .with_context(|| format!("failed to create {}", COPY_LIVE_SOAK_DIR))?;
+    let body = json!({
+        "paused_at_ms": now_ms(),
+        "reason": "frontend_cancel_copy",
+    });
+    write_json_pretty(Path::new(COPY_LIVE_SOAK_PAUSE_PATH), &body)
+}
+
+fn copy_live_soak_pause_flag_exists_in_dir(dir: &Path) -> bool {
+    dir.join("copy-live-soak-paused.flag").exists()
+}
+
+fn clear_copy_live_soak_pause_flag() -> Result<()> {
+    let path = Path::new(COPY_LIVE_SOAK_PAUSE_PATH);
+    if path.exists() {
+        fs::remove_file(path).with_context(|| format!("failed to remove {}", path.display()))?;
+    }
+    Ok(())
 }
 
 fn stop_copy_live_soak_from_frontend() -> Result<CopyLiveSoakActionResponse> {
+    write_copy_live_soak_pause_flag()?;
     let before = build_copy_live_soak_status_response()?;
     if !before.running {
         return Ok(CopyLiveSoakActionResponse {
             action: "stop".to_string(),
             status: before,
-            message: "copy live soak is not running".to_string(),
+            message: "copy live soak is paused; no background copy process is running".to_string(),
             pid: None,
         });
     }
@@ -8186,6 +8262,9 @@ fn build_copy_summary_response_from_entries(
     let configured_markets = copy_settings
         .map(|settings| settings.markets.clone())
         .unwrap_or_else(default_copy_markets);
+    let configured_account_ids = copy_settings
+        .map(|settings| settings.account_ids.clone())
+        .unwrap_or_default();
     let configured_address_set = configured_addresses
         .iter()
         .map(|address| address.to_ascii_lowercase())
@@ -8323,10 +8402,11 @@ fn build_copy_summary_response_from_entries(
             ..CopyPnlAccountSummary::default()
         });
     }
-    if let Some(local) = local_summary.as_ref() {
-        copied_notional_usd = copied_notional_usd
-            .max(local.notional_usd.unwrap_or_default().max(0.0))
-            .max(local.position_value_usd.unwrap_or_default().max(0.0));
+    if pnl_summary.submitted_notional_usd > 0.0 {
+        copied_notional_usd = copied_notional_usd.max(pnl_summary.submitted_notional_usd);
+    } else if let Some(local) = local_summary.as_ref() {
+        copied_notional_usd =
+            copied_notional_usd.max(local.notional_usd.unwrap_or_default().max(0.0));
     }
 
     let mut leader_summaries = Vec::new();
@@ -8428,10 +8508,26 @@ fn build_copy_summary_response_from_entries(
         .iter()
         .map(|leader| leader.open_position_count as u64)
         .sum();
+    let configured_leader_count = configured_addresses.len();
+    let live_target_count = leader_summaries
+        .iter()
+        .filter(|leader| leader.kind.eq_ignore_ascii_case("target_live"))
+        .count();
+    let target_position_state = if configured_leader_count == 0 {
+        "unconfigured"
+    } else if live_target_count == configured_leader_count {
+        "current"
+    } else if live_target_count > 0 {
+        "partial"
+    } else {
+        "unavailable"
+    }
+    .to_string();
     CopySummaryResponse {
         fetched_at_ms,
         leader_count: leader_addresses.len(),
         leader_addresses,
+        account_ids: configured_account_ids,
         markets: configured_markets,
         shadow_signal_count: would_copy_count,
         rejected_count,
@@ -8452,12 +8548,14 @@ fn build_copy_summary_response_from_entries(
         pnl_report_stale,
         pnl_report_status,
         local_summary,
+        local_summaries: live_accounts.locals,
         leader_summaries,
         target_realized_pnl_usd,
         target_unrealized_pnl_usd,
         target_total_pnl_usd,
         target_position_value_usd,
         target_open_position_count,
+        target_position_state,
         latest_entries,
     }
 }
@@ -8465,6 +8563,7 @@ fn build_copy_summary_response_from_entries(
 #[derive(Debug, Clone, Default)]
 struct CopyLiveAccountSummaries {
     local: Option<CopyPnlAccountSummary>,
+    locals: Vec<CopyPnlAccountSummary>,
     targets: Vec<CopyPnlAccountSummary>,
 }
 
@@ -8479,31 +8578,47 @@ async fn read_copy_live_account_summaries(
     let perp_markets = markets
         .iter()
         .filter_map(|market| normalize_market_id(market))
-        .filter(|market| *market == MARKET_XYZ_PERP || *market == MARKET_HL_PERP)
+        .filter(|market| *market != MARKET_SPOT)
         .collect::<Vec<_>>();
     if perp_markets.is_empty() {
         return Ok(CopyLiveAccountSummaries::default());
     }
 
-    let local = settings
-        .and_then(|settings| config.account(&settings.account_id))
-        .or_else(|| config.account("addr_a"));
-    let local_summary = if let Some(account) = local {
-        copy_live_account_summary_for_address(
+    let local_account_ids = settings
+        .map(|settings| settings.account_ids.clone())
+        .filter(|account_ids| !account_ids.is_empty())
+        .unwrap_or_else(|| {
+            settings
+                .map(|settings| vec![settings.account_id.clone()])
+                .unwrap_or_else(|| vec!["addr_a".to_string()])
+        });
+    let mut local_summaries = Vec::new();
+    for account_id in local_account_ids {
+        let Some(account) = config.account(&account_id) else {
+            continue;
+        };
+        let summary = match copy_live_account_summary_for_address(
             &config,
             &state.realtime,
-            "local".to_string(),
+            account.account_id.clone(),
             "local_live".to_string(),
             account.address.clone(),
             &perp_markets,
             true,
         )
         .await
-        .ok()
-        .filter(copy_pnl_account_summary_has_current_state)
-    } else {
-        None
-    };
+        {
+            Ok(summary) => summary,
+            Err(_) => CopyPnlAccountSummary {
+                id: account.account_id.clone(),
+                kind: "local_unavailable".to_string(),
+                address: account.address.to_ascii_lowercase(),
+                ..CopyPnlAccountSummary::default()
+            },
+        };
+        local_summaries.push(summary);
+    }
+    let local_summary = aggregate_copy_local_account_summaries(&local_summaries);
 
     let leader_addresses = settings
         .map(|settings| settings.leaders.clone())
@@ -8533,7 +8648,48 @@ async fn read_copy_live_account_summaries(
 
     Ok(CopyLiveAccountSummaries {
         local: local_summary,
+        locals: local_summaries,
         targets,
+    })
+}
+
+fn aggregate_copy_local_account_summaries(
+    accounts: &[CopyPnlAccountSummary],
+) -> Option<CopyPnlAccountSummary> {
+    if accounts.is_empty() {
+        return None;
+    }
+    let mut positions = Vec::new();
+    for account in accounts {
+        positions.extend(account.positions.iter().cloned());
+    }
+    let realized_pnl_usd =
+        copy_sum_optional(accounts.iter().map(|account| account.realized_pnl_usd));
+    let unrealized_pnl_usd =
+        copy_sum_optional(accounts.iter().map(|account| account.unrealized_pnl_usd));
+    let fees_usd = copy_sum_optional(accounts.iter().map(|account| account.fees_usd));
+    let notional_usd = copy_sum_optional(accounts.iter().map(|account| account.notional_usd));
+    let position_value_usd =
+        copy_sum_optional(accounts.iter().map(|account| account.position_value_usd));
+    Some(CopyPnlAccountSummary {
+        id: "local_all".to_string(),
+        kind: "local_live_aggregate".to_string(),
+        fill_count: accounts.iter().map(|account| account.fill_count).sum(),
+        realized_pnl_usd,
+        closed_pnl_usd: copy_sum_optional(accounts.iter().map(|account| account.closed_pnl_usd)),
+        unrealized_pnl_usd,
+        total_pnl_usd: copy_sum_optional([realized_pnl_usd, unrealized_pnl_usd]),
+        fees_usd,
+        notional_usd,
+        position_value_usd,
+        open_position_count: positions.len(),
+        positions,
+        signal_count: accounts.iter().map(|account| account.signal_count).sum(),
+        last_signal_at_ms: accounts
+            .iter()
+            .filter_map(|account| account.last_signal_at_ms)
+            .max(),
+        ..CopyPnlAccountSummary::default()
     })
 }
 
@@ -8547,6 +8703,7 @@ async fn copy_live_account_summary_for_address(
     allow_rest_fallback: bool,
 ) -> Result<CopyPnlAccountSummary> {
     let mut positions = Vec::new();
+    let mut observed_market_count = 0usize;
     for market_id in markets {
         let market = resolve_market_profile(Some(market_id), config)?;
         let state = if let Some(cached) = realtime.clearinghouse_state(market.id, &address) {
@@ -8568,7 +8725,11 @@ async fn copy_live_account_summary_for_address(
             .await
             .context("timed out fetching dex clearinghouseState for copy summary")??
         };
+        observed_market_count += 1;
         positions.extend(copy_pnl_positions_from_clearinghouse(&market, &state));
+    }
+    if observed_market_count == 0 {
+        anyhow::bail!("no current clearinghouse snapshot available for copy summary account {id}");
     }
     Ok(copy_pnl_account_summary_from_live_positions(
         id, kind, address, positions,
@@ -8653,6 +8814,7 @@ struct CopyLeaderEventMeta {
 struct CopyLiveSoakPnlSummary {
     submitted_reports: u64,
     order_evidence: u64,
+    submitted_notional_usd: f64,
     matching_fill_count: u64,
     closed_pnl_usd: f64,
     fees_usd: f64,
@@ -8725,16 +8887,18 @@ fn read_copy_live_soak_pnl_summary(
         let Some(submit) = report.get("persistent_live_submit") else {
             continue;
         };
-        summary.submitted_reports += submit
-            .get("submitted_reports")
-            .and_then(Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .filter(|item| copy_json_live_submitted_report(item))
-                    .count() as u64
-            })
-            .unwrap_or(0);
+        if let Some(items) = submit.get("submitted_reports").and_then(Value::as_array) {
+            summary.submitted_reports += items
+                .iter()
+                .filter(|item| copy_json_live_submitted_report(item))
+                .count() as u64;
+            summary.submitted_notional_usd += items
+                .iter()
+                .filter(|item| copy_json_live_submitted_report(item))
+                .filter_map(|item| copy_json_number_or_string(item, "notional_usd"))
+                .map(|notional| notional.max(0.0))
+                .sum::<f64>();
+        }
         summary.order_evidence += submit
             .get("order_evidence")
             .and_then(Value::as_array)
@@ -9190,11 +9354,25 @@ fn build_copy_live_soak_status_response_from_dir(
     dir: &Path,
     now_ms_value: u64,
 ) -> Result<CopyLiveSoakStatusResponse> {
+    let copy_settings = read_copy_ui_settings().ok();
     let mut response = CopyLiveSoakStatusResponse {
         detected: false,
         running: false,
+        paused: copy_live_soak_pause_flag_exists_in_dir(dir),
         run_id: None,
         pid: None,
+        account_ids: copy_settings
+            .as_ref()
+            .map(|settings| settings.account_ids.clone())
+            .unwrap_or_default(),
+        markets: copy_settings
+            .as_ref()
+            .map(|settings| settings.markets.clone())
+            .unwrap_or_default(),
+        leader_count: copy_settings
+            .as_ref()
+            .map(|settings| settings.leaders.len())
+            .unwrap_or_default(),
         latest_log_path: None,
         latest_summary_path: None,
         latest_report_path: None,
@@ -9204,6 +9382,7 @@ fn build_copy_live_soak_status_response_from_dir(
         submitted_reports: None,
         order_evidence: None,
         cleanup_errors: None,
+        suppression_summaries: Vec::new(),
         final_flat: None,
         final_reconcile_health: None,
         hold_positions_after_submit: None,
@@ -9217,10 +9396,24 @@ fn build_copy_live_soak_status_response_from_dir(
     };
 
     if !dir.exists() {
+        if response.paused {
+            response.detected = true;
+            response.status_kind = "paused".to_string();
+            response.message =
+                "copy live soak is paused by operator; automatic monitor restart is disabled"
+                    .to_string();
+        }
         return Ok(response);
     }
 
     let Some(log_path) = latest_matching_file(dir, "-run.log")? else {
+        if response.paused {
+            response.detected = true;
+            response.status_kind = "paused".to_string();
+            response.message =
+                "copy live soak is paused by operator; automatic monitor restart is disabled"
+                    .to_string();
+        }
         return Ok(response);
     };
     let log_modified_ms = file_modified_at_ms(&log_path).ok();
@@ -9243,6 +9436,24 @@ fn build_copy_live_soak_status_response_from_dir(
     };
     response.latest_log_path = Some(log_path.display().to_string());
     response.last_updated_at_ms = log_modified_ms;
+    if !response.paused {
+        if let Some(runtime_settings_line) = last_matching_line(&log_path, "copy settings ")? {
+            if let Some(account_ids) =
+                parse_copy_soak_log_csv_field(&runtime_settings_line, "accounts")
+            {
+                response.account_ids = account_ids;
+            }
+            if let Some(markets) = parse_copy_soak_log_csv_field(&runtime_settings_line, "markets")
+            {
+                response.markets = markets;
+            }
+            if let Some(leader_count) =
+                parse_copy_soak_log_usize_field(&runtime_settings_line, "leaders")
+            {
+                response.leader_count = leader_count;
+            }
+        }
+    }
 
     let mut pid_running = if let Some(pid_path) = copy_live_soak_pid_file(dir)? {
         response.pid = fs::read_to_string(&pid_path)
@@ -9259,6 +9470,7 @@ fn build_copy_live_soak_status_response_from_dir(
         }
     }
 
+    let mut latest_completed_report_path: Option<String> = None;
     if !run_id.is_empty() {
         let summary_path = dir.join(format!("persistent-live-soak-{run_id}-summary.jsonl"));
         if summary_path.exists() {
@@ -9285,23 +9497,26 @@ fn build_copy_live_soak_status_response_from_dir(
                     .get("report_path")
                     .and_then(Value::as_str)
                     .map(str::to_string);
+                latest_completed_report_path = response.latest_report_path.clone();
             }
         }
     }
     let active_round = parse_running_copy_soak_round(&last_log_line);
-    if let Some(active_round) = active_round {
-        if response
-            .latest_round
-            .map_or(true, |latest_round| latest_round < active_round)
-        {
-            response.latest_round = Some(active_round);
-            response.watcher_status = Some("running_window".to_string());
-            if !run_id.is_empty() {
-                let round_tag = format!("{active_round:04}");
-                let active_report_path = dir.join(format!(
-                    "persistent-live-soak-{run_id}-round-{round_tag}.json"
-                ));
-                response.latest_report_path = Some(active_report_path.display().to_string());
+    if !response.paused {
+        if let Some(active_round) = active_round {
+            if response
+                .latest_round
+                .map_or(true, |latest_round| latest_round < active_round)
+            {
+                response.latest_round = Some(active_round);
+                response.watcher_status = Some("running_window".to_string());
+                if !run_id.is_empty() {
+                    let round_tag = format!("{active_round:04}");
+                    let active_report_path = dir.join(format!(
+                        "persistent-live-soak-{run_id}-round-{round_tag}.json"
+                    ));
+                    response.latest_report_path = Some(active_report_path.display().to_string());
+                }
             }
         }
     }
@@ -9326,19 +9541,36 @@ fn build_copy_live_soak_status_response_from_dir(
                     .map(|updated| now_ms_value.saturating_sub(updated) > COPY_LIVE_SOAK_STALE_MS)
                     .unwrap_or(true)
         });
+    if let Some(report_path) = response.latest_report_path.as_deref() {
+        response.suppression_summaries =
+            read_copy_live_soak_suppression_summaries(dir, report_path, 5).unwrap_or_default();
+    }
+    if response.suppression_summaries.is_empty()
+        && let Some(report_path) = latest_completed_report_path.as_deref()
+        && response.latest_report_path.as_deref() != Some(report_path)
+    {
+        response.suppression_summaries =
+            read_copy_live_soak_suppression_summaries(dir, report_path, 5).unwrap_or_default();
+    }
+    if response.suppression_summaries.is_empty() && !run_id.is_empty() {
+        response.suppression_summaries =
+            read_latest_copy_live_soak_suppression_summaries(dir, &run_id, 5).unwrap_or_default();
+    }
     let lower_last = last_log_line.to_ascii_lowercase();
     let terminal = lower_last.contains(" stopping")
         || lower_last.contains(" stopped")
         || lower_last.contains(" completed")
         || lower_last.contains(" failed")
         || lower_last.contains(" error=");
-    let effective_stale = stale && !pid_running;
+    let effective_stale = !response.paused && stale && !pid_running;
     response.stale = effective_stale;
     response.pid_running = pid_running;
-    response.terminal = terminal || active_report_stalled;
-    response.running = !effective_stale && !response.terminal && pid_running;
+    response.terminal = !response.paused && (terminal || active_report_stalled);
+    response.running = !response.paused && !effective_stale && !response.terminal && pid_running;
     response.status_kind = if response.running {
         "running".to_string()
+    } else if response.paused {
+        "paused".to_string()
     } else if active_report_stalled {
         "round_stalled".to_string()
     } else if effective_stale {
@@ -9352,6 +9584,8 @@ fn build_copy_live_soak_status_response_from_dir(
     };
     response.message = if response.running {
         last_log_line
+    } else if response.paused {
+        "copy live soak is paused by operator; automatic monitor restart is disabled".to_string()
     } else if active_report_stalled {
         "latest live soak round report is stalled or empty".to_string()
     } else if effective_stale && response.pid.is_some() && !pid_running {
@@ -9366,6 +9600,170 @@ fn build_copy_live_soak_status_response_from_dir(
         last_log_line
     };
     Ok(response)
+}
+
+fn read_copy_live_soak_suppression_summaries(
+    dir: &Path,
+    report_path: &str,
+    limit: usize,
+) -> Result<Vec<CopyLiveSoakSuppressionSummary>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let path = Path::new(report_path);
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        let direct = PathBuf::from(report_path);
+        if direct.exists() {
+            direct
+        } else {
+            let file_name = path
+                .file_name()
+                .with_context(|| format!("invalid live soak report path {report_path}"))?;
+            dir.join(file_name)
+        }
+    };
+    if !path.exists() || fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0) == 0 {
+        return Ok(Vec::new());
+    }
+    let value: Value = serde_json::from_slice(
+        &fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?,
+    )
+    .with_context(|| format!("failed to parse {}", path.display()))?;
+    let submitted_cloids = copy_live_soak_submitted_cloids(&value);
+    let mut summaries = Vec::<CopyLiveSoakSuppressionSummary>::new();
+    let items = value
+        .get("suppressed_would_submit_orders")
+        .and_then(Value::as_array)
+        .cloned()
+        .or_else(|| {
+            value
+                .get("suppressed_submit_plan_refs")
+                .and_then(Value::as_array)
+                .cloned()
+        })
+        .unwrap_or_default();
+    for item in items {
+        let reason_code = item
+            .get("reason_code")
+            .and_then(Value::as_str)
+            .unwrap_or("UNKNOWN")
+            .to_string();
+        let message = item
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let order = item
+            .get("order")
+            .or_else(|| item.get("plan").and_then(|plan| plan.get("order")));
+        let cloid = order
+            .and_then(|order| order.get("cloid"))
+            .and_then(Value::as_str)
+            .map(normalize_copy_soak_cloid_key);
+        if cloid
+            .as_deref()
+            .is_some_and(|cloid| submitted_cloids.contains(cloid))
+        {
+            continue;
+        }
+        let account_id = order
+            .and_then(|order| order.get("account_id"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let coin = order
+            .and_then(|order| order.get("coin"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if let Some(existing) = summaries.iter_mut().find(|summary| {
+            summary.reason_code == reason_code
+                && summary.message == message
+                && summary.account_id == account_id
+                && summary.coin == coin
+        }) {
+            existing.count += 1;
+            continue;
+        }
+        summaries.push(CopyLiveSoakSuppressionSummary {
+            reason_code,
+            message,
+            account_id,
+            coin,
+            count: 1,
+        });
+        if summaries.len() >= limit {
+            break;
+        }
+    }
+    Ok(summaries)
+}
+
+fn read_latest_copy_live_soak_suppression_summaries(
+    dir: &Path,
+    run_id: &str,
+    limit: usize,
+) -> Result<Vec<CopyLiveSoakSuppressionSummary>> {
+    if limit == 0 || run_id.trim().is_empty() || !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut reports = Vec::<PathBuf>::new();
+    for entry in fs::read_dir(dir).with_context(|| format!("failed to read {}", dir.display()))? {
+        let path = entry?.path();
+        if copy_live_soak_round_report_path_for_run(&path, Some(run_id)) {
+            reports.push(path);
+        }
+    }
+    reports.sort_by(|left, right| {
+        right
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("")
+            .cmp(
+                left.file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or(""),
+            )
+    });
+    for report in reports {
+        let summaries =
+            read_copy_live_soak_suppression_summaries(dir, &report.display().to_string(), limit)?;
+        if !summaries.is_empty() {
+            return Ok(summaries);
+        }
+    }
+    Ok(Vec::new())
+}
+
+fn copy_live_soak_submitted_cloids(value: &Value) -> HashSet<String> {
+    value
+        .get("persistent_live_submit")
+        .and_then(|submit| submit.get("submitted_reports"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|report| {
+            report
+                .get("kind")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind.eq_ignore_ascii_case("submitted"))
+                && !report
+                    .get("dry_run")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+        })
+        .filter_map(|report| report.get("cloid").and_then(Value::as_str))
+        .map(normalize_copy_soak_cloid_key)
+        .filter(|cloid| !cloid.is_empty())
+        .collect()
+}
+
+fn normalize_copy_soak_cloid_key(cloid: &str) -> String {
+    cloid
+        .trim()
+        .trim_start_matches("0x")
+        .replace('-', "")
+        .to_ascii_lowercase()
 }
 
 fn parse_running_copy_soak_round(line: &str) -> Option<u64> {
@@ -11560,7 +11958,12 @@ fn extend_realtime_fill_events(
     state: &FrontendAppState,
 ) {
     for account in config.enabled_worker_accounts() {
-        for market_id in [MARKET_XYZ_PERP, MARKET_HL_PERP, MARKET_SPOT] {
+        for market_id in [
+            MARKET_XYZ_PERP,
+            MARKET_HL_PERP,
+            MARKET_CASH_PERP,
+            MARKET_SPOT,
+        ] {
             let Some(fills) = state.realtime.fills(market_id, &account.address) else {
                 continue;
             };
@@ -11634,7 +12037,12 @@ fn cap_recent_events_by_market(events: Vec<EventResponse>) -> Vec<EventResponse>
         by_market.entry(market).or_default().push(event);
     }
     let mut capped = Vec::new();
-    for market_id in [MARKET_XYZ_PERP, MARKET_HL_PERP, MARKET_SPOT] {
+    for market_id in [
+        MARKET_XYZ_PERP,
+        MARKET_HL_PERP,
+        MARKET_CASH_PERP,
+        MARKET_SPOT,
+    ] {
         if let Some(mut market_events) = by_market.remove(market_id) {
             market_events.sort_by_key(|event| std::cmp::Reverse(event.occurred_at_ms));
             capped.extend(
@@ -14657,8 +15065,12 @@ struct CopyShadowHistoryResponse {
 struct CopyLiveSoakStatusResponse {
     detected: bool,
     running: bool,
+    paused: bool,
     run_id: Option<String>,
     pid: Option<u32>,
+    account_ids: Vec<String>,
+    markets: Vec<String>,
+    leader_count: usize,
     latest_log_path: Option<String>,
     latest_summary_path: Option<String>,
     latest_report_path: Option<String>,
@@ -14668,6 +15080,7 @@ struct CopyLiveSoakStatusResponse {
     submitted_reports: Option<u64>,
     order_evidence: Option<u64>,
     cleanup_errors: Option<u64>,
+    suppression_summaries: Vec<CopyLiveSoakSuppressionSummary>,
     final_flat: Option<bool>,
     final_reconcile_health: Option<bool>,
     hold_positions_after_submit: Option<bool>,
@@ -14680,6 +15093,15 @@ struct CopyLiveSoakStatusResponse {
     fetched_at_ms: u64,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct CopyLiveSoakSuppressionSummary {
+    reason_code: String,
+    message: String,
+    account_id: Option<String>,
+    coin: Option<String>,
+    count: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CopyUiSettings {
     leaders: Vec<String>,
@@ -14689,7 +15111,52 @@ struct CopyUiSettings {
     principal_cap_usd: f64,
     leverage: f64,
     account_id: String,
+    #[serde(default)]
+    account_ids: Vec<String>,
     updated_at_ms: u64,
+}
+
+fn last_matching_line(path: &Path, needle: &str) -> Result<Option<String>> {
+    let text =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    Ok(text
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && line.contains(needle))
+        .map(ToOwned::to_owned))
+}
+
+fn parse_copy_soak_log_csv_field(line: &str, field: &str) -> Option<Vec<String>> {
+    let value = parse_copy_soak_log_field(line, field)?;
+    let values = value
+        .split(',')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        None
+    } else {
+        Some(values)
+    }
+}
+
+fn parse_copy_soak_log_usize_field(line: &str, field: &str) -> Option<usize> {
+    parse_copy_soak_log_field(line, field)?
+        .parse::<usize>()
+        .ok()
+}
+
+fn parse_copy_soak_log_field(line: &str, field: &str) -> Option<String> {
+    let marker = format!("{field}=");
+    let start = line.find(&marker)? + marker.len();
+    let value = line[start..].split_whitespace().next().unwrap_or("").trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
 }
 
 impl Default for CopyUiSettings {
@@ -14701,6 +15168,7 @@ impl Default for CopyUiSettings {
             principal_cap_usd: COPY_DEFAULT_PRINCIPAL_CAP_USD,
             leverage: crate::strategies::smart_money::COPY_MAX_LEVERAGE,
             account_id: "addr_a".to_string(),
+            account_ids: vec!["addr_a".to_string()],
             updated_at_ms: 0,
         }
     }
@@ -14715,7 +15183,11 @@ struct CopySettingsPayload {
     copy_ratio: f64,
     principal_cap_usd: f64,
     #[serde(default)]
+    leverage: Option<f64>,
+    #[serde(default)]
     account_id: Option<String>,
+    #[serde(default)]
+    account_ids: Vec<String>,
 }
 
 impl CopySettingsPayload {
@@ -14730,19 +15202,33 @@ impl CopySettingsPayload {
             self.principal_cap_usd.is_finite() && self.principal_cap_usd > 0.0,
             "principal_cap_usd must be positive"
         );
+        let leverage = self
+            .leverage
+            .unwrap_or(crate::strategies::smart_money::COPY_MAX_LEVERAGE);
+        anyhow::ensure!(
+            leverage.is_finite()
+                && leverage >= 1.0
+                && leverage <= crate::strategies::smart_money::COPY_MAX_LEVERAGE,
+            "leverage must be between 1 and {}",
+            crate::strategies::smart_money::COPY_MAX_LEVERAGE
+        );
+        let mut account_ids = normalize_copy_account_ids(String::new(), self.account_ids);
         let account_id = self
             .account_id
-            .unwrap_or_else(|| "addr_a".to_string())
-            .trim()
-            .to_string();
+            .map(|account_id| account_id.trim().to_string())
+            .filter(|account_id| !account_id.is_empty())
+            .or_else(|| account_ids.first().cloned())
+            .unwrap_or_else(|| "addr_a".to_string());
         anyhow::ensure!(!account_id.is_empty(), "account_id cannot be empty");
+        account_ids = normalize_copy_account_ids(account_id.clone(), account_ids);
         Ok(CopyUiSettings {
             leaders,
             markets,
             copy_ratio: self.copy_ratio,
             principal_cap_usd: self.principal_cap_usd,
-            leverage: crate::strategies::smart_money::COPY_MAX_LEVERAGE,
+            leverage,
             account_id,
+            account_ids,
             updated_at_ms: 0,
         })
     }
@@ -14816,6 +15302,7 @@ struct CopySummaryResponse {
     fetched_at_ms: u64,
     leader_count: usize,
     leader_addresses: Vec<String>,
+    account_ids: Vec<String>,
     markets: Vec<String>,
     shadow_signal_count: u64,
     rejected_count: u64,
@@ -14836,12 +15323,14 @@ struct CopySummaryResponse {
     pnl_report_stale: bool,
     pnl_report_status: String,
     local_summary: Option<CopyPnlAccountSummary>,
+    local_summaries: Vec<CopyPnlAccountSummary>,
     leader_summaries: Vec<CopyPnlAccountSummary>,
     target_realized_pnl_usd: Option<f64>,
     target_unrealized_pnl_usd: Option<f64>,
     target_total_pnl_usd: Option<f64>,
     target_position_value_usd: Option<f64>,
     target_open_position_count: u64,
+    target_position_state: String,
     latest_entries: Vec<CopyShadowHistoryEntry>,
 }
 
@@ -15616,6 +16105,12 @@ fn resolve_market_profile(raw_market: Option<&str>, config: &AppConfig) -> Resul
             dex: String::new(),
             live_trading_supported: true,
         },
+        MARKET_CASH_PERP => MarketProfile {
+            id: MARKET_CASH_PERP,
+            label: "Cash Perps",
+            dex: "cash".to_string(),
+            live_trading_supported: true,
+        },
         MARKET_SPOT => MarketProfile {
             id: MARKET_SPOT,
             label: "Spot",
@@ -15833,10 +16328,11 @@ mod tests {
 
     use anyhow::Result;
     use serde_json::json;
+    use std::path::Path;
 
     use crate::{
         audit::AuditEvent,
-        config::{AppConfig, MARKET_HL_PERP, MARKET_SPOT, MARKET_XYZ_PERP},
+        config::{AppConfig, MARKET_CASH_PERP, MARKET_HL_PERP, MARKET_SPOT, MARKET_XYZ_PERP},
         domain::{ExecutionMode, OrderSide, WorkerReport},
         hyperliquid::UserFill,
         realtime::RealtimeState,
@@ -15844,20 +16340,22 @@ mod tests {
     };
 
     use super::{
-        CopyLiveAccountSummaries, CopyLiveSoakStartPayload, CopyPnlAccountSummary,
-        CopyPnlPositionSummary, CopyPnlReportSummary, CopyUiSettings, DashboardOpenOrderResponse,
-        FibBasicConfig, FibBasicLevelPlan, FibBasicPlan, FibInstanceRecord, FibInstanceStatus,
-        FibOrderRef, FibPositionSnapshot, FibProfitLossMode, FibTradeDirection, FrontendAppState,
+        COPY_LIVE_SOAK_DIR, COPY_UI_SETTINGS_PATH, CopyLiveAccountSummaries,
+        CopyLiveSoakStartPayload, CopyPnlAccountSummary, CopyPnlPositionSummary,
+        CopyPnlReportSummary, CopyUiSettings, DashboardOpenOrderResponse, FibBasicConfig,
+        FibBasicLevelPlan, FibBasicPlan, FibInstanceRecord, FibInstanceStatus, FibOrderRef,
+        FibPositionSnapshot, FibProfitLossMode, FibTradeDirection, FrontendAppState,
         ManualSettingsPayload, NotificationSettings, NotificationSettingsPayload,
         NotificationSettingsResponse, OrderStatusPayload, OrderStatusQuery, PerpFundingLayer,
         ReadinessCheckResponse, SecretUsage, SpotFundingLayer, VAULT_SESSION_TTL_MS,
-        account_funding_next_actions, account_funding_summary, apply_notification_settings_payload,
+        account_funding_next_actions, account_funding_summary,
+        aggregate_copy_local_account_summaries, apply_notification_settings_payload,
         build_basic_plan, build_copy_live_soak_status_response_from_dir,
         build_copy_shadow_history_response_from_path, build_copy_summary_response_from_entries,
         build_fib_strategy_pnl_summary, copy_ledger_position_summaries,
         dashboard_cancel_stopped_without_open_orders_count, dashboard_cancel_strategy_ids,
-        dashboard_order_is_cancelable_fib_entry, default_copy_markets, ensure_fib_pair_available,
-        failed_readiness_blockers, feishu_test_response_ok,
+        dashboard_order_is_cancelable_fib_entry, default_copy_leaders, default_copy_markets,
+        ensure_fib_pair_available, failed_readiness_blockers, feishu_test_response_ok,
         fib_all_target_accounts_have_complete_protection, fib_background_stop_requested,
         fib_coordinator_signals_from_plan, fib_entry_sync_assessment,
         fib_position_is_effectively_flat, fib_position_matches_direction,
@@ -16308,6 +16806,7 @@ mod tests {
             principal_cap_usd: 25.0,
             leverage: crate::strategies::smart_money::COPY_MAX_LEVERAGE,
             account_id: "addr_a".to_string(),
+            account_ids: vec!["addr_a".to_string()],
             updated_at_ms: 123,
         };
         let pnl_report = CopyPnlReportSummary {
@@ -16363,6 +16862,7 @@ mod tests {
             principal_cap_usd: 25.0,
             leverage: crate::strategies::smart_money::COPY_MAX_LEVERAGE,
             account_id: "addr_a".to_string(),
+            account_ids: vec!["addr_a".to_string()],
             updated_at_ms: 123,
         };
         let current = crate::strategies::smart_money::CopyShadowHistoryEntry {
@@ -16417,10 +16917,16 @@ mod tests {
                 "0x6d6d7c05ef7f31b31b618400495b4ce4092a5089, 0x6ac0b46b32dc429dbd129a503292f88649d2b8a0"
                     .to_string(),
             ],
-            markets: vec!["xyz".to_string(), "hl_perp spot".to_string(), "xyz_perp".to_string()],
+            markets: vec![
+                "xyz".to_string(),
+                "hl_perp cash spot".to_string(),
+                "xyz_perp".to_string(),
+            ],
             copy_ratio: 0.2,
             principal_cap_usd: 35.0,
+            leverage: Some(7.0),
             account_id: Some("addr_a".to_string()),
+            account_ids: Vec::new(),
         }
         .normalized()?;
 
@@ -16429,20 +16935,28 @@ mod tests {
             vec![
                 MARKET_XYZ_PERP.to_string(),
                 MARKET_HL_PERP.to_string(),
+                MARKET_CASH_PERP.to_string(),
                 MARKET_SPOT.to_string()
             ]
         );
         assert_eq!(settings.leaders.len(), 2);
+        assert_eq!(settings.leverage, 7.0);
 
         let defaulted = super::CopySettingsPayload {
             leaders: vec!["0x6d6d7c05ef7f31b31b618400495b4ce4092a5089".to_string()],
             markets: Vec::new(),
             copy_ratio: 0.1,
             principal_cap_usd: 10.0,
+            leverage: None,
             account_id: None,
+            account_ids: Vec::new(),
         }
         .normalized()?;
         assert_eq!(defaulted.markets, default_copy_markets());
+        assert_eq!(
+            defaulted.leverage,
+            crate::strategies::smart_money::COPY_MAX_LEVERAGE
+        );
         Ok(())
     }
 
@@ -16469,6 +16983,7 @@ mod tests {
             principal_cap_usd: 35.0,
             leverage: crate::strategies::smart_money::COPY_MAX_LEVERAGE,
             account_id: "addr_a".to_string(),
+            account_ids: vec!["addr_a".to_string()],
             updated_at_ms: 123,
         };
 
@@ -16476,6 +16991,126 @@ mod tests {
         let account = config.account("addr_a").expect("updated copy account");
         assert_eq!(account.copy_ratio, 0.2);
         assert_eq!(account.max_order_notional_usd, 350.0);
+    }
+
+    #[test]
+    fn copy_settings_apply_updates_selected_multiple_accounts_only() -> Result<()> {
+        let settings = super::CopySettingsPayload {
+            leaders: vec!["0x6d6d7c05ef7f31b31b618400495b4ce4092a5089".to_string()],
+            markets: vec![MARKET_XYZ_PERP.to_string(), MARKET_HL_PERP.to_string()],
+            copy_ratio: 0.25,
+            principal_cap_usd: 20.0,
+            leverage: Some(6.0),
+            account_id: Some("addr_a".to_string()),
+            account_ids: vec![
+                "addr_a".to_string(),
+                "addr_b".to_string(),
+                "addr_a".to_string(),
+            ],
+        }
+        .normalized()?;
+
+        assert_eq!(
+            settings.account_ids,
+            vec!["addr_a".to_string(), "addr_b".to_string()]
+        );
+
+        let mut config = AppConfig::default();
+        config.accounts = vec![
+            crate::config::AccountConfig {
+                account_id: "addr_a".to_string(),
+                address: "0x0000000000000000000000000000000000000001".to_string(),
+                secret_id: "addr_a_api_wallet".to_string(),
+                api_wallet_env: String::new(),
+                transfer_secret_id: String::new(),
+                transfer_wallet_env: String::new(),
+                enabled: true,
+                worker_enabled: true,
+                copy_ratio: 1.0,
+                max_order_notional_usd: 100.0,
+                blocked_markets: Vec::new(),
+            },
+            crate::config::AccountConfig {
+                account_id: "addr_b".to_string(),
+                address: "0x0000000000000000000000000000000000000002".to_string(),
+                secret_id: "addr_b_api_wallet".to_string(),
+                api_wallet_env: String::new(),
+                transfer_secret_id: String::new(),
+                transfer_wallet_env: String::new(),
+                enabled: true,
+                worker_enabled: true,
+                copy_ratio: 1.0,
+                max_order_notional_usd: 100.0,
+                blocked_markets: Vec::new(),
+            },
+            crate::config::AccountConfig {
+                account_id: "addr_c".to_string(),
+                address: "0x0000000000000000000000000000000000000003".to_string(),
+                secret_id: "addr_c_api_wallet".to_string(),
+                api_wallet_env: String::new(),
+                transfer_secret_id: String::new(),
+                transfer_wallet_env: String::new(),
+                enabled: true,
+                worker_enabled: true,
+                copy_ratio: 1.0,
+                max_order_notional_usd: 100.0,
+                blocked_markets: Vec::new(),
+            },
+        ];
+
+        assert!(super::apply_copy_settings_to_config(&mut config, &settings));
+        for account_id in ["addr_a", "addr_b"] {
+            let account = config.account(account_id).expect("selected account");
+            assert_eq!(account.copy_ratio, 0.25);
+            assert_eq!(account.max_order_notional_usd, 120.0);
+        }
+        let untouched = config.account("addr_c").expect("unselected account");
+        assert_eq!(untouched.copy_ratio, 1.0);
+        assert_eq!(untouched.max_order_notional_usd, 100.0);
+        Ok(())
+    }
+
+    #[test]
+    fn copy_settings_payload_normalizes_multiple_local_accounts() -> Result<()> {
+        let settings = super::CopySettingsPayload {
+            leaders: vec!["0x6d6d7c05ef7f31b31b618400495b4ce4092a5089".to_string()],
+            markets: vec![MARKET_XYZ_PERP.to_string()],
+            copy_ratio: 0.2,
+            principal_cap_usd: 35.0,
+            leverage: None,
+            account_id: Some("addr_a".to_string()),
+            account_ids: vec!["addr_b, addr_a".to_string(), "addr_c".to_string()],
+        }
+        .normalized()?;
+
+        assert_eq!(
+            settings.account_ids,
+            vec![
+                "addr_a".to_string(),
+                "addr_b".to_string(),
+                "addr_c".to_string()
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn copy_settings_payload_uses_account_ids_when_primary_missing() -> Result<()> {
+        let settings = super::CopySettingsPayload {
+            leaders: vec!["0x6d6d7c05ef7f31b31b618400495b4ce4092a5089".to_string()],
+            markets: vec![MARKET_XYZ_PERP.to_string()],
+            copy_ratio: 0.2,
+            principal_cap_usd: 35.0,
+            leverage: Some(3.0),
+            account_id: None,
+            account_ids: vec!["addr_b".to_string()],
+        }
+        .normalized()?;
+
+        assert_eq!(settings.account_id, "addr_b");
+        assert_eq!(settings.account_ids, vec!["addr_b".to_string()]);
+        assert_eq!(settings.leverage, 3.0);
+        Ok(())
     }
 
     #[test]
@@ -16589,6 +17224,7 @@ mod tests {
                 total_pnl_usd: Some(0.05),
                 ..CopyPnlAccountSummary::default()
             }),
+            locals: Vec::new(),
             targets: Vec::new(),
         };
         let ledger_positions = vec![CopyPnlPositionSummary {
@@ -16626,6 +17262,7 @@ mod tests {
             principal_cap_usd: 35.0,
             leverage: crate::strategies::smart_money::COPY_MAX_LEVERAGE,
             account_id: "addr_a".to_string(),
+            account_ids: vec!["addr_a".to_string()],
             updated_at_ms: 123,
         };
         let pnl_report = CopyPnlReportSummary {
@@ -16650,6 +17287,7 @@ mod tests {
                 open_position_count: 1,
                 ..CopyPnlAccountSummary::default()
             }),
+            locals: Vec::new(),
             targets: vec![CopyPnlAccountSummary {
                 id: "leader_1".to_string(),
                 kind: "target_live".to_string(),
@@ -16687,6 +17325,147 @@ mod tests {
         assert_eq!(summary.target_unrealized_pnl_usd, Some(2.5));
         assert_eq!(summary.target_position_value_usd, Some(700.0));
         assert_eq!(summary.target_open_position_count, 1);
+    }
+
+    #[test]
+    fn copy_summary_aggregates_multiple_local_live_accounts() {
+        let configured = CopyUiSettings {
+            leaders: default_copy_leaders(),
+            markets: default_copy_markets(),
+            copy_ratio: 0.2,
+            principal_cap_usd: 35.0,
+            leverage: crate::strategies::smart_money::COPY_MAX_LEVERAGE,
+            account_id: "addr_a".to_string(),
+            account_ids: vec!["addr_a".to_string(), "addr_b".to_string()],
+            updated_at_ms: 123,
+        };
+        let local_a = CopyPnlAccountSummary {
+            id: "addr_a".to_string(),
+            kind: "local_live".to_string(),
+            unrealized_pnl_usd: Some(1.25),
+            total_pnl_usd: Some(1.25),
+            position_value_usd: Some(100.0),
+            open_position_count: 1,
+            positions: vec![CopyPnlPositionSummary {
+                coin: "xyz:GOLD".to_string(),
+                side: "long".to_string(),
+                size: 0.01,
+                position_value_usd: Some(100.0),
+                unrealized_pnl_usd: Some(1.25),
+                entry_px: Some(4000.0),
+            }],
+            ..CopyPnlAccountSummary::default()
+        };
+        let local_b = CopyPnlAccountSummary {
+            id: "addr_b".to_string(),
+            kind: "local_live".to_string(),
+            unrealized_pnl_usd: Some(-0.5),
+            total_pnl_usd: Some(-0.5),
+            position_value_usd: Some(50.0),
+            open_position_count: 1,
+            positions: vec![CopyPnlPositionSummary {
+                coin: "xyz:MU".to_string(),
+                side: "short".to_string(),
+                size: 0.02,
+                position_value_usd: Some(50.0),
+                unrealized_pnl_usd: Some(-0.5),
+                entry_px: Some(1000.0),
+            }],
+            ..CopyPnlAccountSummary::default()
+        };
+        let live_accounts = CopyLiveAccountSummaries {
+            local: aggregate_copy_local_account_summaries(&[local_a.clone(), local_b.clone()]),
+            locals: vec![local_a, local_b],
+            targets: Vec::new(),
+        };
+
+        let summary = build_copy_summary_response_from_entries(
+            Vec::new(),
+            None,
+            3_000_000,
+            CopyPnlReportSummary::default(),
+            Some(&configured),
+            Vec::new(),
+            live_accounts,
+        );
+
+        assert_eq!(summary.local_summaries.len(), 2);
+        assert_eq!(summary.unrealized_pnl_usd, Some(0.75));
+        assert_eq!(
+            summary
+                .local_summary
+                .as_ref()
+                .and_then(|item| item.position_value_usd),
+            Some(150.0)
+        );
+        assert_eq!(
+            summary
+                .local_summary
+                .as_ref()
+                .map(|item| item.open_position_count),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn copy_summary_keeps_flat_local_account_rows() {
+        let configured = CopyUiSettings {
+            leaders: default_copy_leaders(),
+            markets: default_copy_markets(),
+            copy_ratio: 0.2,
+            principal_cap_usd: 35.0,
+            leverage: crate::strategies::smart_money::COPY_MAX_LEVERAGE,
+            account_id: "addr_a".to_string(),
+            account_ids: vec!["addr_a".to_string(), "addr_b".to_string()],
+            updated_at_ms: 123,
+        };
+        let local_a = CopyPnlAccountSummary {
+            id: "addr_a".to_string(),
+            kind: "local_live".to_string(),
+            unrealized_pnl_usd: Some(2.0),
+            total_pnl_usd: Some(2.0),
+            position_value_usd: Some(100.0),
+            open_position_count: 1,
+            positions: vec![CopyPnlPositionSummary {
+                coin: "xyz:GOLD".to_string(),
+                side: "long".to_string(),
+                size: 0.01,
+                position_value_usd: Some(100.0),
+                unrealized_pnl_usd: Some(2.0),
+                entry_px: Some(4000.0),
+            }],
+            ..CopyPnlAccountSummary::default()
+        };
+        let local_b = CopyPnlAccountSummary {
+            id: "addr_b".to_string(),
+            kind: "local_live".to_string(),
+            address: "0x00000000000000000000000000000000000000bb".to_string(),
+            ..CopyPnlAccountSummary::default()
+        };
+        let live_accounts = CopyLiveAccountSummaries {
+            local: aggregate_copy_local_account_summaries(&[local_a.clone(), local_b.clone()]),
+            locals: vec![local_a, local_b],
+            targets: Vec::new(),
+        };
+
+        let summary = build_copy_summary_response_from_entries(
+            Vec::new(),
+            None,
+            3_000_000,
+            CopyPnlReportSummary::default(),
+            Some(&configured),
+            Vec::new(),
+            live_accounts,
+        );
+
+        assert_eq!(
+            summary.account_ids,
+            vec!["addr_a".to_string(), "addr_b".to_string()]
+        );
+        assert_eq!(summary.local_summaries.len(), 2);
+        assert_eq!(summary.local_summaries[1].id, "addr_b");
+        assert_eq!(summary.local_summaries[1].open_position_count, 0);
+        assert_eq!(summary.unrealized_pnl_usd, Some(2.0));
     }
 
     #[test]
@@ -17074,6 +17853,173 @@ mod tests {
     }
 
     #[test]
+    fn copy_live_soak_status_reads_runtime_accounts_and_markets_from_log() {
+        let dir = std::env::temp_dir().join(format!(
+            "trade_xyz_copy_live_soak_runtime_scope_{}",
+            crate::domain::now_ms()
+        ));
+        fs::create_dir_all(&dir).expect("test dir");
+        fs::write(
+            dir.join("persistent-live-soak-20260623-203800-run.log"),
+            "2026-06-23T20:38:01+08:00 copy settings leaders=5 accounts=addr_a,addr_b markets=xyz_perp,hl_perp,spot leader_notional_usd=1750\n2026-06-23T20:38:01+08:00 round=1 starting report=.codex-longrun\\persistent-live-soak-20260623-203800-round-0001.json\n",
+        )
+        .expect("run log");
+        fs::write(
+            dir.join("persistent-live-soak-detached-current.pid"),
+            format!("{}\n", std::process::id()),
+        )
+        .expect("pid");
+
+        let status = build_copy_live_soak_status_response_from_dir(&dir, crate::domain::now_ms())
+            .expect("status");
+
+        assert!(status.running);
+        assert_eq!(
+            status.account_ids,
+            vec!["addr_a".to_string(), "addr_b".to_string()]
+        );
+        assert_eq!(
+            status.markets,
+            vec![
+                MARKET_XYZ_PERP.to_string(),
+                MARKET_HL_PERP.to_string(),
+                MARKET_SPOT.to_string()
+            ]
+        );
+        assert_eq!(status.leader_count, 5);
+    }
+
+    #[test]
+    fn copy_live_soak_status_paused_keeps_current_settings_scope() {
+        let dir = std::env::temp_dir().join(format!(
+            "trade_xyz_copy_live_soak_paused_scope_{}",
+            crate::domain::now_ms()
+        ));
+        fs::create_dir_all(&dir).expect("test dir");
+        fs::write(
+            dir.join("persistent-live-soak-20260623-224946-run.log"),
+            "2026-06-23T22:49:46+08:00 copy settings leaders=5 accounts=addr_a markets=xyz_perp leader_notional_usd=1750\n",
+        )
+        .expect("run log");
+        fs::create_dir_all(COPY_LIVE_SOAK_DIR).expect("live dir");
+        let settings_path = Path::new(COPY_UI_SETTINGS_PATH);
+        let previous_settings = fs::read(settings_path).ok();
+        fs::write(
+            settings_path,
+            serde_json::to_vec(&CopyUiSettings {
+                leaders: default_copy_leaders(),
+                markets: vec![MARKET_XYZ_PERP.to_string(), MARKET_HL_PERP.to_string()],
+                copy_ratio: 0.2,
+                principal_cap_usd: 35.0,
+                leverage: crate::strategies::smart_money::COPY_MAX_LEVERAGE,
+                account_id: "addr_a".to_string(),
+                account_ids: vec!["addr_a".to_string(), "addr_b".to_string()],
+                updated_at_ms: 123,
+            })
+            .expect("settings json"),
+        )
+        .expect("write settings");
+        fs::write(dir.join("copy-live-soak-paused.flag"), "{}\n").expect("pause flag");
+
+        let status = build_copy_live_soak_status_response_from_dir(&dir, crate::domain::now_ms())
+            .expect("status");
+        let _ = fs::remove_file(dir.join("copy-live-soak-paused.flag"));
+        if let Some(previous_settings) = previous_settings {
+            fs::write(settings_path, previous_settings).expect("restore settings");
+        } else {
+            let _ = fs::remove_file(settings_path);
+        }
+
+        assert!(status.paused);
+        assert_eq!(status.status_kind, "paused");
+        assert_eq!(status.run_id.as_deref(), Some("20260623-224946"));
+        assert_eq!(
+            status.account_ids,
+            vec!["addr_a".to_string(), "addr_b".to_string()]
+        );
+    }
+
+    #[test]
+    fn copy_live_soak_status_paused_keeps_latest_run_evidence_and_plan_suppressions() {
+        let dir = std::env::temp_dir().join(format!(
+            "trade_xyz_copy_live_soak_paused_evidence_{}",
+            crate::domain::now_ms()
+        ));
+        fs::create_dir_all(&dir).expect("test dir");
+        fs::write(
+            dir.join("persistent-live-soak-20260624-045617-run.log"),
+            "2026-06-24T04:56:17+08:00 copy settings leaders=5 accounts=addr_a,addr_b markets=xyz_perp,hl_perp,cash_perp,spot leader_notional_usd=1750\n2026-06-24T05:06:24+08:00 round=1 ok=True submitted=1 evidence=1\n2026-06-24T05:06:29+08:00 round=2 starting report=.codex-longrun\\persistent-live-soak-20260624-045617-round-0002.json\n",
+        )
+        .expect("run log");
+        fs::write(
+            dir.join("persistent-live-soak-20260624-045617-summary.jsonl"),
+            "{\"run_id\":\"20260624-045617\",\"round\":1,\"ok\":true,\"submitted_reports\":1,\"order_evidence\":1,\"cleanup_errors\":0,\"watcher_status\":\"completed_duration_watcher_open\",\"final_flat\":false,\"final_reconcile_health\":true,\"hold_positions_after_submit\":true,\"report_path\":\"persistent-live-soak-20260624-045617-round-0001.json\"}\n",
+        )
+        .expect("summary");
+        fs::write(
+            dir.join("persistent-live-soak-20260624-045617-round-0001.json"),
+            serde_json::json!({
+                "persistent_live_submit": {
+                    "submitted_reports": [{"kind": "submitted", "dry_run": false, "notional_usd": 12.5}],
+                    "order_evidence": [{"matching_fills": []}]
+                },
+                "suppressed_submit_plan_refs": [{
+                    "plan": {
+                        "order": {
+                            "account_id": "addr_a",
+                            "coin": "xyz:JPY"
+                        }
+                    },
+                    "reason_code": "COPY_DAEMON_MARGIN_RESIZED_BELOW_MIN",
+                    "message": "addr_a withdrawable=0.2 supports resized_notional=2.0, below exchange minimum 10"
+                }]
+            })
+            .to_string(),
+        )
+        .expect("round report");
+        fs::write(
+            dir.join("persistent-live-soak-old-run-round-0001.json"),
+            serde_json::json!({
+                "persistent_live_submit": {
+                    "submitted_reports": [{"kind": "submitted", "dry_run": false, "notional_usd": 999.0}],
+                    "order_evidence": [{"matching_fills": []}]
+                }
+            })
+            .to_string(),
+        )
+        .expect("old report");
+        fs::write(dir.join("copy-live-soak-paused.flag"), "{}\n").expect("pause flag");
+
+        let status = build_copy_live_soak_status_response_from_dir(&dir, crate::domain::now_ms())
+            .expect("status");
+        let pnl_summary =
+            read_copy_live_soak_pnl_summary(&dir, status.run_id.as_deref()).expect("pnl summary");
+
+        assert!(status.paused);
+        assert_eq!(status.status_kind, "paused");
+        assert_eq!(status.run_id.as_deref(), Some("20260624-045617"));
+        assert_eq!(status.latest_round, Some(1));
+        assert_eq!(status.submitted_reports, Some(1));
+        assert_eq!(status.order_evidence, Some(1));
+        assert_eq!(status.suppression_summaries.len(), 1);
+        assert_eq!(
+            status.suppression_summaries[0].reason_code,
+            "COPY_DAEMON_MARGIN_RESIZED_BELOW_MIN"
+        );
+        assert_eq!(
+            status.suppression_summaries[0].account_id.as_deref(),
+            Some("addr_a")
+        );
+        assert_eq!(
+            status.suppression_summaries[0].coin.as_deref(),
+            Some("xyz:JPY")
+        );
+        assert_eq!(pnl_summary.submitted_reports, 1);
+        assert_eq!(pnl_summary.order_evidence, 1);
+        assert!((pnl_summary.submitted_notional_usd - 12.5).abs() < 1e-9);
+    }
+
+    #[test]
     fn copy_live_soak_status_ignores_summary_bom() {
         let dir = std::env::temp_dir().join(format!(
             "trade_xyz_copy_live_soak_bom_{}",
@@ -17190,6 +18136,83 @@ mod tests {
         assert_eq!(status.latest_round, Some(13));
         assert_eq!(status.status_kind, "running");
         assert_eq!(status.watcher_status.as_deref(), Some("running_window"));
+    }
+
+    #[test]
+    fn copy_live_soak_status_keeps_recent_suppression_during_empty_active_round() {
+        let dir = std::env::temp_dir().join(format!(
+            "trade_xyz_copy_live_soak_recent_suppression_{}",
+            crate::domain::now_ms()
+        ));
+        fs::create_dir_all(&dir).expect("test dir");
+        fs::write(
+            dir.join("persistent-live-soak-20260624-063702-run.log"),
+            "2026-06-24T06:37:02+08:00 copy settings leaders=5 accounts=addr_a,addr_b markets=xyz_perp,hl_perp,cash_perp,spot leader_notional_usd=1750\n2026-06-24T06:47:11+08:00 round=1 ok=True submitted=0 evidence=0\n2026-06-24T06:57:25+08:00 round=2 ok=True submitted=0 evidence=0\n2026-06-24T06:57:30+08:00 round=3 starting report=.codex-longrun\\persistent-live-soak-20260624-063702-round-0003.json\n",
+        )
+        .expect("run log");
+        fs::write(
+            dir.join("persistent-live-soak-20260624-063702-summary.jsonl"),
+            "{\"run_id\":\"20260624-063702\",\"round\":1,\"ok\":true,\"submitted_reports\":0,\"order_evidence\":0,\"cleanup_errors\":0,\"watcher_status\":\"completed_duration_watcher_open\",\"final_flat\":false,\"final_reconcile_health\":true,\"hold_positions_after_submit\":true,\"report_path\":\"persistent-live-soak-20260624-063702-round-0001.json\"}\n{\"run_id\":\"20260624-063702\",\"round\":2,\"ok\":true,\"submitted_reports\":0,\"order_evidence\":0,\"cleanup_errors\":0,\"watcher_status\":\"completed_duration_watcher_open\",\"final_flat\":false,\"final_reconcile_health\":true,\"hold_positions_after_submit\":true,\"report_path\":\"persistent-live-soak-20260624-063702-round-0002.json\"}\n",
+        )
+        .expect("summary");
+        fs::write(
+            dir.join("persistent-live-soak-20260624-063702-round-0001.json"),
+            serde_json::json!({
+                "persistent_live_submit": {
+                    "submitted_reports": [],
+                    "order_evidence": []
+                },
+                "suppressed_submit_plan_refs": [{
+                    "plan": {
+                        "order": {
+                            "account_id": "addr_b",
+                            "coin": "xyz:SP500"
+                        }
+                    },
+                    "reason_code": "COPY_DAEMON_MARGIN_RESIZED_BELOW_MIN",
+                    "message": "addr_b withdrawable=0.292874 supports resized_notional=2.638505, below exchange minimum 10.000000"
+                }]
+            })
+            .to_string(),
+        )
+        .expect("round one report");
+        fs::write(
+            dir.join("persistent-live-soak-20260624-063702-round-0002.json"),
+            serde_json::json!({
+                "persistent_live_submit": {
+                    "submitted_reports": [],
+                    "order_evidence": []
+                },
+                "suppressed_submit_plan_refs": []
+            })
+            .to_string(),
+        )
+        .expect("round two report");
+        fs::write(
+            dir.join("persistent-live-soak-20260624-063702-round-0003.json"),
+            "",
+        )
+        .expect("active report");
+        fs::write(
+            dir.join("persistent-live-soak-detached-current.pid"),
+            format!("{}\n", std::process::id()),
+        )
+        .expect("pid");
+
+        let status = build_copy_live_soak_status_response_from_dir(&dir, crate::domain::now_ms())
+            .expect("status");
+
+        assert!(status.running);
+        assert_eq!(status.latest_round, Some(3));
+        assert_eq!(status.suppression_summaries.len(), 1);
+        assert_eq!(
+            status.suppression_summaries[0].reason_code,
+            "COPY_DAEMON_MARGIN_RESIZED_BELOW_MIN"
+        );
+        assert_eq!(
+            status.suppression_summaries[0].account_id.as_deref(),
+            Some("addr_b")
+        );
     }
 
     #[test]

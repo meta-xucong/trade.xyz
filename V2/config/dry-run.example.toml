@@ -34,7 +34,7 @@ transfer_secret_id = "addr_a_evm_wallet"
 transfer_wallet_env = "HL_EVM_TRANSFER_PRIVATE_KEY_ADDR_A"
 enabled = true
 worker_enabled = true
-copy_ratio = 0.1
+copy_ratio = 0.05
 max_order_notional_usd = 100.0
 blocked_markets = []
 
@@ -47,7 +47,7 @@ transfer_secret_id = "addr_b_evm_wallet"
 transfer_wallet_env = "HL_EVM_TRANSFER_PRIVATE_KEY_ADDR_B"
 enabled = true
 worker_enabled = true
-copy_ratio = 0.05
+copy_ratio = 0.1
 max_order_notional_usd = 100.0
 blocked_markets = []
 

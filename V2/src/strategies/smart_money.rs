@@ -2465,6 +2465,57 @@ mod tests {
     }
 
     #[test]
+    fn dry_run_shadow_blocked_symbol_still_allows_mapped_reduce_only_close() {
+        let now = now_ms();
+        let mut config = dry_run_shadow_config();
+        config.blocked_symbols = vec!["xyz:XYZ100".to_string()];
+        let mut ledger = CopyLedger::new();
+        ledger.push(ledger_entry(
+            "sig-open",
+            OrderSide::Buy,
+            75.0,
+            0.0,
+            75.0,
+            75.0,
+            CopyLedgerStatus::Open,
+        ));
+        let mut pipeline = CopyDryRunShadowPipeline::new(config, copy_strategy(), ledger);
+
+        pipeline.handle_watcher_event(position_event("leader_a", 1.0, 10.0), now);
+        pipeline.handle_watcher_event(
+            CopyLeaderWatcherEvent::Fill {
+                leader_id: "leader_a".to_string(),
+                leader_address: "0xABC".to_string(),
+                fill: leader_fill(
+                    "shadow-blocked-symbol-close-1",
+                    "leader_a",
+                    OrderSide::Sell,
+                    10.0,
+                ),
+                is_snapshot: false,
+            },
+            now + 1,
+        );
+        let records = pipeline.handle_watcher_event(position_event("leader_a", 0.0, 0.0), now + 2);
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].risk_decision,
+            CopySignalRiskDecision::Approved {
+                side: OrderSide::Sell,
+                reduce_only: true,
+                notional_usd: 75.0,
+            }
+        );
+        let signal = records[0]
+            .signal
+            .as_ref()
+            .expect("blocked symbol mapped close should still create a reduce-only signal");
+        assert_eq!(signal.order.side, OrderSide::Sell);
+        assert!(signal.order.reduce_only);
+    }
+
+    #[test]
     fn dry_run_shadow_reconnect_empty_snapshot_closes_mapped_long() {
         let now = now_ms();
         let mut ledger = CopyLedger::new();

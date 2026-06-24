@@ -1625,6 +1625,45 @@
         font-weight: 650;
       }
 
+      .copy-native-select {
+        display: none;
+      }
+
+      .copy-account-picker {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+        gap: 8px;
+      }
+
+      .copy-account-option {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        min-height: 40px;
+        padding: 8px 10px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: #141920;
+        color: var(--text);
+        cursor: pointer;
+      }
+
+      .copy-account-option input {
+        width: 16px;
+        height: 16px;
+        accent-color: var(--cyan);
+      }
+
+      .copy-account-option:has(input:checked) {
+        border-color: var(--cyan);
+        background: #162530;
+      }
+
+      .copy-account-option strong {
+        font-size: 13px;
+        font-weight: 650;
+      }
+
       .copy-advanced-details {
         border: 1px solid var(--line);
         border-radius: 8px;
@@ -3019,9 +3058,19 @@
                 <input id="copyLeaderNotional" type="hidden" value="100" />
                 <input id="copyLeverage" type="hidden" value="10" min="1" max="10" step="1" />
                 <input id="copyReduce" type="checkbox" class="hidden" />
+                <div class="field wide">
+                  <label for="copyAccounts" data-i18n="copy.local_accounts">本地执行账号</label>
+                  <select id="copyAccounts" class="copy-native-select" multiple size="4"></select>
+                  <div id="copyAccountPicker" class="copy-account-picker"></div>
+                  <div class="footer-actions compact">
+                    <button class="action-button" type="button" id="copySelectAllAccounts"><i data-lucide="users"></i><span data-i18n="copy.select_all_accounts">全选账号</span></button>
+                    <button class="action-button" type="button" id="copyClearAccounts"><i data-lucide="user-x"></i><span data-i18n="copy.clear_accounts">清空</span></button>
+                  </div>
+                  <div class="quote-meta" data-i18n="copy.local_accounts_help">可多选。保存后，后台会为每个账号独立走风控和 worker 执行。</div>
+                </div>
                 <div class="field">
                   <label for="copyMarkets" data-i18n="copy.markets">Copy Markets</label>
-                  <select id="copyMarkets" multiple size="3"></select>
+                  <select id="copyMarkets" multiple size="4"></select>
                   <div class="quote-meta" data-i18n="copy.markets_help">Choose one or more markets. Unselected markets remain exit-only after the new settings take effect.</div>
                 </div>
                 <div class="field copy-advanced hidden">
@@ -3056,8 +3105,9 @@
                 <div class="form-section wide"><span data-i18n="copy.operator_controls">Operator Controls</span></div>
                 <div class="footer-actions compact wide">
                   <button class="action-button action-primary" type="button" id="copyLiveSoakStartAction"><i data-lucide="play"></i><span data-i18n="copy.start_live_soak">Start Live Soak</span></button>
-                  <button class="action-button" type="button" id="copyLiveSoakStopAction"><i data-lucide="square"></i><span data-i18n="copy.stop_live_soak">Stop Live Soak</span></button>
+                  <button class="action-button action-danger" type="button" id="copyLiveSoakStopAction"><i data-lucide="square-x"></i><span data-i18n="copy.cancel_copy">一键取消跟单</span></button>
                 </div>
+                <div class="quote-meta wide" data-i18n="copy.cancel_copy_help">取消会暂停后台跟单并阻止健康监控自动重启；不会绕过风控强制清仓，已有持仓仍会在结果区展示。</div>
               </div>
             </form>
             <div class="panel">
@@ -3244,9 +3294,10 @@
       const QUOTE_WS_RETRY_MS = 1500;
       const DASHBOARD_SNAPSHOT_REFRESH_MS = 20000;
       const DASHBOARD_TPSL_RULES_CACHE_MS = 30000;
-      const UI_REVISION = "ui-2026-06-17-copy-overview-card";
+      const UI_REVISION = "ui-2026-06-23-copy-multi-account-cancel";
       const MIN_OPENING_NOTIONAL_USD = 10;
       const FIB_MIN_PER_LEVEL_NOTIONAL_USD = 11;
+      const COPY_SUPPORTED_MARKET_IDS = ["xyz_perp", "hl_perp", "cash_perp", "spot"];
       const SPOT_DASHBOARD_QUOTE_CACHE_MS = 5000;
       const POST_SUBMIT_POSITION_CONFIRM_DELAYS_MS = [0, 800, 1200, 1800, 2600, 3500];
       const MANUAL_POSITION_DUST_EPS = 1e-12;
@@ -3939,6 +3990,12 @@
           "copy.leader_accounts": "Target copy accounts",
           "copy.leader_accounts_placeholder": "Paste wallet addresses, one per line",
           "copy.leader_accounts_help": "Paste one or more wallet addresses. Use a new line, comma, or space to separate them.",
+          "copy.local_accounts": "Local execution accounts",
+          "copy.local_accounts_help": "Select one or more local accounts. Each selected account goes through its own risk check and account worker.",
+          "copy.select_all_accounts": "All Accounts",
+          "copy.clear_accounts": "Clear",
+          "copy.running_accounts": "Local copy accounts",
+          "copy.running_markets": "Markets",
           "copy.markets": "Copy Markets",
           "copy.markets_help": "Choose one or more markets. Unselected markets remain exit-only after the new settings take effect.",
           "copy.market_scope": "Copy markets",
@@ -3957,7 +4014,9 @@
           "copy.operator_controls": "Operator Controls",
           "copy.start_live_soak": "Start Live Soak",
           "copy.stop_live_soak": "Stop Live Soak",
-          "copy.settings_saved": "Settings saved to backend. {leaders} target(s), ratio {ratio}, principal cap {cap}; live soak will use these settings.",
+          "copy.cancel_copy": "Cancel Copy",
+          "copy.cancel_copy_help": "Pauses the background copy process and blocks health-monitor auto-restart. It will not force-close positions outside the risk path; existing positions remain visible in results.",
+          "copy.settings_saved": "Settings saved to backend. {leaders} target(s), {accounts} local account(s), ratio {ratio}, principal cap {cap}, leverage {leverage}; live soak will use these settings.",
           "copy.result": "Copy Result",
           "copy.summary_empty": "No copy signals yet.",
           "copy.summary_status": "Status",
@@ -3976,6 +4035,9 @@
           "copy.target_pnl": "Target PnL",
           "copy.target_raw_pnl": "Target Raw PnL",
           "copy.target_accounts": "Target Copy Accounts",
+          "copy.local_copy_accounts": "Local Copy Accounts",
+          "copy.local_detail": "Local account detail",
+          "copy.local_position_detail": "Local position detail",
           "copy.trade_count": "Trades",
           "copy.current_run_orders": "Current Soak Orders",
           "copy.history_total_orders": "Current run total",
@@ -3994,6 +4056,9 @@
           "copy.position_detail": "Position detail",
           "copy.no_positions": "No open positions",
           "copy.no_leaders": "No target accounts found yet",
+          "copy.target_positions_unknown": "Target positions not refreshed",
+          "copy.target_positions_partial": "Target positions partially refreshed",
+          "copy.target_positions_current": "Target positions current",
           "copy.pnl_report": "PnL Report",
           "copy.pnl_report_time": "Report Time",
           "copy.pnl_report_missing": "PnL report not found yet.",
@@ -4003,19 +4068,24 @@
           "copy.realtime_attribution_note": "Open PnL uses realtime account positions matched by the copy ledger.",
           "copy.waiting_pnl": "Waiting",
           "copy.error_requires_leader": "Enter at least one target copy account.",
+          "copy.error_requires_local_account": "Select at least one local copy account.",
           "copy.error_invalid_leader": "Invalid target copy account: {address}",
           "copy.live_soak_title": "Live Copy Soak",
           "copy.live_soak_empty": "No background copy soak was detected on this machine.",
           "copy.live_soak_running": "Running",
           "copy.live_soak_stopped": "Stopped",
+          "copy.live_soak_status_paused": "Cancelled / paused",
           "copy.live_soak_status_stale": "Status stale",
           "copy.live_soak_status_process_stopped": "Process stopped",
+          "copy.live_soak_status_stalled": "Round stalled",
           "copy.live_soak_status_terminal": "Ended",
           "copy.live_soak_status_unknown": "Unknown",
           "copy.live_soak_run_id": "Run ID",
           "copy.live_soak_round": "Latest Round",
           "copy.live_soak_submitted": "Submitted",
           "copy.live_soak_evidence": "Order Evidence",
+          "copy.live_soak_suppressed": "Skipped Reasons",
+          "copy.local_account": "Local Account",
           "copy.live_soak_cleanup_errors": "Cleanup Errors",
           "copy.live_soak_final_flat": "Final Flat",
           "copy.live_soak_hold": "Hold After Submit",
@@ -4624,6 +4694,12 @@
           "copy.leader_accounts": "目标跟单账号",
           "copy.leader_accounts_placeholder": "粘贴钱包地址，每行一个",
           "copy.leader_accounts_help": "可以填多个钱包地址，用换行、逗号或空格分隔。",
+          "copy.local_accounts": "本地执行账号",
+          "copy.local_accounts_help": "可多选。每个账号都会独立经过风控和 account worker 执行。",
+          "copy.select_all_accounts": "全选账号",
+          "copy.clear_accounts": "清空",
+          "copy.running_accounts": "本地跟单账号",
+          "copy.running_markets": "跟单市场",
           "copy.markets": "跟单市场",
           "copy.markets_help": "可多选。取消某个市场后，新配置生效起该市场只跟卖/减仓，不再跟买/加仓。",
           "copy.market_scope": "跟单市场",
@@ -4642,7 +4718,9 @@
           "copy.operator_controls": "运行控制",
           "copy.start_live_soak": "开始实盘长测",
           "copy.stop_live_soak": "停止实盘长测",
-          "copy.settings_saved": "设置已写入后台。{leaders} 个目标账号，跟单比例 {ratio}，单交易对本金上限 {cap}；实盘长测会使用这组设置。",
+          "copy.cancel_copy": "一键取消跟单",
+          "copy.cancel_copy_help": "取消会暂停后台跟单并阻止健康监控自动重启；不会绕过风控强制清仓，已有持仓仍会在结果区展示。",
+          "copy.settings_saved": "设置已写入后台。{leaders} 个目标账号，{accounts} 个本地账号，跟单比例 {ratio}，单交易对本金上限 {cap}，杠杆 {leverage}；实盘长测会使用这组设置。",
           "copy.result": "跟单结果",
           "copy.summary_empty": "还没有跟单信号。",
           "copy.summary_status": "运行状态",
@@ -4661,6 +4739,9 @@
           "copy.target_pnl": "目标盈亏",
           "copy.target_raw_pnl": "目标原始盈亏",
           "copy.target_accounts": "目标跟单账户",
+          "copy.local_copy_accounts": "本地跟单账号",
+          "copy.local_detail": "本地账号明细",
+          "copy.local_position_detail": "本地持仓明细",
           "copy.trade_count": "交易次数",
           "copy.current_run_orders": "当前长测订单",
           "copy.history_total_orders": "当前运行累计",
@@ -4679,6 +4760,9 @@
           "copy.position_detail": "持仓明细",
           "copy.no_positions": "暂无持仓",
           "copy.no_leaders": "还没有识别到目标跟单账号",
+          "copy.target_positions_unknown": "目标仓位未刷新",
+          "copy.target_positions_partial": "目标仓位部分已刷新",
+          "copy.target_positions_current": "目标仓位已刷新",
           "copy.pnl_report": "盈亏报告",
           "copy.pnl_report_time": "报告时间",
           "copy.pnl_report_missing": "暂未找到盈亏报告。",
@@ -4688,19 +4772,24 @@
           "copy.realtime_attribution_note": "持仓浮盈亏使用实时账户持仓，并按跟单账本归因。",
           "copy.waiting_pnl": "等待归因",
           "copy.error_requires_leader": "请至少填写一个目标跟单账号。",
+          "copy.error_requires_local_account": "请至少选择一个本地跟单账号。",
           "copy.error_invalid_leader": "目标跟单账号格式不正确：{address}",
           "copy.live_soak_title": "跟单实盘长测",
           "copy.live_soak_empty": "当前机器未检测到后台跟单长测。",
           "copy.live_soak_running": "运行中",
           "copy.live_soak_stopped": "已停止",
+          "copy.live_soak_status_paused": "已取消 / 暂停",
           "copy.live_soak_status_stale": "状态过期",
           "copy.live_soak_status_process_stopped": "进程已停止",
+          "copy.live_soak_status_stalled": "轮次卡住",
           "copy.live_soak_status_terminal": "已结束",
           "copy.live_soak_status_unknown": "状态未知",
           "copy.live_soak_run_id": "运行 ID",
           "copy.live_soak_round": "最近轮次",
           "copy.live_soak_submitted": "已提交",
           "copy.live_soak_evidence": "订单证据",
+          "copy.live_soak_suppressed": "跳过原因",
+          "copy.local_account": "本地账号",
           "copy.live_soak_cleanup_errors": "清理异常",
           "copy.live_soak_final_flat": "最终空仓",
           "copy.live_soak_hold": "提交后持仓",
@@ -5037,6 +5126,7 @@
           || id === "vaultResult"
           || id === "dashboardTpslResult"
         ) {
+          $(id).dataset.resultKind = payload?.ok === false ? "error" : "result";
           $(id).textContent = formatManualReadableResult(payload);
           return;
         }
@@ -5048,6 +5138,7 @@
       }
 
       function showCopyResult(payload) {
+        $("copyResult").dataset.resultKind = payload?.ok === false ? "error" : "result";
         const data = payload?.data || {};
         const settings = data?.settings || {};
         const status = data?.status || {};
@@ -5057,13 +5148,15 @@
         } else if (Array.isArray(settings.leaders)) {
           lines.push(t("copy.settings_saved", {
             leaders: number(settings.leaders.length, 0),
+            accounts: number((Array.isArray(settings.account_ids) ? settings.account_ids : []).length, 0),
             ratio: number(settings.copy_ratio, 4),
             cap: money(settings.principal_cap_usd),
+            leverage: `${number(settings.leverage || Number($("copyLeverage")?.value) || 10, 0)}x`,
           }));
           if (data.path) lines.push(data.path);
         } else if (data.action) {
           lines.push(data.message || (state.lang === "zh" ? "执行完成" : "Done"));
-          lines.push(`${state.lang === "zh" ? "运行状态" : "Status"}: ${status.running ? t("copy.live_soak_running") : t("copy.live_soak_stopped")}`);
+          lines.push(`${state.lang === "zh" ? "运行状态" : "Status"}: ${status.paused ? t("copy.live_soak_status_paused") : (status.running ? t("copy.live_soak_running") : t("copy.live_soak_stopped"))}`);
           if (status.run_id) lines.push(`${t("copy.live_soak_run_id")}: ${status.run_id}`);
           if (status.latest_round != null) lines.push(`${t("copy.live_soak_round")}: ${status.latest_round}`);
         } else {
@@ -5088,6 +5181,38 @@
             ? `已保存 ${symbols.length} 个跟单黑名单交易对：${symbols.join(", ")}`
             : `Saved ${symbols.length} copy blacklist symbol(s): ${symbols.join(", ")}`);
         $("copyResult").classList.remove("hidden");
+      }
+
+      function copySuppressionReasonText(item) {
+        const code = String(item?.reason_code || "").trim();
+        const message = String(item?.message || "").trim();
+        const lower = `${code} ${message}`.toLowerCase();
+        if (lower.includes("withdrawable") && (lower.includes("below exchange minimum") || lower.includes("resized_notional"))) {
+          return state.lang === "zh"
+            ? "这个本地账号可用保证金太少，缩量后仍低于交易所最小下单额，所以本次没有下单。"
+            : "This local account had too little withdrawable margin; after resizing, the order was still below the exchange minimum, so it was skipped.";
+        }
+        if (code === "COPY_DAEMON_EFFECTIVE_NOTIONAL_BELOW_MIN" || lower.includes("effective_notional_below_min")) {
+          return state.lang === "zh"
+            ? "精度取整后的实际下单金额低于交易所最小下单额，已安全跳过。"
+            : "The precision-rounded effective notional was below the exchange minimum, so it was safely skipped.";
+        }
+        if (code === "COPY_DAEMON_MAX_LIVE_ORDERS") {
+          return state.lang === "zh"
+            ? "本轮可同时执行的开仓名额已满，候选信号先记录观察。"
+            : "The live open-order slot limit was full, so this candidate was recorded only.";
+        }
+        if (code === "COPY_CLOSE_WITHOUT_LOCAL_MAPPING") {
+          return state.lang === "zh"
+            ? "目标账号有平仓信号，但本地没有对应跟单仓位，不能误平其他仓位。"
+            : "The target closed exposure, but there was no mapped local copy position, so no unrelated position was closed.";
+        }
+        if (code === "COPY_INCREASE_WITHOUT_LOCAL_MAPPING") {
+          return state.lang === "zh"
+            ? "目标账号是在已有仓位上加仓，本地没有同源映射，为避免追旧仓已跳过。"
+            : "The target increased an existing position without a same-source local mapping, so it was skipped to avoid chasing old exposure.";
+        }
+        return message || code || "-";
       }
 
       function formatManualReadableResult(payload) {
@@ -8478,13 +8603,29 @@
 
       function marketLabel(marketId) {
         const info = marketInfoById(marketId);
-        if (!info) return marketId || "xyz_perp";
+        if (!info) {
+          const fallback = {
+            xyz_perp: "XYZ Perps",
+            hl_perp: "HL Perps",
+            cash_perp: "Cash Perps",
+            spot: "Spot",
+          };
+          return fallback[marketId] || marketId || "xyz_perp";
+        }
         return info.label || info.market || marketId;
       }
 
       function marketDexById(marketId) {
         const info = marketInfoById(marketId);
-        if (!info) return "xyz";
+        if (!info) {
+          const fallback = {
+            xyz_perp: "xyz",
+            hl_perp: "default",
+            cash_perp: "cash",
+            spot: "spot",
+          };
+          return fallback[marketId] || "xyz";
+        }
         return info.dex || "xyz";
       }
 
@@ -8512,7 +8653,8 @@
       function defaultCopyMarkets() {
         const markets = Array.isArray(state.marketCapabilities) ? state.marketCapabilities : [];
         const ids = markets.map((item) => item?.market).filter(Boolean);
-        return ids.length > 0 ? ids : ["xyz_perp", "hl_perp", "spot"];
+        const merged = [...ids, ...COPY_SUPPORTED_MARKET_IDS];
+        return Array.from(new Set(merged));
       }
 
       function selectedCopyMarkets() {
@@ -8697,8 +8839,13 @@
         $("fibMarket").innerHTML = toOptions(activeFibMarket());
         const copySelect = $("copyMarkets");
         if (copySelect) {
+          const copyMarkets = defaultCopyMarkets().map((market) => ({
+            market,
+            label: marketLabel(market),
+            dex: marketDexById(market),
+          }));
           const selected = new Set((Array.isArray(state.copyMarkets) && state.copyMarkets.length > 0) ? state.copyMarkets : defaultCopyMarkets());
-          copySelect.innerHTML = markets.map((item) => {
+          copySelect.innerHTML = copyMarkets.map((item) => {
             const isSelected = selected.has(item.market) ? " selected" : "";
             return `<option value="${item.market}"${isSelected}>${item.label} (${item.dex})</option>`;
           }).join("");
@@ -8778,27 +8925,34 @@
       function renderAccounts(accounts, { dashboardAccounts = null, force = false } = {}) {
         const manualSelect = $("manualAccounts");
         const fibSelect = $("fibAccounts");
+        const copySelect = $("copyAccounts");
         const accountUiBusy = document.activeElement === manualSelect
-          || document.activeElement === fibSelect;
+          || document.activeElement === fibSelect
+          || document.activeElement === copySelect;
         if (!force && accountUiBusy) {
-          deferSectionRender("accounts", manualSelect || fibSelect, () => {
+          deferSectionRender("accounts", manualSelect || fibSelect || copySelect, () => {
             renderAccounts(state.accounts || [], { dashboardAccounts: state.dashboardAccounts, force: true });
           });
           return;
         }
         const previousSelection = new Set(selectedAccounts());
         const previousFibSelection = new Set(selectedFibAccounts());
-        const accountIds = accounts.map((account) => account.account_id);
+        const previousCopySelection = new Set(selectedCopyAccounts());
         const manualAccounts = filteredAccountsForMarket(accounts, activeManualMarket());
         const fibAccounts = filteredAccountsForMarket(accounts, activeFibMarket());
+        const copyAccounts = accounts.filter((account) => account.enabled !== false && account.worker_enabled !== false);
         const manualIds = manualAccounts.map((account) => account.account_id);
         const fibIds = fibAccounts.map((account) => account.account_id);
+        const copyIds = copyAccounts.map((account) => account.account_id);
         let selectedIds = manualIds.filter((accountId) => previousSelection.has(accountId));
         let fibSelectedIds = fibIds.filter((accountId) => previousFibSelection.has(accountId));
+        let copySelectedIds = copyIds.filter((accountId) => previousCopySelection.has(accountId));
         if (selectedIds.length === 0 && manualIds.length > 0) selectedIds = [manualIds[0]];
         if (fibSelectedIds.length === 0 && fibIds.length > 0) fibSelectedIds = [fibIds[0]];
+        if (copySelectedIds.length === 0 && copyIds.length > 0) copySelectedIds = copyIds.slice();
         const selectedSet = new Set(selectedIds);
         const fibSelectedSet = new Set(fibSelectedIds);
+        const copySelectedSet = new Set(copySelectedIds);
 
         $("manualAccounts").innerHTML = manualAccounts.map((account) => {
           const selected = selectedSet.has(account.account_id) ? " selected" : "";
@@ -8808,6 +8962,13 @@
           const selected = fibSelectedSet.has(account.account_id) ? " selected" : "";
           return `<option value="${account.account_id}"${selected}>${account.account_id}</option>`;
         }).join("");
+        if (copySelect) {
+          copySelect.innerHTML = copyAccounts.map((account) => {
+            const selected = copySelectedSet.has(account.account_id) ? " selected" : "";
+            return `<option value="${account.account_id}"${selected}>${account.account_id}</option>`;
+          }).join("");
+          renderCopyAccountPicker(copyAccounts);
+        }
         renderVaultAccountOptions();
       }
 
@@ -10008,7 +10169,7 @@
           `;
           return;
         }
-        const marketOrder = ["xyz_perp", "hl_perp", "spot"];
+        const marketOrder = ["xyz_perp", "hl_perp", "cash_perp", "spot"];
         const knownMarkets = new Set(marketOrder);
         for (const order of list) {
           if (order?.market && !knownMarkets.has(order.market)) {
@@ -10933,6 +11094,72 @@
         return leaders.find((leader) => !isEvmAddress(leader)) || null;
       }
 
+      function selectedCopyAccounts() {
+        const select = $("copyAccounts");
+        if (!select) return [];
+        return Array.from(select.selectedOptions).map((option) => option.value);
+      }
+
+      function renderCopyAccountPicker(accounts = []) {
+        const root = $("copyAccountPicker");
+        if (!root) return;
+        const selected = new Set(selectedCopyAccounts());
+        root.innerHTML = accounts.map((account) => {
+          const accountId = String(account?.account_id || "").trim();
+          if (!accountId) return "";
+          const checked = selected.has(accountId) ? " checked" : "";
+          return `
+            <label class="copy-account-option">
+              <input type="checkbox" value="${escapeHtml(accountId)}"${checked} />
+              <strong class="mono">${escapeHtml(accountId)}</strong>
+            </label>
+          `;
+        }).join("");
+      }
+
+      function syncCopyAccountPickerFromSelect() {
+        const root = $("copyAccountPicker");
+        if (!root) return;
+        const selected = new Set(selectedCopyAccounts());
+        root.querySelectorAll("input[type='checkbox']").forEach((input) => {
+          input.checked = selected.has(input.value);
+        });
+      }
+
+      function syncCopyAccountsFromPicker() {
+        const select = $("copyAccounts");
+        const root = $("copyAccountPicker");
+        if (!select || !root) return;
+        const checked = new Set(Array.from(root.querySelectorAll("input[type='checkbox']:checked")).map((input) => input.value));
+        Array.from(select.options).forEach((option) => {
+          option.selected = checked.has(option.value);
+        });
+        renderCopyConfigPreview();
+      }
+
+      function setCopyAccountSelections(accountIds = []) {
+        const select = $("copyAccounts");
+        if (!select) return;
+        const selected = new Set((Array.isArray(accountIds) ? accountIds : [])
+          .map((accountId) => String(accountId || "").trim())
+          .filter(Boolean));
+        Array.from(select.options).forEach((option, index) => {
+          option.selected = selected.size > 0 ? selected.has(option.value) : index === 0;
+        });
+        syncCopyAccountPickerFromSelect();
+        renderCopyConfigPreview();
+      }
+
+      function setAllCopyAccountsSelected(selected) {
+        const select = $("copyAccounts");
+        if (!select) return;
+        Array.from(select.options).forEach((option) => {
+          option.selected = Boolean(selected);
+        });
+        syncCopyAccountPickerFromSelect();
+        renderCopyConfigPreview();
+      }
+
       function loadCopySimpleSettings() {
         try {
           const saved = JSON.parse(localStorage.getItem("trade_xyz_copy_simple_settings") || "{}");
@@ -10946,8 +11173,14 @@
             if (Number.isFinite(Number(saved.principal_cap_usd))) {
               $("copyPrincipalCap").value = String(saved.principal_cap_usd);
             }
+            if (Number.isFinite(Number(saved.leverage))) {
+              $("copyLeverage").value = String(Math.min(Math.max(Number(saved.leverage), 1), 10));
+            }
             if (Array.isArray(saved.markets) && saved.markets.length > 0) {
               setCopyMarketSelections(saved.markets, { persist: false });
+            }
+            if (Array.isArray(saved.account_ids) && saved.account_ids.length > 0) {
+              setCopyAccountSelections(saved.account_ids);
             }
           }
         } catch {
@@ -10968,14 +11201,23 @@
           if (Number.isFinite(Number(settings.principal_cap_usd))) {
             $("copyPrincipalCap").value = String(settings.principal_cap_usd);
           }
+          if (Number.isFinite(Number(settings.leverage))) {
+            $("copyLeverage").value = String(Math.min(Math.max(Number(settings.leverage), 1), 10));
+          }
           if (Array.isArray(settings.markets) && settings.markets.length > 0) {
             setCopyMarketSelections(settings.markets);
+          }
+          if (Array.isArray(settings.account_ids) && settings.account_ids.length > 0) {
+            setCopyAccountSelections(settings.account_ids);
+          } else if (settings.account_id) {
+            setCopyAccountSelections([settings.account_id]);
           }
           saveCopySimpleSettings(
             parseCopyLeaderAccounts($("copyLeaderAccounts")?.value || ""),
             Number($("copyRatio")?.value),
             Number($("copyPrincipalCap")?.value),
             selectedCopyMarkets(),
+            selectedCopyAccounts(),
           );
           renderCopyConfigPreview();
         } catch (error) {
@@ -10986,12 +11228,14 @@
         }
       }
 
-      function saveCopySimpleSettings(leaders, ratio, cap, markets = selectedCopyMarkets()) {
+      function saveCopySimpleSettings(leaders, ratio, cap, markets = selectedCopyMarkets(), accountIds = selectedCopyAccounts()) {
         localStorage.setItem("trade_xyz_copy_simple_settings", JSON.stringify({
           leaders,
           markets,
+          account_ids: accountIds,
           copy_ratio: ratio,
           principal_cap_usd: cap,
+          leverage: Number($("copyLeverage")?.value) || 10,
           saved_at_ms: Date.now(),
         }));
       }
@@ -11003,16 +11247,22 @@
         const ratio = Number($("copyRatio")?.value);
         const cap = Number($("copyPrincipalCap")?.value);
         const markets = selectedCopyMarkets();
+        const accountIds = selectedCopyAccounts();
         const marketText = markets.map((market) => marketLabel(market)).join(" / ");
-        const ok = leaders.length > 0 && markets.length > 0 && !invalidCopyLeaderAccount(leaders) && Number.isFinite(ratio) && ratio > 0 && Number.isFinite(cap) && cap > 0;
-        root.classList.toggle("hidden", !ok);
+        const ok = leaders.length > 0 && accountIds.length > 0 && markets.length > 0 && !invalidCopyLeaderAccount(leaders) && Number.isFinite(ratio) && ratio > 0 && Number.isFinite(cap) && cap > 0;
         if (!ok) {
-          root.textContent = "";
+          if (!root.dataset.resultKind || root.dataset.resultKind === "preview") {
+            root.textContent = "";
+            root.dataset.resultKind = "preview";
+            root.classList.add("hidden");
+          }
           return;
         }
+        root.classList.remove("hidden");
+        root.dataset.resultKind = "preview";
         root.textContent = state.lang === "zh"
-          ? `已识别 ${leaders.length} 个目标跟单账号。跟单市场：${marketText}。系统将按 ${number(ratio, 4)} 倍比例跟随，每个交易对最多使用 ${money(cap)} 本金；取消的市场只出不进，杠杆、交易对识别、买卖方向、去重和风控由后台自动处理。`
-          : `Detected ${leaders.length} target copy account(s). Copy markets: ${marketText}. The bot will copy at ${number(ratio, 4)}x, cap each pair at ${money(cap)} principal, keep unselected markets exit-only, and handle leverage, symbols, side detection, dedupe, and risk automatically.`;
+          ? `已识别 ${leaders.length} 个目标跟单账号，${accountIds.length} 个本地账号会同时跟单。跟单市场：${marketText}。系统将按 ${number(ratio, 4)} 倍比例跟随，每个交易对最多使用 ${money(cap)} 本金；取消的市场只出不进，杠杆、交易对识别、买卖方向、去重和风控由后台自动处理。`
+          : `Detected ${leaders.length} target copy account(s); ${accountIds.length} local account(s) will copy together. Copy markets: ${marketText}. The bot will copy at ${number(ratio, 4)}x, cap each pair at ${money(cap)} principal, keep unselected markets exit-only, and handle leverage, symbols, side detection, dedupe, and risk automatically.`;
       }
 
       function shortAddress(value) {
@@ -11029,6 +11279,20 @@
 
       function nullableMoney(value) {
         return value == null ? t("copy.waiting_pnl") : signedMoney(value);
+      }
+
+      function copyTargetPositionStateText(summary) {
+        const stateText = String(summary?.target_position_state || "").toLowerCase();
+        if (stateText === "current") return t("copy.target_positions_current");
+        if (stateText === "partial") return t("copy.target_positions_partial");
+        if (stateText === "unconfigured") return "-";
+        return t("copy.target_positions_unknown");
+      }
+
+      function copyTargetOpenPositionText(summary) {
+        const stateText = String(summary?.target_position_state || "").toLowerCase();
+        if (stateText !== "current" && stateText !== "partial") return "-";
+        return number(summary?.target_open_position_count || 0, 0);
       }
 
       function copyAccountLabel(account, fallbackIndex = 0) {
@@ -11060,9 +11324,13 @@
           : t("copy.pnl_report_fresh", { minutes });
       }
 
-      function copyAccountRowsHtml(accounts) {
+      function copyAccountRowsHtml(accounts, {
+        accountLabel = t("copy.target_accounts"),
+        pnlLabel = t("copy.target_raw_pnl"),
+        emptyText = t("copy.no_leaders"),
+      } = {}) {
         if (!accounts.length) {
-          return `<div class="quote-meta">${t("copy.no_leaders")}</div>`;
+          return `<div class="quote-meta">${emptyText}</div>`;
         }
         return accounts.map((account, index) => {
           const total = account?.total_pnl_usd ?? (
@@ -11074,11 +11342,11 @@
           return `
             <div class="copy-account-row">
               <div class="copy-account-cell">
-                <span>${t("copy.target_accounts")}</span>
-                <strong title="${escapeHtml(account?.address || "")}">${escapeHtml(copyAccountLabel(account, index))} · ${escapeHtml(shortAddress(account?.address))}</strong>
+                <span>${escapeHtml(accountLabel)}</span>
+                <strong title="${escapeHtml(account?.address || "")}">${escapeHtml(copyAccountLabel(account, index))}${account?.address ? ` · ${escapeHtml(shortAddress(account.address))}` : ""}</strong>
               </div>
               <div class="copy-account-cell">
-                <span>${t("copy.target_raw_pnl")}</span>
+                <span>${escapeHtml(pnlLabel)}</span>
                 <strong class="${escapeHtml(pnlClass(total))}">${escapeHtml(nullableMoney(total))}</strong>
               </div>
               <div class="copy-account-cell">
@@ -11094,7 +11362,10 @@
         }).join("");
       }
 
-      function copyPositionsHtml(accounts) {
+      function copyPositionsHtml(accounts, {
+        accountLabel = t("copy.target_accounts"),
+        emptyText = t("copy.no_positions"),
+      } = {}) {
         const positions = [];
         accounts.forEach((account, accountIndex) => {
           (Array.isArray(account?.positions) ? account.positions : []).forEach((position) => {
@@ -11102,12 +11373,12 @@
           });
         });
         if (!positions.length) {
-          return `<div class="quote-meta">${t("copy.no_positions")}</div>`;
+          return `<div class="quote-meta">${emptyText}</div>`;
         }
         return positions.map(({ account, accountIndex, position }) => `
           <div class="copy-position-row">
             <div class="copy-position-cell">
-              <span>${t("copy.target_accounts")}</span>
+              <span>${escapeHtml(accountLabel)}</span>
               <strong>${escapeHtml(copyAccountLabel(account, accountIndex))}</strong>
             </div>
             <div class="copy-position-cell">
@@ -11160,9 +11431,9 @@
         const myRealized = local.realized_pnl_usd ?? summary.realized_pnl_usd;
         const ledgerRealtime = copyRealtimeDashboardAttribution();
         const hasRealtimeCopyPnl = ledgerRealtime.position_count > 0;
-        const myUnrealized = hasRealtimeCopyPnl
-          ? ledgerRealtime.pnl_usd
-          : (local.unrealized_pnl_usd ?? summary.unrealized_pnl_usd);
+        const myUnrealized = local.unrealized_pnl_usd ?? summary.unrealized_pnl_usd ?? (
+          hasRealtimeCopyPnl ? ledgerRealtime.pnl_usd : null
+        );
         const myDisplayTotal = myRealized == null && myUnrealized == null
           ? myTotal
           : Number(myRealized || 0) + Number(myUnrealized || 0);
@@ -11178,6 +11449,9 @@
           : t("copy.live_soak_stopped");
         const tone = summary.live_running ? "live" : "waiting";
         const leaders = Array.isArray(summary.leader_summaries) ? summary.leader_summaries : [];
+        const localSummaries = Array.isArray(summary.local_summaries) && summary.local_summaries.length > 0
+          ? summary.local_summaries
+          : (summary.local_summary ? [summary.local_summary] : []);
         const addressFallback = Array.isArray(summary.leader_addresses) ? summary.leader_addresses : [];
         const summaryMarkets = Array.isArray(summary.markets) && summary.markets.length > 0
           ? summary.markets
@@ -11185,6 +11459,16 @@
         const marketsHtml = summaryMarkets.map((market) => `
           <span class="copy-address-chip">
             <strong>${escapeHtml(marketLabel(market))}</strong>
+          </span>
+        `).join("");
+        const localAccountIds = Array.isArray(summary.account_ids) && summary.account_ids.length > 0
+          ? summary.account_ids
+          : Array.isArray(state.copyLiveSoakStatus?.account_ids) && state.copyLiveSoakStatus.account_ids.length > 0
+            ? state.copyLiveSoakStatus.account_ids
+            : selectedCopyAccounts();
+        const localAccountsHtml = localAccountIds.map((accountId) => `
+          <span class="copy-address-chip">
+            <strong>${escapeHtml(accountId)}</strong>
           </span>
         `).join("");
         const addressHtml = leaders.length
@@ -11203,10 +11487,12 @@
           : latestEntries.slice(0, 5).map((entry) => {
             const notional = Number.isFinite(Number(entry?.notional_usd)) ? money(Number(entry.notional_usd)) : "-";
             const occurred = entry?.occurred_at_ms ? formatDateTime(entry.occurred_at_ms) : "-";
+            const localAccount = entry?.local_account_id || "-";
             return `
               <div class="order-meta-line">
                 <span class="status-badge" data-status="${escapeHtml(String(entry?.status || "").toLowerCase())}">${escapeHtml(copyShadowStatusText(entry?.status))}</span>
                 <span class="mono">${escapeHtml(coinDisplayPair(entry?.coin) || entry?.coin || "-")}</span>
+                <span class="mono">${escapeHtml(localAccount)}</span>
                 <strong>${escapeHtml(notional)}</strong>
                 <span>${escapeHtml(occurred)}</span>
               </div>
@@ -11238,11 +11524,14 @@
               ${copyMetricHtml(t("copy.my_pnl"), nullableMoney(myDisplayTotal), mySub, myDisplayTotal)}
               ${copyMetricHtml(t("copy.target_raw_pnl"), nullableMoney(targetTotal), targetSub, targetTotal)}
               ${copyMetricHtml(t("copy.unattributed_pnl"), money(unattributedPnl || 0), t("copy.unattributed_positions", { count: number(unattributedCount, 0) }), unattributedPnl || 0)}
-              ${copyMetricHtml(t("copy.target_accounts"), number(summary.leader_count || 0, 0), `${t("copy.open_positions")} ${number(summary.target_open_position_count || 0, 0)}`)}
+              ${copyMetricHtml(t("copy.target_accounts"), number(summary.leader_count || 0, 0), `${t("copy.open_positions")} ${copyTargetOpenPositionText(summary)} · ${copyTargetPositionStateText(summary)}`)}
               ${copyMetricHtml(t("copy.current_run_orders"), number(summary.submitted_reports || 0, 0), `${t("copy.history_total_orders")} · ${t("copy.summary_notional")} ${money(summary.copied_notional_usd || 0)}`)}
             </div>
             <div class="copy-address-list">
               ${marketsHtml || `<span class="quote-meta">${t("copy.market_exit_only")}</span>`}
+            </div>
+            <div class="copy-address-list" aria-label="${escapeHtml(t("copy.local_copy_accounts"))}">
+              ${localAccountsHtml || `<span class="quote-meta">${t("copy.error_requires_local_account")}</span>`}
             </div>
             <div class="copy-address-list">
               ${addressHtml || `<span class="quote-meta">${t("copy.no_leaders")}</span>`}
@@ -11259,7 +11548,8 @@
                   <div><span>${t("copy.unattributed_pnl")}</span><strong class="${escapeHtml(pnlClass(unattributedPnl || 0))}">${escapeHtml(money(unattributedPnl || 0))}</strong></div>
                   <div><span>${t("copy.fees")}</span><strong>${escapeHtml(myFees == null ? "-" : money(myFees))}</strong></div>
                   <div><span>${t("copy.summary_rejected")}</span><strong>${escapeHtml(number(summary.rejected_count || 0, 0))} / ${escapeHtml(number(summary.deduped_count || 0, 0))}</strong></div>
-                  <div><span>${t("copy.open_positions")}</span><strong>${escapeHtml(number(summary.target_open_position_count || 0, 0))}</strong></div>
+                  <div><span>${t("copy.open_positions")}</span><strong>${escapeHtml(copyTargetOpenPositionText(summary))}</strong></div>
+                  <div><span>${t("copy.target_accounts")}</span><strong>${escapeHtml(copyTargetPositionStateText(summary))}</strong></div>
                   <div><span>${t("copy.position_value")}</span><strong>${escapeHtml(summary.target_position_value_usd == null ? "-" : money(summary.target_position_value_usd))}</strong></div>
                   <div><span>${t("copy.pnl_report_time")}</span><strong>${escapeHtml(reportTime)}</strong></div>
                 </div>
@@ -11268,9 +11558,13 @@
                   <span>${escapeHtml(copyPnlReportStatusText(summary))}</span>
                   <span>${escapeHtml(reportText)}</span>
                   <span>${escapeHtml(t("copy.pnl_scope_note"))}</span>
-                  ${hasRealtimeCopyPnl ? `<span>${escapeHtml(t("copy.realtime_attribution_note"))}</span>` : ""}
+                  ${hasRealtimeCopyPnl && local.unrealized_pnl_usd == null && summary.unrealized_pnl_usd == null ? `<span>${escapeHtml(t("copy.realtime_attribution_note"))}</span>` : ""}
                   ${unattributedCount > 0 ? `<span>${escapeHtml(t("copy.unattributed_warning", { count: number(unattributedCount, 0), pnl: money(unattributedPnl || 0) }))}</span>` : ""}
                 </div>
+                <div class="fib-instance-section-title">${t("copy.local_detail")}</div>
+                ${copyAccountRowsHtml(localSummaries, { accountLabel: t("copy.local_copy_accounts"), pnlLabel: t("copy.my_pnl"), emptyText: t("copy.error_requires_local_account") })}
+                <div class="fib-instance-section-title">${t("copy.local_position_detail")}</div>
+                ${copyPositionsHtml(localSummaries, { accountLabel: t("copy.local_copy_accounts") })}
                 <div class="fib-instance-section-title">${t("copy.leader_detail")}</div>
                 ${copyAccountRowsHtml(leaders)}
                 <div class="fib-instance-section-title">${t("copy.position_detail")}</div>
@@ -11297,7 +11591,7 @@
         const startButton = $("copyLiveSoakStartAction");
         const stopButton = $("copyLiveSoakStopAction");
         if (startButton) startButton.disabled = Boolean(status?.running);
-        if (stopButton) stopButton.disabled = !Boolean(status?.running);
+        if (stopButton) stopButton.disabled = false;
         if (!status || !status.detected) {
           root.innerHTML = `<div class="quote-meta">${t("copy.live_soak_empty")}</div>`;
           return;
@@ -11306,21 +11600,51 @@
         const statusKind = String(status.status_kind || (running ? "running" : "unknown"));
         const statusLabel = statusKind === "running"
           ? t("copy.live_soak_running")
+          : statusKind === "paused"
+            ? t("copy.live_soak_status_paused")
           : statusKind === "stale"
             ? t("copy.live_soak_status_stale")
             : statusKind === "process_stopped"
               ? t("copy.live_soak_status_process_stopped")
-              : statusKind === "terminal"
-                ? t("copy.live_soak_status_terminal")
-                : statusKind === "not_detected"
-                  ? t("copy.live_soak_stopped")
-                  : t("copy.live_soak_status_unknown");
-        const tone = running ? "live" : (statusKind === "stale" || statusKind === "process_stopped" ? "warning" : "waiting");
+              : statusKind === "round_stalled"
+                ? t("copy.live_soak_status_stalled")
+                : statusKind === "terminal"
+                  ? t("copy.live_soak_status_terminal")
+                  : statusKind === "not_detected"
+                    ? t("copy.live_soak_stopped")
+                    : t("copy.live_soak_status_unknown");
+        const tone = running ? "live" : (statusKind === "stale" || statusKind === "process_stopped" || statusKind === "round_stalled" ? "warning" : "waiting");
         const updatedAt = status.last_updated_at_ms ? formatDateTime(status.last_updated_at_ms) : "-";
         const latestOk = status.latest_ok == null ? "-" : (status.latest_ok ? "OK" : "FAIL");
+        const accountText = Array.isArray(status.account_ids) && status.account_ids.length > 0
+          ? status.account_ids.join(", ")
+          : selectedCopyAccounts().join(", ");
+        const marketText = Array.isArray(status.markets) && status.markets.length > 0
+          ? status.markets.map((market) => marketLabel(market)).join(" / ")
+          : selectedCopyMarkets().map((market) => marketLabel(market)).join(" / ");
         const boolText = (value) => value == null
           ? "-"
           : (value ? (state.lang === "zh" ? "是" : "yes") : (state.lang === "zh" ? "否" : "no"));
+        const suppressionSummaries = Array.isArray(status.suppression_summaries) ? status.suppression_summaries : [];
+        const suppressionHtml = suppressionSummaries.length
+          ? suppressionSummaries.slice(0, 5).map((item) => {
+              const scope = [item?.account_id, coinDisplayPair(item?.coin) || item?.coin]
+                .filter(Boolean)
+                .join(" · ");
+              const count = Number(item?.count || 0);
+              const plainReason = copySuppressionReasonText(item);
+              const technicalReason = String(item?.message || "").trim();
+              return `
+                <div class="order-meta-line">
+                  <span class="status-badge" data-status="warning">${escapeHtml(item?.reason_code || "-")}</span>
+                  ${scope ? `<span class="mono">${escapeHtml(scope)}</span>` : ""}
+                  ${count > 1 ? `<strong>x${escapeHtml(number(count, 0))}</strong>` : ""}
+                  <span>${escapeHtml(plainReason)}</span>
+                  ${technicalReason && technicalReason !== plainReason ? `<span class="mono">${escapeHtml(technicalReason)}</span>` : ""}
+                </div>
+              `;
+            }).join("")
+          : `<div class="quote-meta">-</div>`;
         root.innerHTML = `
           <div class="fib-instance-card">
             <div class="fib-instance-body">
@@ -11331,6 +11655,9 @@
               <div class="fib-instance-kv">
                 <div><span>${t("copy.live_soak_run_id")}</span><strong class="mono">${escapeHtml(status.run_id || "-")}</strong></div>
                 <div><span>${t("copy.live_soak_round")}</span><strong>${escapeHtml(status.latest_round ?? "-")}</strong></div>
+                <div><span>${t("copy.running_accounts")}</span><strong class="mono">${escapeHtml(accountText || "-")}</strong></div>
+                <div><span>${t("copy.running_markets")}</span><strong>${escapeHtml(marketText || "-")}</strong></div>
+                <div><span>${t("copy.target_accounts")}</span><strong>${escapeHtml(status.leader_count ?? "-")}</strong></div>
                 <div><span>${t("copy.live_soak_status_kind")}</span><strong>${escapeHtml(statusLabel)}</strong></div>
                 <div><span>OK</span><strong>${escapeHtml(latestOk)}</strong></div>
                 <div><span>PID</span><strong class="mono">${escapeHtml(status.pid || "-")}</strong></div>
@@ -11343,6 +11670,8 @@
                 <div><span>${t("copy.live_soak_watcher")}</span><strong>${escapeHtml(status.watcher_status || "-")}</strong></div>
               </div>
               <div class="order-meta-line"><strong>${t("copy.live_soak_message")}：</strong>${escapeHtml(status.message || "-")}</div>
+              <div class="fib-instance-section-title">${t("copy.live_soak_suppressed")}</div>
+              ${suppressionHtml}
             </div>
           </div>
         `;
@@ -11380,6 +11709,7 @@
               <div class="fib-instance-kv">
                 <div><span>${t("table.coin")}</span><strong class="mono">${escapeHtml(coinDisplayPair(entry?.coin) || entry?.coin || "-")}</strong></div>
                 <div><span>${t("manual.side")}</span><strong>${escapeHtml(side)} ${escapeHtml(reduceOnly)}</strong></div>
+                <div><span>${t("copy.local_account")}</span><strong class="mono">${escapeHtml(entry?.local_account_id || "-")}</strong></div>
                 <div><span>${t("manual.notional")}</span><strong>${escapeHtml(notional)}</strong></div>
                 <div><span>${state.lang === "zh" ? "动作" : "Action"}</span><strong>${escapeHtml(entry?.action_kind || "-")}</strong></div>
                 <div><span>${t("copy.shadow.live_gate")}</span><strong>${escapeHtml(entry?.live_gate || "-")}</strong></div>
@@ -12034,7 +12364,7 @@
           return;
         }
         const source = Array.isArray(events) ? events : [];
-        const marketOrder = ["xyz_perp", "hl_perp", "spot"];
+        const marketOrder = ["xyz_perp", "hl_perp", "cash_perp", "spot"];
         const openMarkets = new Set(
           (Array.isArray(state.recentEventsOpenMarkets) ? state.recentEventsOpenMarkets : [])
             .map((market) => String(market || "").trim().toLowerCase())
@@ -12838,9 +13168,10 @@
           if (!knownIds.has(state.manualMarket)) state.manualMarket = knownIds.has(defaultMarket) ? defaultMarket : "xyz_perp";
           if (!knownIds.has(state.fibMarket)) state.fibMarket = state.manualMarket;
           if (!knownIds.has(state.copyMarket)) state.copyMarket = state.manualMarket;
-          state.copyMarkets = (Array.isArray(state.copyMarkets) ? state.copyMarkets : []).filter((market) => knownIds.has(market));
+          const knownCopyIds = new Set([...knownIds, ...COPY_SUPPORTED_MARKET_IDS]);
+          state.copyMarkets = (Array.isArray(state.copyMarkets) ? state.copyMarkets : []).filter((market) => knownCopyIds.has(market));
           if (state.copyMarkets.length === 0) {
-            state.copyMarkets = markets.map((item) => item.market);
+            state.copyMarkets = defaultCopyMarkets();
           }
           renderMarketSelectOptions();
           syncLeverageControlsForMarket();
@@ -14056,8 +14387,16 @@
       $("copyMarkets").addEventListener("change", () => {
         setCopyMarketSelections(selectedCopyMarkets());
       });
-      ["copyLeaderAccounts", "copyRatio", "copyPrincipalCap", "copyMarkets"].forEach((id) => {
+      $("copySelectAllAccounts")?.addEventListener("click", () => {
+        setAllCopyAccountsSelected(true);
+      });
+      $("copyClearAccounts")?.addEventListener("click", () => {
+        setAllCopyAccountsSelected(false);
+      });
+      $("copyAccountPicker")?.addEventListener("change", syncCopyAccountsFromPicker);
+      ["copyLeaderAccounts", "copyAccounts", "copyRatio", "copyPrincipalCap", "copyMarkets"].forEach((id) => {
         $(id)?.addEventListener("input", renderCopyConfigPreview);
+        $(id)?.addEventListener("change", renderCopyConfigPreview);
       });
       $("copySaveWhitelistAction").addEventListener("click", async () => {
         await saveModuleSymbolPolicy("copyResult", "copy", "copySymbolWhitelist", "copySaveWhitelistAction", "copy", showCopyPolicyResult);
@@ -14078,6 +14417,7 @@
             : "Start live smart-money copy soak with the current target accounts, ratio, and cap? This may place real orders.");
           if (!ok) return;
           button.disabled = true;
+          await saveCopySettingsFromForm();
           const result = await api("/api/copy/live-soak/start", {
             method: "POST",
             headers: { "content-type": "application/json" },
@@ -14101,6 +14441,10 @@
       $("copyLiveSoakStopAction").addEventListener("click", async () => {
         const button = $("copyLiveSoakStopAction");
         try {
+          const ok = window.confirm(state.lang === "zh"
+            ? "确认一键取消当前聪明钱跟单？这会停止后台跟单进程，并阻止它继续执行新的跟买信号。"
+            : "Cancel the current smart-money copy process? This stops the background copy process and prevents new copy-buy execution from it.");
+          if (!ok) return;
           button.disabled = true;
           const result = await api("/api/copy/live-soak/stop", {
             method: "POST",
@@ -14118,39 +14462,44 @@
         }
       });
 
-      $("copyForm").addEventListener("submit", async (event) => {
-        event.preventDefault();
+      async function saveCopySettingsFromForm() {
         const leaders = parseCopyLeaderAccounts($("copyLeaderAccounts").value);
+        const accountIds = selectedCopyAccounts();
         const ratio = Number($("copyRatio").value);
         const cap = Number($("copyPrincipalCap").value);
         const markets = selectedCopyMarkets();
         if (leaders.length === 0) {
           showResult("copyResult", { ok: false, error: t("copy.error_requires_leader") });
           $("copyResult").classList.remove("hidden");
-          return;
+          throw new Error(t("copy.error_requires_leader"));
+        }
+        if (accountIds.length === 0) {
+          showResult("copyResult", { ok: false, error: t("copy.error_requires_local_account") });
+          $("copyResult").classList.remove("hidden");
+          throw new Error(t("copy.error_requires_local_account"));
         }
         const invalidLeader = invalidCopyLeaderAccount(leaders);
         if (invalidLeader) {
           showResult("copyResult", { ok: false, error: t("copy.error_invalid_leader", { address: invalidLeader }) });
           $("copyResult").classList.remove("hidden");
-          return;
+          throw new Error(t("copy.error_invalid_leader", { address: invalidLeader }));
         }
         if (!(Number.isFinite(ratio) && ratio > 0)) {
           showResult("copyResult", { ok: false, error: t("validate.min", { label: t("copy.copy_ratio"), min: 0.0001 }) });
           $("copyResult").classList.remove("hidden");
-          return;
+          throw new Error(t("validate.min", { label: t("copy.copy_ratio"), min: 0.0001 }));
         }
         if (!(Number.isFinite(cap) && cap > 0)) {
           showResult("copyResult", { ok: false, error: t("validate.min", { label: t("copy.principal_cap"), min: 0.01 }) });
           $("copyResult").classList.remove("hidden");
-          return;
+          throw new Error(t("validate.min", { label: t("copy.principal_cap"), min: 0.01 }));
         }
         $("copyLeaderId").value = "leader_1";
         $("copyAddress").value = leaders[0];
         $("copyLeaderNotional").value = String(Math.max(cap / Math.max(ratio, 0.0001), 1));
         $("copyLeverage").value = "10";
         $("copyReduce").checked = false;
-        saveCopySimpleSettings(leaders, ratio, cap, markets);
+        saveCopySimpleSettings(leaders, ratio, cap, markets, accountIds);
         const result = await api("/api/copy/settings", {
           method: "POST",
           headers: { "content-type": "application/json" },
@@ -14159,12 +14508,19 @@
             markets,
             copy_ratio: ratio,
             principal_cap_usd: cap,
-            account_id: "addr_a",
+            leverage: Number($("copyLeverage")?.value) || 10,
+            account_id: accountIds[0],
+            account_ids: accountIds,
           }),
         });
-        const saved = result?.data?.settings || {};
         showCopyResult(result);
         await loadCopySummary({ silent: true });
+        return result;
+      }
+
+      $("copyForm").addEventListener("submit", async (event) => {
+        event.preventDefault();
+        await saveCopySettingsFromForm();
       });
 
       $("vaultForm").addEventListener("submit", async (event) => {

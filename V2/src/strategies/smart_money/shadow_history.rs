@@ -22,6 +22,8 @@ pub struct CopyShadowHistoryEntry {
     pub status: String,
     pub leader_id: String,
     pub leader_address: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_account_id: Option<String>,
     pub coin: String,
     pub action_kind: String,
     pub action_event_id: String,
@@ -71,6 +73,16 @@ impl CopyShadowHistoryEntry {
             status: status.to_string(),
             leader_id: record.action.leader_id.clone(),
             leader_address: record.action.leader_address.clone(),
+            local_account_id: record
+                .ledger_entry
+                .as_ref()
+                .map(|entry| entry.local_account_id.clone())
+                .or_else(|| {
+                    record
+                        .signal
+                        .as_ref()
+                        .and_then(|signal| signal.target_accounts.first().cloned())
+                }),
             coin: record.action.coin.clone(),
             action_kind: format!("{:?}", record.action.kind),
             action_event_id: record.action.event_id.clone(),
@@ -114,6 +126,7 @@ impl Default for CopyShadowHistoryEntry {
             status: String::new(),
             leader_id: String::new(),
             leader_address: String::new(),
+            local_account_id: None,
             coin: String::new(),
             action_kind: String::new(),
             action_event_id: String::new(),

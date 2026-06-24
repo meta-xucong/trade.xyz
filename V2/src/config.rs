@@ -348,6 +348,7 @@ impl AppConfig {
     pub fn default_coin_for_market(&self, market: &str) -> String {
         match normalize_market_id(market).unwrap_or(MARKET_XYZ_PERP) {
             MARKET_HL_PERP => "BTC".to_string(),
+            MARKET_CASH_PERP => "cash:USA500".to_string(),
             MARKET_SPOT => "PURR/USDC".to_string(),
             _ => self.default_coin(),
         }
@@ -409,10 +410,16 @@ impl AccountConfig {
 
 pub const MARKET_XYZ_PERP: &str = "xyz_perp";
 pub const MARKET_HL_PERP: &str = "hl_perp";
+pub const MARKET_CASH_PERP: &str = "cash_perp";
 pub const MARKET_SPOT: &str = "spot";
 
 pub fn supported_market_ids() -> &'static [&'static str] {
-    &[MARKET_XYZ_PERP, MARKET_HL_PERP, MARKET_SPOT]
+    &[
+        MARKET_XYZ_PERP,
+        MARKET_HL_PERP,
+        MARKET_CASH_PERP,
+        MARKET_SPOT,
+    ]
 }
 
 pub fn normalize_market_id(raw: &str) -> Option<&'static str> {
@@ -421,6 +428,7 @@ pub fn normalize_market_id(raw: &str) -> Option<&'static str> {
         "hl" | "hl_perp" | "hl-perp" | "perp" | "default_perp" | "default-perp" => {
             Some(MARKET_HL_PERP)
         }
+        "cash" | "cash_perp" | "cash-perp" => Some(MARKET_CASH_PERP),
         "spot" => Some(MARKET_SPOT),
         _ => None,
     }
