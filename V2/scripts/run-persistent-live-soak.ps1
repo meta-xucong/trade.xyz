@@ -26,6 +26,7 @@ $prefix = ".codex-longrun\persistent-live-soak-$runId"
 $summaryPath = "$prefix-summary.jsonl"
 $logPath = "$prefix-run.log"
 $notificationSettingsPath = ".codex-longrun\notification-settings.json"
+$stopNotificationStatePath = ".codex-longrun\copy-stop-notification-state.json"
 $pidPath = ".codex-longrun\persistent-live-soak-detached-current.pid"
 $lockPath = ".codex-longrun\persistent-live-soak.lock"
 New-Item -ItemType Directory -Force -Path ".codex-longrun" | Out-Null
@@ -67,15 +68,26 @@ function Write-SoakLog {
 function Read-JsonObjectFile {
     param([string]$Path)
     $raw = Get-Content -LiteralPath $Path -Raw -Encoding utf8
+    if ([string]::IsNullOrWhiteSpace($raw)) {
+        throw "empty JSON report at $Path"
+    }
     try {
-        return $raw | ConvertFrom-Json
+        $parsed = $raw | ConvertFrom-Json
+        if ($null -eq $parsed) {
+            throw "JSON report parsed to null"
+        }
+        return $parsed
     } catch {
         $start = $raw.IndexOf('{')
         $end = $raw.LastIndexOf('}')
         if ($start -ge 0 -and $end -gt $start) {
             $json = $raw.Substring($start, $end - $start + 1)
             try {
-                return $json | ConvertFrom-Json
+                $parsed = $json | ConvertFrom-Json
+                if ($null -eq $parsed) {
+                    throw "JSON object parsed to null"
+                }
+                return $parsed
             } catch {
                 throw "failed to parse JSON object from $Path after stripping noisy output: $($_.Exception.Message)"
             }
@@ -97,6 +109,30 @@ function Get-NotificationSettings {
     } catch {
         Write-SoakLog "notification settings parse failed: $($_.Exception.Message)"
         return $null
+    }
+}
+
+function Write-StopNotificationState {
+    param(
+        [string]$Provider,
+        [string]$Status,
+        [string]$Reason,
+        [string]$Detail
+    )
+    try {
+        $state = [ordered]@{
+            source = "runner"
+            provider = $Provider
+            run_id = $runId
+            status = $Status
+            reason = $Reason
+            detail = $Detail
+            sent_at = (Get-Date -Format o)
+        }
+        $json = $state | ConvertTo-Json -Compress -Depth 6
+        Set-Content -LiteralPath $stopNotificationStatePath -Value $json -Encoding utf8
+    } catch {
+        Write-SoakLog "stop notification state write failed: $($_.Exception.Message)"
     }
 }
 
@@ -130,6 +166,7 @@ function Send-StopNotification {
             } | ConvertTo-Json -Compress -Depth 6
             Invoke-RestMethod -Uri $webhook -Method POST -ContentType "application/json" -Body $body -TimeoutSec 10 | Out-Null
             Write-SoakLog "stop notification sent provider=feishu status=$Status reason=$Reason"
+            Write-StopNotificationState -Provider "feishu" -Status $Status -Reason $Reason -Detail $Detail
         } else {
             $sendKey = [string]$settings.serverchan_sendkey
             if ([string]::IsNullOrWhiteSpace($sendKey)) {
@@ -143,6 +180,7 @@ function Send-StopNotification {
                 noip = "1"
             } -TimeoutSec 10 | Out-Null
             Write-SoakLog "stop notification sent provider=serverchan status=$Status reason=$Reason"
+            Write-StopNotificationState -Provider "serverchan" -Status $Status -Reason $Reason -Detail $Detail
         }
     } catch {
         $errorMessage = [string]$_.Exception.Message
@@ -230,6 +268,14 @@ if ($copySettings -and $copySettings.markets) {
 }
 if ($settingsMarkets.Count -eq 0) {
     $settingsMarkets = @("xyz_perp", "hl_perp", "cash_perp", "spot")
+}
+
+function As-NonNullArray {
+    param([object]$Value)
+    if ($null -eq $Value) {
+        return @()
+    }
+    return @($Value | Where-Object { $null -ne $_ })
 }
 
 $settingsAccounts = @()
@@ -412,8 +458,25 @@ while ($true) {
         Stop-WithNotification -Code $roundExitCode -Status "failed" -Reason "round_exit_code" -Detail "round=$round exit_code=$roundExitCode stderr=$stderrPath"
     }
 
-    $report = Read-JsonObjectFile -Path $reportPath
-    $submittedReports = @($report.persistent_live_submit.submitted_reports)
+    try {
+        $report = Read-JsonObjectFile -Path $reportPath
+    } catch {
+        $stderrTail = ""
+        if (Test-Path -LiteralPath $stderrPath) {
+            try {
+                $stderrTail = (Get-Content -LiteralPath $stderrPath -Tail 20 -Encoding utf8) -join "`n"
+            } catch {
+                $stderrTail = "failed to read stderr tail: $($_.Exception.Message)"
+            }
+        }
+        $detail = "round=$round report_parse_failed=$($_.Exception.Message) stderr=$stderrPath"
+        if (-not [string]::IsNullOrWhiteSpace($stderrTail)) {
+            $detail = "$detail stderr_tail=$stderrTail"
+        }
+        Write-SoakLog $detail
+        Stop-WithNotification -Code 3 -Status "failed" -Reason "report_parse_failed" -Detail $detail
+    }
+    $submittedReports = As-NonNullArray $report.persistent_live_submit.submitted_reports
     $submittedCount = @($submittedReports | Where-Object {
         $kind = [string]$_.kind
         $dryRun = $false
@@ -427,9 +490,9 @@ while ($true) {
         $message = [string]$_.message
         $kind -eq "error" -and $message.ToLowerInvariant().Contains("copy submit skipped before exchange")
     }).Count
-    $evidenceCount = @($report.persistent_live_submit.order_evidence).Count
-    $cleanupCount = @($report.persistent_live_submit.cleanup_runbooks).Count
-    $cleanupErrors = @($report.persistent_live_submit.cleanup_errors).Count
+    $evidenceCount = (As-NonNullArray $report.persistent_live_submit.order_evidence).Count
+    $cleanupCount = (As-NonNullArray $report.persistent_live_submit.cleanup_runbooks).Count
+    $cleanupErrors = (As-NonNullArray $report.persistent_live_submit.cleanup_errors).Count
     $finalReconcileHealth = $false
     foreach ($check in @($report.checks)) {
         if ($check.name -eq "final_reconcile_health") {
@@ -438,15 +501,21 @@ while ($true) {
         }
     }
     $finalFlat = $true
-    foreach ($reconcile in @($report.final_reconciliations)) {
+    foreach ($reconcile in (As-NonNullArray $report.final_reconciliations)) {
         if (-not $reconcile.ok) {
             $finalFlat = $false
         }
     }
-    $failedChecks = @($report.checks | Where-Object { -not $_.ok } | ForEach-Object {
-        "$($_.name): $($_.detail)"
+    $failedChecks = @(As-NonNullArray $report.checks | Where-Object { -not $_.ok } | ForEach-Object {
+        $name = [string]$_.name
+        $detail = [string]$_.detail
+        if ([string]::IsNullOrWhiteSpace($name) -and [string]::IsNullOrWhiteSpace($detail)) {
+            "unnamed failed check"
+        } else {
+            "${name}: $detail"
+        }
     })
-    $failedCheckNames = @($report.checks | Where-Object { -not $_.ok } | ForEach-Object {
+    $failedCheckNames = @(As-NonNullArray $report.checks | Where-Object { -not $_.ok } | ForEach-Object {
         [string]$_.name
     })
     $watcherOnlyDegraded = (-not [bool]$report.ok) `
@@ -462,8 +531,8 @@ while ($true) {
         -and ($cleanupErrors -eq 0) `
         -and ($failedCheckNames.Count -gt 0) `
         -and (@($failedCheckNames | Where-Object { $_ -notin @("exchange_submit_mode", "final_reconcile_health") }).Count -eq 0) `
-        -and (@($report.final_reconciliations).Count -gt 0) `
-        -and (@($report.final_reconciliations | Where-Object { -not $_.error }).Count -eq 0)
+        -and ((As-NonNullArray $report.final_reconciliations).Count -gt 0) `
+        -and (@(As-NonNullArray $report.final_reconciliations | Where-Object { -not $_.error }).Count -eq 0)
     if ($watcherOnlyDegraded) {
         $consecutiveDegradedWatcherRounds += 1
     } elseif ($reconcileOnlyDegraded) {

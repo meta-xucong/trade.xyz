@@ -7,6 +7,8 @@ param(
     [double]$Leverage = 10.0,
     [double]$MaxTotalNotionalUsd = 700.0,
     [double]$MaxTotalFeesUsd = 1.0,
+    [int]$StopConfirmPolls = 3,
+    [int]$NotificationCooldownSecs = 900,
     [string]$AccountId = "addr_a",
     [string[]]$AccountIds = @(),
     [string[]]$Leaders = @(
@@ -30,7 +32,12 @@ $projectRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 Set-Location $projectRoot
 New-Item -ItemType Directory -Force -Path ".codex-longrun" | Out-Null
 $notificationSettingsPath = ".codex-longrun\notification-settings.json"
+$stopNotificationStatePath = ".codex-longrun\copy-stop-notification-state.json"
 $copyLiveSoakPausePath = ".codex-longrun\copy-live-soak-paused.flag"
+$stopCandidateReason = ""
+$stopCandidateCount = 0
+$lastStopNotificationReason = ""
+$lastStopNotificationAt = [datetime]::MinValue
 
 function Write-MonitorLog {
     param([string]$Message)
@@ -63,7 +70,7 @@ function Send-MonitorNotification {
     )
     $settings = Get-NotificationSettings
     if ($null -eq $settings) {
-        return
+        return $false
     }
     $title = "trade.xyz copy health monitor $Status"
     $message = @(
@@ -76,7 +83,7 @@ function Send-MonitorNotification {
         if ([string]$settings.provider -eq "feishu") {
             $webhook = [string]$settings.feishu_webhook
             if ([string]::IsNullOrWhiteSpace($webhook)) {
-                return
+                return $false
             }
             $body = @{
                 msg_type = "text"
@@ -84,10 +91,11 @@ function Send-MonitorNotification {
             } | ConvertTo-Json -Compress -Depth 6
             Invoke-RestMethod -Uri $webhook -Method POST -ContentType "application/json" -Body $body -TimeoutSec 10 | Out-Null
             Write-MonitorLog "notification sent provider=feishu status=$Status reason=$Reason"
+            return $true
         } else {
             $sendKey = [string]$settings.serverchan_sendkey
             if ([string]::IsNullOrWhiteSpace($sendKey)) {
-                return
+                return $false
             }
             Invoke-RestMethod -Uri "https://sctapi.ftqq.com/$sendKey.send" -Method POST -ContentType "application/x-www-form-urlencoded" -Body @{
                 title = $title
@@ -96,6 +104,7 @@ function Send-MonitorNotification {
                 noip = "1"
             } -TimeoutSec 10 | Out-Null
             Write-MonitorLog "notification sent provider=serverchan status=$Status reason=$Reason"
+            return $true
         }
     } catch {
         $errorMessage = [string]$_.Exception.Message
@@ -106,7 +115,87 @@ function Send-MonitorNotification {
             $errorMessage = $errorMessage.Replace([string]$settings.feishu_webhook, "***")
         }
         Write-MonitorLog "notification failed provider=$($settings.provider) status=$Status error=$errorMessage"
+        return $false
     }
+}
+
+function Get-DiagnosticRunId {
+    param([string]$Diagnostic)
+    if ([string]::IsNullOrWhiteSpace($Diagnostic)) {
+        return ""
+    }
+    $match = [regex]::Match($Diagnostic, "run_id=([0-9]{8}-[0-9]{6})")
+    if ($match.Success) {
+        return $match.Groups[1].Value
+    }
+    return ""
+}
+
+function Read-StopNotificationState {
+    if (-not (Test-Path -LiteralPath $stopNotificationStatePath)) {
+        return $null
+    }
+    try {
+        return Get-Content -LiteralPath $stopNotificationStatePath -Raw -Encoding utf8 | ConvertFrom-Json
+    } catch {
+        Write-MonitorLog "stop notification state parse failed: $($_.Exception.Message)"
+        return $null
+    }
+}
+
+function Write-StopNotificationState {
+    param(
+        [string]$Provider,
+        [string]$Reason,
+        [string]$Diagnostic
+    )
+    try {
+        $state = [ordered]@{
+            source = "monitor"
+            provider = $Provider
+            run_id = Get-DiagnosticRunId $Diagnostic
+            status = "stopped"
+            reason = $Reason
+            detail = $Diagnostic
+            sent_at = (Get-Date -Format o)
+        }
+        $json = $state | ConvertTo-Json -Compress -Depth 6
+        Set-Content -LiteralPath $stopNotificationStatePath -Value $json -Encoding utf8
+    } catch {
+        Write-MonitorLog "stop notification state write failed: $($_.Exception.Message)"
+    }
+}
+
+function Test-RecentStopNotificationAlreadySent {
+    param(
+        [string]$Reason,
+        [string]$Diagnostic
+    )
+    $state = Read-StopNotificationState
+    if ($null -eq $state -or $null -eq $state.sent_at) {
+        return $false
+    }
+    try {
+        $sentAt = [datetime]::Parse([string]$state.sent_at)
+    } catch {
+        return $false
+    }
+    $ageSecs = ((Get-Date) - $sentAt).TotalSeconds
+    if ($ageSecs -ge $NotificationCooldownSecs) {
+        return $false
+    }
+    $stateSource = [string]$state.source
+    $stateStatus = [string]$state.status
+    if ($stateSource -eq "runner" -and $stateStatus -in @("failed", "stopped")) {
+        Write-MonitorLog "recent runner stop notification already covers monitor stop reason=$Reason prior_reason=$($state.reason) age_secs=$([Math]::Round($ageSecs, 1))"
+        return $true
+    }
+    $diagnosticRunId = Get-DiagnosticRunId $Diagnostic
+    $stateRunId = [string]$state.run_id
+    if (-not [string]::IsNullOrWhiteSpace($diagnosticRunId) -and $stateRunId -eq $diagnosticRunId) {
+        return $true
+    }
+    return ([string]$state.reason) -eq $Reason
 }
 
 function Invoke-Json {
@@ -172,15 +261,26 @@ function Get-LatestRunDiagnostic {
 function Read-JsonObjectFile {
     param([string]$Path)
     $raw = Get-Content -LiteralPath $Path -Raw -Encoding utf8
+    if ([string]::IsNullOrWhiteSpace($raw)) {
+        throw "empty JSON report at $Path"
+    }
     try {
-        return $raw | ConvertFrom-Json
+        $parsed = $raw | ConvertFrom-Json
+        if ($null -eq $parsed) {
+            throw "JSON report parsed to null"
+        }
+        return $parsed
     } catch {
         $start = $raw.IndexOf('{')
         $end = $raw.LastIndexOf('}')
         if ($start -ge 0 -and $end -gt $start) {
             $json = $raw.Substring($start, $end - $start + 1)
             try {
-                return $json | ConvertFrom-Json
+                $parsed = $json | ConvertFrom-Json
+                if ($null -eq $parsed) {
+                    throw "JSON object parsed to null"
+                }
+                return $parsed
             } catch {
                 throw "failed to parse JSON object from $Path after stripping noisy output: $($_.Exception.Message)"
             }
@@ -216,6 +316,64 @@ function Test-SoakProcessCommand {
     $isRoundChild = $Process.Name -eq "trade_xyz_bot_v2.exe" `
         -and $commandLine -like "*copy-live-daemon-supervisor*"
     return $isWrapper -or $isRoundChild
+}
+
+function Reset-StopCandidate {
+    param([string]$Context)
+    if ($script:stopCandidateCount -gt 0) {
+        Write-MonitorLog "stop candidate cleared context=$Context prior_reason=$script:stopCandidateReason prior_count=$script:stopCandidateCount"
+    }
+    $script:stopCandidateReason = ""
+    $script:stopCandidateCount = 0
+}
+
+function Test-StopCandidateConfirmed {
+    param(
+        [string]$Reason,
+        [string]$Diagnostic
+    )
+    if ($script:stopCandidateReason -ne $Reason) {
+        $script:stopCandidateReason = $Reason
+        $script:stopCandidateCount = 0
+    }
+    $script:stopCandidateCount += 1
+    if ($script:stopCandidateCount -lt [Math]::Max(1, $StopConfirmPolls)) {
+        Write-MonitorLog "stop candidate pending reason=$Reason count=$script:stopCandidateCount/$StopConfirmPolls diagnostic=$Diagnostic"
+        return $false
+    }
+    Write-MonitorLog "stop candidate confirmed reason=$Reason count=$script:stopCandidateCount diagnostic=$Diagnostic"
+    return $true
+}
+
+function Send-ConfirmedStopNotification {
+    param(
+        [string]$Reason,
+        [string]$Diagnostic
+    )
+    $now = Get-Date
+    $cooldownActive = $script:lastStopNotificationReason -eq $Reason -and
+        (($now - $script:lastStopNotificationAt).TotalSeconds -lt $NotificationCooldownSecs)
+    if ($cooldownActive) {
+        $remaining = [Math]::Round($NotificationCooldownSecs - ($now - $script:lastStopNotificationAt).TotalSeconds, 1)
+        Write-MonitorLog "notification suppressed by cooldown reason=$Reason remaining_secs=$remaining"
+        return
+    }
+    if (Test-RecentStopNotificationAlreadySent -Reason $Reason -Diagnostic $Diagnostic) {
+        Write-MonitorLog "notification suppressed by shared state reason=$Reason diagnostic=$Diagnostic"
+        return
+    }
+    $sent = Send-MonitorNotification -Status "stopped" -Reason $Reason -Detail $Diagnostic
+    if ($sent) {
+        $settings = Get-NotificationSettings
+        $provider = if ($null -ne $settings -and -not [string]::IsNullOrWhiteSpace([string]$settings.provider)) {
+            [string]$settings.provider
+        } else {
+            ""
+        }
+        Write-StopNotificationState -Provider $provider -Reason $Reason -Diagnostic $Diagnostic
+    }
+    $script:lastStopNotificationReason = $Reason
+    $script:lastStopNotificationAt = $now
 }
 
 function Test-SoakWrapperCommand {
@@ -545,7 +703,7 @@ function Restart-CopyLiveSoakAfterStale {
         [string]$Reason,
         [string]$Diagnostic
     )
-    Send-MonitorNotification -Status "stopped" -Reason $Reason -Detail $Diagnostic
+    Send-ConfirmedStopNotification -Reason $Reason -Diagnostic $Diagnostic
     Stop-SoakProcessesForRestart -Reason $Reason
     Start-CopyLiveSoak
 }
@@ -556,7 +714,7 @@ function Test-CopyLiveSoakPaused {
 
 $monitorAccountIds = Get-RuntimeAccountIds
 $monitorMarkets = Get-RuntimeMarkets
-Write-MonitorLog "monitor started poll_secs=$PollSecs base_url=$BaseUrl accounts=$($monitorAccountIds -join ',') principal_cap=$PrincipalCapUsd leverage=$Leverage markets=$($monitorMarkets -join ',') max_total_notional=$MaxTotalNotionalUsd max_total_fees=$MaxTotalFeesUsd bot_exe=$BotExePath"
+Write-MonitorLog "monitor started poll_secs=$PollSecs stop_confirm_polls=$StopConfirmPolls notification_cooldown_secs=$NotificationCooldownSecs base_url=$BaseUrl accounts=$($monitorAccountIds -join ',') principal_cap=$PrincipalCapUsd leverage=$Leverage markets=$($monitorMarkets -join ',') max_total_notional=$MaxTotalNotionalUsd max_total_fees=$MaxTotalFeesUsd bot_exe=$BotExePath"
 
 while ($true) {
     try {
@@ -570,46 +728,60 @@ while ($true) {
         if ($status.ok -and $status.data.running -and $null -ne $soakProcess -and (Test-SoakHeartbeatStale)) {
             $diagnostic = "soak_heartbeat_stale; $(Get-SoakHeartbeatDiagnostic)"
             Write-MonitorLog "detected stopped soak; diagnostic: $diagnostic"
-            try {
-                Restart-CopyLiveSoakAfterStale -Reason "soak_heartbeat_stale" -Diagnostic $diagnostic
-            } catch {
-                Send-MonitorNotification -Status "failed" -Reason "restart_failed" -Detail $_.Exception.Message
-                throw
+            if (Test-StopCandidateConfirmed -Reason "soak_heartbeat_stale" -Diagnostic $diagnostic) {
+                try {
+                    Restart-CopyLiveSoakAfterStale -Reason "soak_heartbeat_stale" -Diagnostic $diagnostic
+                    Reset-StopCandidate "restart_after_stale"
+                } catch {
+                    Send-MonitorNotification -Status "failed" -Reason "restart_failed" -Detail $_.Exception.Message
+                    throw
+                }
             }
         } elseif ($status.ok -and $status.data.running -and $null -ne $soakProcess) {
+            Reset-StopCandidate "healthy"
             Write-MonitorLog "healthy pid=$($soakProcess.ProcessId) run_id=$($status.data.run_id) round=$($status.data.latest_round) message=$($status.data.message)"
         } elseif ($status.ok -and $status.data.running -and $null -eq $soakProcess) {
             $diagnostic = "frontend_running_but_soak_process_missing run_id=$($status.data.run_id) round=$($status.data.latest_round) message=$($status.data.message)"
             Write-MonitorLog "detected stopped soak; diagnostic: $diagnostic"
-            Send-MonitorNotification -Status "stopped" -Reason "soak_process_missing" -Detail $diagnostic
-            try {
-                Start-CopyLiveSoak
-            } catch {
-                Send-MonitorNotification -Status "failed" -Reason "restart_failed" -Detail $_.Exception.Message
-                throw
+            if (Test-StopCandidateConfirmed -Reason "soak_process_missing" -Diagnostic $diagnostic) {
+                Send-ConfirmedStopNotification -Reason "soak_process_missing" -Diagnostic $diagnostic
+                try {
+                    Start-CopyLiveSoak
+                    Reset-StopCandidate "restart_after_missing_process"
+                } catch {
+                    Send-MonitorNotification -Status "failed" -Reason "restart_failed" -Detail $_.Exception.Message
+                    throw
+                }
             }
         } elseif ((Test-SoakProcessRunning) -and (Test-SoakHeartbeatStale)) {
             $diagnostic = "soak_heartbeat_stale_without_status; $(Get-SoakHeartbeatDiagnostic)"
             Write-MonitorLog "detected stopped soak; diagnostic: $diagnostic"
-            try {
-                Restart-CopyLiveSoakAfterStale -Reason "soak_heartbeat_stale" -Diagnostic $diagnostic
-            } catch {
-                Send-MonitorNotification -Status "failed" -Reason "restart_failed" -Detail $_.Exception.Message
-                throw
+            if (Test-StopCandidateConfirmed -Reason "soak_heartbeat_stale" -Diagnostic $diagnostic) {
+                try {
+                    Restart-CopyLiveSoakAfterStale -Reason "soak_heartbeat_stale" -Diagnostic $diagnostic
+                    Reset-StopCandidate "restart_after_stale_without_status"
+                } catch {
+                    Send-MonitorNotification -Status "failed" -Reason "restart_failed" -Detail $_.Exception.Message
+                    throw
+                }
             }
         } elseif (Test-SoakProcessRunning) {
+            Reset-StopCandidate "healthy_fallback"
             $diagnostic = if ($status.ok) { "status_not_running message=$($status.data.message)" } else { "status_error=$($status.error)" }
             $proc = Get-SoakProcess
             Write-MonitorLog "healthy_fallback pid=$($proc.ProcessId) $diagnostic"
         } else {
             $diagnostic = Get-LatestRunDiagnostic
             Write-MonitorLog "detected stopped soak; diagnostic: $diagnostic"
-            Send-MonitorNotification -Status "stopped" -Reason "soak_not_running" -Detail $diagnostic
-            try {
-                Start-CopyLiveSoak
-            } catch {
-                Send-MonitorNotification -Status "failed" -Reason "restart_failed" -Detail $_.Exception.Message
-                throw
+            if (Test-StopCandidateConfirmed -Reason "soak_not_running" -Diagnostic $diagnostic) {
+                Send-ConfirmedStopNotification -Reason "soak_not_running" -Diagnostic $diagnostic
+                try {
+                    Start-CopyLiveSoak
+                    Reset-StopCandidate "restart_after_not_running"
+                } catch {
+                    Send-MonitorNotification -Status "failed" -Reason "restart_failed" -Detail $_.Exception.Message
+                    throw
+                }
             }
         }
     } catch {
@@ -618,24 +790,31 @@ while ($true) {
             if (Test-SoakHeartbeatStale) {
                 $diagnostic = "status_exception=$($_.Exception.Message); $(Get-SoakHeartbeatDiagnostic)"
                 Write-MonitorLog "detected stopped soak; diagnostic: $diagnostic"
-                try {
-                    Restart-CopyLiveSoakAfterStale -Reason "soak_heartbeat_stale" -Diagnostic $diagnostic
-                } catch {
-                    Send-MonitorNotification -Status "failed" -Reason "restart_failed" -Detail $_.Exception.Message
-                    throw
+                if (Test-StopCandidateConfirmed -Reason "soak_heartbeat_stale" -Diagnostic $diagnostic) {
+                    try {
+                        Restart-CopyLiveSoakAfterStale -Reason "soak_heartbeat_stale" -Diagnostic $diagnostic
+                        Reset-StopCandidate "restart_after_exception_stale"
+                    } catch {
+                        Send-MonitorNotification -Status "failed" -Reason "restart_failed" -Detail $_.Exception.Message
+                        throw
+                    }
                 }
             } else {
+                Reset-StopCandidate "healthy_fallback_exception"
                 Write-MonitorLog "healthy_fallback pid=$($proc.ProcessId) status_exception=$($_.Exception.Message)"
             }
         } else {
             $diagnostic = "status_exception=$($_.Exception.Message); no_soak_process=true"
             Write-MonitorLog "detected stopped soak; diagnostic: $diagnostic"
-            Send-MonitorNotification -Status "stopped" -Reason "soak_not_running" -Detail $diagnostic
-            try {
-                Start-CopyLiveSoak
-            } catch {
-                Write-MonitorLog "monitor restart failed after status exception: $($_.Exception.Message)"
-                Send-MonitorNotification -Status "failed" -Reason "restart_failed" -Detail $_.Exception.Message
+            if (Test-StopCandidateConfirmed -Reason "soak_not_running" -Diagnostic $diagnostic) {
+                Send-ConfirmedStopNotification -Reason "soak_not_running" -Diagnostic $diagnostic
+                try {
+                    Start-CopyLiveSoak
+                    Reset-StopCandidate "restart_after_exception_not_running"
+                } catch {
+                    Write-MonitorLog "monitor restart failed after status exception: $($_.Exception.Message)"
+                    Send-MonitorNotification -Status "failed" -Reason "restart_failed" -Detail $_.Exception.Message
+                }
             }
         }
     }

@@ -2077,6 +2077,14 @@ fn fast_signed_effective_submit(submit_requested: bool, process_dry_run: bool) -
     submit_requested && !process_dry_run
 }
 
+fn validate_process_live_action_gate(process_dry_run: bool, action: &str) -> Result<()> {
+    anyhow::ensure!(
+        !process_dry_run,
+        "{action} is blocked while the frontend console was started with --dry-run true"
+    );
+    Ok(())
+}
+
 async fn manual_protective_exit(
     State(state): State<FrontendAppState>,
     Json(payload): Json<ProtectiveExitPayload>,
@@ -2767,6 +2775,7 @@ async fn usdc_dex_transfer(
     let result = async {
         let config = state.config_snapshot()?;
         let password = if payload.submit {
+            validate_process_live_action_gate(state.dry_run, "USDC DEX transfer submit")?;
             validate_usdc_dex_transfer_gates(&config, &payload)?;
             state.audit_attempt(
                 "usdc_dex_transfer_submit_attempt",
@@ -2844,6 +2853,7 @@ async fn usdc_dex_transfer_runbook(
     let result = async {
         let config = state.config_snapshot()?;
         if payload.submit {
+            validate_process_live_action_gate(state.dry_run, "USDC DEX transfer runbook submit")?;
             state.audit_attempt(
                 "usdc_dex_transfer_runbook_submit_attempt",
                 Some(payload.account_id.clone()),
@@ -7570,9 +7580,25 @@ async fn build_copy_summary_response(state: &FrontendAppState) -> Result<CopySum
     let live_soak = build_copy_live_soak_status_response().ok();
     let pnl_report = read_latest_copy_pnl_report_summary(&copy_live_soak_dir()).unwrap_or_default();
     let copy_settings = read_copy_ui_settings().ok();
-    let ledger_positions =
-        read_copy_ledger_position_summaries(&copy_live_soak_dir()).unwrap_or_default();
-    let live_accounts = tokio::time::timeout(
+    let config = state.config_snapshot()?;
+    let snapshot =
+        load_copy_persistence_snapshot(&copy_live_soak_dir().join(COPY_LIVE_SOAK_CURRENT_SNAPSHOT))
+            .ok();
+    let ledger_positions = snapshot
+        .as_ref()
+        .map(|snapshot| copy_ledger_position_summaries(&snapshot.ledger_entries))
+        .unwrap_or_default();
+    let ledger_local_summaries = snapshot
+        .as_ref()
+        .map(|snapshot| {
+            copy_ledger_local_account_summaries(
+                &config,
+                copy_settings.as_ref(),
+                &snapshot.ledger_entries,
+            )
+        })
+        .unwrap_or_default();
+    let mut live_accounts = tokio::time::timeout(
         Duration::from_secs(5),
         read_copy_live_account_summaries(state, copy_settings.as_ref()),
     )
@@ -7580,6 +7606,7 @@ async fn build_copy_summary_response(state: &FrontendAppState) -> Result<CopySum
     .ok()
     .and_then(Result::ok)
     .unwrap_or_default();
+    merge_copy_live_account_fallback_rows(&mut live_accounts, ledger_local_summaries);
     Ok(build_copy_summary_response_from_entries(
         entries,
         live_soak,
@@ -8182,7 +8209,39 @@ fn read_recent_copy_shadow_history_entries_from_active_paths(
     if let Some(path) = active_copy_live_soak_shadow_history_path()? {
         paths.push(path);
     }
+    paths.extend(recent_copy_live_soak_shadow_history_paths(8)?);
     read_recent_copy_shadow_history_entries_from_paths(paths, limit)
+}
+
+fn recent_copy_live_soak_shadow_history_paths(limit: usize) -> Result<Vec<PathBuf>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let dir = copy_live_soak_dir();
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut paths = fs::read_dir(&dir)
+        .with_context(|| format!("failed to read {}", dir.display()))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.starts_with("persistent-live-soak-") && name.ends_with("-shadow.jsonl")
+                })
+        })
+        .filter_map(|path| {
+            let modified = fs::metadata(&path)
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())?;
+            Some((modified, path))
+        })
+        .collect::<Vec<_>>();
+    paths.sort_by(|left, right| right.0.cmp(&left.0));
+    paths.truncate(limit);
+    Ok(paths.into_iter().map(|(_, path)| path).collect())
 }
 
 fn read_recent_copy_shadow_history_entries_from_paths(
@@ -9238,10 +9297,129 @@ fn copy_live_soak_dir() -> PathBuf {
     if parent.exists() { parent } else { local }
 }
 
-fn read_copy_ledger_position_summaries(dir: &Path) -> Result<Vec<CopyPnlPositionSummary>> {
-    let path = dir.join(COPY_LIVE_SOAK_CURRENT_SNAPSHOT);
-    let snapshot = load_copy_persistence_snapshot(&path)?;
-    Ok(copy_ledger_position_summaries(&snapshot.ledger_entries))
+fn copy_ledger_local_account_summaries(
+    config: &AppConfig,
+    settings: Option<&CopyUiSettings>,
+    entries: &[CopyLedgerEntry],
+) -> Vec<CopyPnlAccountSummary> {
+    let account_ids = settings
+        .map(|settings| settings.account_ids.clone())
+        .filter(|account_ids| !account_ids.is_empty())
+        .unwrap_or_else(|| {
+            settings
+                .map(|settings| vec![settings.account_id.clone()])
+                .unwrap_or_else(|| vec!["addr_a".to_string()])
+        });
+    let mut notional_by_account_coin_side = HashMap::<(String, String, String), f64>::new();
+    for entry in entries {
+        if entry.local_account_id.trim().is_empty() || entry.coin.trim().is_empty() {
+            continue;
+        }
+        let notional_delta = match entry.status {
+            CopyLedgerStatus::PendingOpen if copy_ledger_entry_has_live_order_evidence(entry) => {
+                entry.pending_notional_usd.max(0.0)
+            }
+            CopyLedgerStatus::Open => entry.remaining_notional_usd.max(0.0),
+            CopyLedgerStatus::PendingReduce | CopyLedgerStatus::PendingClose
+                if copy_ledger_entry_has_live_order_evidence(entry) =>
+            {
+                -entry
+                    .pending_notional_usd
+                    .max(entry.remaining_notional_usd)
+                    .max(0.0)
+            }
+            CopyLedgerStatus::PendingOpen
+            | CopyLedgerStatus::PendingReduce
+            | CopyLedgerStatus::PendingClose
+            | CopyLedgerStatus::Closed
+            | CopyLedgerStatus::Rejected => 0.0,
+        };
+        if notional_delta.abs() <= DISPLAY_USD_EPSILON {
+            continue;
+        }
+        *notional_by_account_coin_side
+            .entry((
+                entry.local_account_id.clone(),
+                entry.coin.clone(),
+                copy_ledger_display_side(entry.local_side).to_string(),
+            ))
+            .or_insert(0.0) += notional_delta;
+    }
+
+    let mut summaries = Vec::new();
+    for account_id in account_ids {
+        let account = config.account(&account_id);
+        let address = account
+            .map(|account| account.address.to_ascii_lowercase())
+            .unwrap_or_default();
+        let mut positions = notional_by_account_coin_side
+            .iter()
+            .filter(|((entry_account_id, _, _), notional)| {
+                entry_account_id == &account_id && **notional > DISPLAY_USD_EPSILON
+            })
+            .map(|((_, coin, side), notional)| {
+                let signed_size = if side == "short" {
+                    -*notional
+                } else {
+                    *notional
+                };
+                CopyPnlPositionSummary {
+                    coin: coin.clone(),
+                    side: side.clone(),
+                    size: signed_size,
+                    position_value_usd: Some(*notional),
+                    unrealized_pnl_usd: None,
+                    entry_px: None,
+                }
+            })
+            .collect::<Vec<_>>();
+        positions.sort_by(|left, right| {
+            left.coin
+                .cmp(&right.coin)
+                .then_with(|| left.side.cmp(&right.side))
+        });
+        summaries.push(CopyPnlAccountSummary {
+            id: account_id,
+            kind: if positions.is_empty() {
+                "local_configured".to_string()
+            } else {
+                "local_ledger".to_string()
+            },
+            address,
+            position_value_usd: copy_sum_optional(
+                positions.iter().map(|position| position.position_value_usd),
+            ),
+            open_position_count: positions.len(),
+            positions,
+            ..CopyPnlAccountSummary::default()
+        });
+    }
+    summaries
+}
+
+fn merge_copy_live_account_fallback_rows(
+    live_accounts: &mut CopyLiveAccountSummaries,
+    fallback_rows: Vec<CopyPnlAccountSummary>,
+) {
+    if fallback_rows.is_empty() {
+        return;
+    }
+    for fallback in fallback_rows {
+        if let Some(existing) = live_accounts
+            .locals
+            .iter_mut()
+            .find(|account| account.id == fallback.id)
+        {
+            if !copy_pnl_account_summary_has_current_state(existing) {
+                *existing = fallback;
+            }
+            continue;
+        }
+        live_accounts.locals.push(fallback);
+    }
+    if live_accounts.local.is_none() {
+        live_accounts.local = aggregate_copy_local_account_summaries(&live_accounts.locals);
+    }
 }
 
 fn copy_ledger_position_summaries(entries: &[CopyLedgerEntry]) -> Vec<CopyPnlPositionSummary> {
@@ -13787,7 +13965,7 @@ async fn build_usdc_dex_transfer_readiness(
 
     Ok(UsdcDexTransferReadinessResponse {
         environment: config.app.environment.clone(),
-        dry_run: config.app.dry_run,
+        dry_run: config.app.dry_run || state.dry_run,
         account_id: payload.account_id,
         address: source_account.map(|account| account.address.clone()),
         destination_account_id,
@@ -18358,6 +18536,16 @@ mod tests {
         assert!(!super::fast_signed_effective_submit(true, true));
         assert!(super::fast_signed_effective_submit(true, false));
         assert!(!super::fast_signed_effective_submit(false, false));
+    }
+
+    #[test]
+    fn process_live_action_gate_blocks_console_dry_run() {
+        let error = super::validate_process_live_action_gate(true, "USDC DEX transfer submit")
+            .expect_err("process dry-run must block live transfer submit");
+        assert!(error.to_string().contains("--dry-run true"));
+
+        super::validate_process_live_action_gate(false, "USDC DEX transfer submit")
+            .expect("live action should be allowed when process dry-run is off");
     }
 
     #[test]
