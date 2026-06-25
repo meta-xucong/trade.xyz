@@ -248,7 +248,7 @@ fn read_cached_vault_password_from_path(
     if !cache_path.exists() || !vault_path.exists() {
         return Ok(None);
     }
-    let raw = fs::read(&cache_path).with_context(|| {
+    let raw = fs::read(cache_path).with_context(|| {
         format!(
             "failed to read Vault session cache {}",
             cache_path.display()
@@ -257,7 +257,7 @@ fn read_cached_vault_password_from_path(
     let cache = serde_json::from_slice::<PersistedVaultSession>(&raw)
         .context("failed to parse Vault session cache")?;
     if cache.version != 1
-        || PathBuf::from(&cache.vault_path) != vault_path
+        || Path::new(&cache.vault_path) != vault_path
         || now_ms_value > cache.expires_at_ms
     {
         return Ok(None);
@@ -283,7 +283,7 @@ fn protect_local_secret(secret: &[u8]) -> Result<Vec<u8>> {
         CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData,
     };
 
-    let mut input = CRYPT_INTEGER_BLOB {
+    let input = CRYPT_INTEGER_BLOB {
         cbData: secret
             .len()
             .try_into()
@@ -294,7 +294,7 @@ fn protect_local_secret(secret: &[u8]) -> Result<Vec<u8>> {
     // SAFETY: input points to `secret` for the duration of the call; output is freed with LocalFree.
     let ok = unsafe {
         CryptProtectData(
-            &mut input,
+            &input,
             ptr::null(),
             ptr::null(),
             ptr::null(),
@@ -317,7 +317,7 @@ fn unprotect_local_secret(secret: &[u8]) -> Result<Vec<u8>> {
         CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptUnprotectData,
     };
 
-    let mut input = CRYPT_INTEGER_BLOB {
+    let input = CRYPT_INTEGER_BLOB {
         cbData: secret
             .len()
             .try_into()
@@ -328,7 +328,7 @@ fn unprotect_local_secret(secret: &[u8]) -> Result<Vec<u8>> {
     // SAFETY: input points to `secret` for the duration of the call; output is freed with LocalFree.
     let ok = unsafe {
         CryptUnprotectData(
-            &mut input,
+            &input,
             ptr::null_mut(),
             ptr::null(),
             ptr::null(),
@@ -7620,12 +7620,12 @@ async fn build_copy_summary_response(state: &FrontendAppState) -> Result<CopySum
 
 fn build_copy_settings_response(state: &FrontendAppState) -> Result<CopySettingsResponse> {
     let mut settings = read_copy_ui_settings().unwrap_or_else(|_| CopyUiSettings::default());
-    if settings.updated_at_ms == 0 {
-        if let Some(account) = state.config_snapshot()?.account(&settings.account_id) {
-            settings.copy_ratio = account.copy_ratio.max(settings.copy_ratio);
-            settings.principal_cap_usd = (account.max_order_notional_usd / COPY_MAX_LEVERAGE)
-                .max(settings.principal_cap_usd);
-        }
+    if settings.updated_at_ms == 0
+        && let Some(account) = state.config_snapshot()?.account(&settings.account_id)
+    {
+        settings.copy_ratio = account.copy_ratio.max(settings.copy_ratio);
+        settings.principal_cap_usd =
+            (account.max_order_notional_usd / COPY_MAX_LEVERAGE).max(settings.principal_cap_usd);
     }
     Ok(CopySettingsResponse {
         settings,
@@ -8239,7 +8239,7 @@ fn recent_copy_live_soak_shadow_history_paths(limit: usize) -> Result<Vec<PathBu
             Some((modified, path))
         })
         .collect::<Vec<_>>();
-    paths.sort_by(|left, right| right.0.cmp(&left.0));
+    paths.sort_by_key(|right| std::cmp::Reverse(right.0));
     paths.truncate(limit);
     Ok(paths.into_iter().map(|(_, path)| path).collect())
 }
@@ -8278,7 +8278,7 @@ fn active_copy_live_soak_shadow_history_path() -> Result<Option<PathBuf>> {
         return Ok(None);
     }
     let Some(log_path) = latest_matching_file(&dir, "-run.log")? else {
-        return Ok(latest_matching_file(&dir, "-shadow.jsonl")?);
+        return latest_matching_file(&dir, "-shadow.jsonl");
     };
     let raw = fs::read_to_string(&log_path)
         .with_context(|| format!("failed to read live soak log {}", log_path.display()))?;
@@ -9614,22 +9614,20 @@ fn build_copy_live_soak_status_response_from_dir(
     };
     response.latest_log_path = Some(log_path.display().to_string());
     response.last_updated_at_ms = log_modified_ms;
-    if !response.paused {
-        if let Some(runtime_settings_line) = last_matching_line(&log_path, "copy settings ")? {
-            if let Some(account_ids) =
-                parse_copy_soak_log_csv_field(&runtime_settings_line, "accounts")
-            {
-                response.account_ids = account_ids;
-            }
-            if let Some(markets) = parse_copy_soak_log_csv_field(&runtime_settings_line, "markets")
-            {
-                response.markets = markets;
-            }
-            if let Some(leader_count) =
-                parse_copy_soak_log_usize_field(&runtime_settings_line, "leaders")
-            {
-                response.leader_count = leader_count;
-            }
+    if !response.paused
+        && let Some(runtime_settings_line) = last_matching_line(&log_path, "copy settings ")?
+    {
+        if let Some(account_ids) = parse_copy_soak_log_csv_field(&runtime_settings_line, "accounts")
+        {
+            response.account_ids = account_ids;
+        }
+        if let Some(markets) = parse_copy_soak_log_csv_field(&runtime_settings_line, "markets") {
+            response.markets = markets;
+        }
+        if let Some(leader_count) =
+            parse_copy_soak_log_usize_field(&runtime_settings_line, "leaders")
+        {
+            response.leader_count = leader_count;
         }
     }
 
@@ -9641,11 +9639,12 @@ fn build_copy_live_soak_status_response_from_dir(
     } else {
         false
     };
-    if !pid_running && is_default_copy_live_soak_dir(dir) {
-        if let Some(pid) = find_running_copy_live_soak_pid() {
-            response.pid = Some(pid);
-            pid_running = true;
-        }
+    if !pid_running
+        && is_default_copy_live_soak_dir(dir)
+        && let Some(pid) = find_running_copy_live_soak_pid()
+    {
+        response.pid = Some(pid);
+        pid_running = true;
     }
 
     let mut latest_completed_report_path: Option<String> = None;
@@ -9680,22 +9679,20 @@ fn build_copy_live_soak_status_response_from_dir(
         }
     }
     let active_round = parse_running_copy_soak_round(&last_log_line);
-    if !response.paused {
-        if let Some(active_round) = active_round {
-            if response
-                .latest_round
-                .map_or(true, |latest_round| latest_round < active_round)
-            {
-                response.latest_round = Some(active_round);
-                response.watcher_status = Some("running_window".to_string());
-                if !run_id.is_empty() {
-                    let round_tag = format!("{active_round:04}");
-                    let active_report_path = dir.join(format!(
-                        "persistent-live-soak-{run_id}-round-{round_tag}.json"
-                    ));
-                    response.latest_report_path = Some(active_report_path.display().to_string());
-                }
-            }
+    if !response.paused
+        && let Some(active_round) = active_round
+        && response
+            .latest_round
+            .is_none_or(|latest_round| latest_round < active_round)
+    {
+        response.latest_round = Some(active_round);
+        response.watcher_status = Some("running_window".to_string());
+        if !run_id.is_empty() {
+            let round_tag = format!("{active_round:04}");
+            let active_report_path = dir.join(format!(
+                "persistent-live-soak-{run_id}-round-{round_tag}.json"
+            ));
+            response.latest_report_path = Some(active_report_path.display().to_string());
         }
     }
 
@@ -9703,7 +9700,7 @@ fn build_copy_live_soak_status_response_from_dir(
         .map(|updated| now_ms_value.saturating_sub(updated) > COPY_LIVE_SOAK_STALE_MS)
         .unwrap_or(true);
     let active_report_stalled = active_round
-        .and_then(|_| response.latest_report_path.as_ref())
+        .and(response.latest_report_path.as_ref())
         .map(Path::new)
         .is_some_and(|path| {
             if pid_running {
@@ -15385,8 +15382,7 @@ impl CopySettingsPayload {
             .unwrap_or(crate::strategies::smart_money::COPY_MAX_LEVERAGE);
         anyhow::ensure!(
             leverage.is_finite()
-                && leverage >= 1.0
-                && leverage <= crate::strategies::smart_money::COPY_MAX_LEVERAGE,
+                && (1.0..=crate::strategies::smart_money::COPY_MAX_LEVERAGE).contains(&leverage),
             "leverage must be between 1 and {}",
             crate::strategies::smart_money::COPY_MAX_LEVERAGE
         );

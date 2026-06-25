@@ -238,7 +238,7 @@ pub fn read_cached_vault_password_from_path(
     let cache = serde_json::from_slice::<PersistedVaultSession>(&raw)
         .context("failed to parse Vault session cache")?;
     if cache.version != 1
-        || PathBuf::from(&cache.vault_path) != vault_path
+        || Path::new(&cache.vault_path) != vault_path
         || now_ms_value > cache.expires_at_ms
     {
         return Ok(None);
@@ -275,7 +275,7 @@ fn unprotect_local_secret(secret: &[u8]) -> Result<Vec<u8>> {
         CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptUnprotectData,
     };
 
-    let mut input = CRYPT_INTEGER_BLOB {
+    let input = CRYPT_INTEGER_BLOB {
         cbData: secret
             .len()
             .try_into()
@@ -286,7 +286,7 @@ fn unprotect_local_secret(secret: &[u8]) -> Result<Vec<u8>> {
     // SAFETY: input points to `secret` for the duration of the call; output is freed with LocalFree.
     let ok = unsafe {
         CryptUnprotectData(
-            &mut input,
+            &input,
             ptr::null_mut(),
             ptr::null(),
             ptr::null(),

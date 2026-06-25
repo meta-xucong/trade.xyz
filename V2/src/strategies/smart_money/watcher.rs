@@ -514,10 +514,10 @@ fn parse_copy_watcher_port(port_text: &str, label: &str) -> Result<u16> {
 
 fn redact_copy_watcher_proxy_url(proxy_url: &str) -> String {
     let trimmed = proxy_url.trim();
-    if let Some((scheme, rest)) = trimmed.split_once("://") {
-        if let Some((_, host)) = rest.rsplit_once('@') {
-            return format!("{scheme}://***@{host}");
-        }
+    if let Some((scheme, rest)) = trimmed.split_once("://")
+        && let Some((_, host)) = rest.rsplit_once('@')
+    {
+        return format!("{scheme}://***@{host}");
     }
     trimmed.to_string()
 }

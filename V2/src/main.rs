@@ -2565,9 +2565,10 @@ mod tests {
             error: None,
         }];
 
+        let plan_for_contract = plan.clone();
         let contract = copy_live_daemon_submit_plan_contract(
             &options,
-            &[plan.clone()],
+            std::slice::from_ref(&plan_for_contract),
             &[CopyLiveDaemonSuppressedWouldSubmitRef {
                 plan,
                 reason_code: "COPY_DAEMON_MAX_LIVE_ORDERS".to_string(),
@@ -2859,8 +2860,9 @@ mod tests {
         reduce_hl_ref.order.side = crate::domain::OrderSide::Sell;
         reduce_hl_ref.order.cloid = "00000000-0000-0000-0000-000000000102".to_string();
 
+        let open_hl_ref_for_partition = open_hl_ref.clone();
         let (executable, suppressed) = partition_copy_live_daemon_would_submit_refs(
-            &[open_hl_ref.clone(), reduce_hl_ref],
+            &[open_hl_ref_for_partition, reduce_hl_ref],
             &options,
         );
         assert_eq!(executable.len(), 1);
@@ -3063,7 +3065,7 @@ mod tests {
                 &config,
                 &options,
                 account,
-                &[account.account_id.clone()],
+                std::slice::from_ref(&account.account_id),
                 std::slice::from_ref(&leader),
                 &persistence,
             );
@@ -3150,7 +3152,7 @@ mod tests {
         }];
         let contract = copy_live_daemon_submit_plan_contract(
             &options,
-            &[open_ref.clone()],
+            std::slice::from_ref(&open_ref),
             &[],
             50.0,
             0.05,
@@ -3238,7 +3240,7 @@ mod tests {
 
         let contract = copy_live_daemon_submit_plan_contract(
             &options,
-            &[open_ref.clone()],
+            std::slice::from_ref(&open_ref),
             &[],
             50.0,
             0.05,
@@ -9021,7 +9023,7 @@ async fn run_copy_execution_canary(
             &options,
             account,
             &leader,
-            &[account.account_id.clone()],
+            std::slice::from_ref(&account.account_id),
         ));
     }
 
@@ -9666,7 +9668,6 @@ async fn run_copy_live_daemon_supervisor(
     let started = Instant::now();
 
     if acceptance.ok && local_account.is_some() && !watcher_leaders.is_empty() {
-        let _account = local_account.expect("checked local account");
         let mut pipelines = target_accounts
             .iter()
             .filter_map(|account_id| {
@@ -9677,7 +9678,7 @@ async fn run_copy_live_daemon_supervisor(
                             config,
                             &options,
                             account,
-                            &[account.account_id.clone()],
+                            std::slice::from_ref(&account.account_id),
                             &watcher_leaders,
                             &persistence,
                         ),
@@ -9975,7 +9976,6 @@ async fn run_copy_live_daemon_supervisor(
         &pre_submit_reconciliations,
         submit_plan_contract,
     );
-    let mut suppressed_submit_plan_refs = suppressed_submit_plan_refs;
     suppressed_submit_plan_refs.append(&mut contract_suppressed_submit_plan_refs);
     suppressed_submit_plan_refs = copy_live_daemon_pending_suppressed_refs(
         &suppressed_submit_plan_refs,
@@ -13093,7 +13093,7 @@ fn copy_live_daemon_synthetic_would_submit_orders(
             &canary_options,
             account,
             leader,
-            &[account.account_id.clone()],
+            std::slice::from_ref(&account.account_id),
         ));
     }
     if append_shadow_history && !records.is_empty() {
@@ -13874,7 +13874,7 @@ fn copy_live_daemon_recover_open_ledger_from_live_positions(
                     && entry
                         .local_account_id
                         .as_deref()
-                        .map_or(true, |account_id| account_id == reconciliation.account_id)
+                        .is_none_or(|account_id| account_id == reconciliation.account_id)
                     && entry
                         .signal_id
                         .as_deref()
@@ -13924,30 +13924,29 @@ fn copy_live_daemon_recent_shadow_entries_for_recovery(
     limit: usize,
 ) -> Result<Vec<strategies::smart_money::CopyShadowHistoryEntry>> {
     let mut paths = vec![options.shadow_history_path.clone()];
-    if let Some(parent) = options.shadow_history_path.parent() {
-        if let Ok(read_dir) = std::fs::read_dir(parent) {
-            let mut siblings = read_dir
-                .filter_map(Result::ok)
-                .map(|entry| entry.path())
-                .filter(|path| path != &options.shadow_history_path)
-                .filter(|path| {
-                    path.file_name()
-                        .and_then(|name| name.to_str())
-                        .is_some_and(|name| {
-                            name.starts_with("persistent-live-soak-")
-                                && name.ends_with("-shadow.jsonl")
-                        })
-                })
-                .filter_map(|path| {
-                    let modified = std::fs::metadata(&path)
-                        .ok()
-                        .and_then(|metadata| metadata.modified().ok())?;
-                    Some((modified, path))
-                })
-                .collect::<Vec<_>>();
-            siblings.sort_by(|left, right| right.0.cmp(&left.0));
-            paths.extend(siblings.into_iter().take(8).map(|(_, path)| path));
-        }
+    if let Some(parent) = options.shadow_history_path.parent()
+        && let Ok(read_dir) = std::fs::read_dir(parent)
+    {
+        let mut siblings = read_dir
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path != &options.shadow_history_path)
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with("persistent-live-soak-") && name.ends_with("-shadow.jsonl")
+                    })
+            })
+            .filter_map(|path| {
+                let modified = std::fs::metadata(&path)
+                    .ok()
+                    .and_then(|metadata| metadata.modified().ok())?;
+                Some((modified, path))
+            })
+            .collect::<Vec<_>>();
+        siblings.sort_by_key(|right| std::cmp::Reverse(right.0));
+        paths.extend(siblings.into_iter().take(8).map(|(_, path)| path));
     }
 
     let mut entries = Vec::new();
@@ -13962,7 +13961,7 @@ fn copy_live_daemon_recent_shadow_entries_for_recovery(
             Err(_) => {}
         }
     }
-    entries.sort_by(|left, right| right.occurred_at_ms.cmp(&left.occurred_at_ms));
+    entries.sort_by_key(|right| std::cmp::Reverse(right.occurred_at_ms));
     if entries.len() > limit {
         entries.truncate(limit);
     }
@@ -13978,12 +13977,11 @@ fn copy_live_daemon_selected_account_set(
             accounts.insert(account_id.as_str());
         }
     }
-    if accounts.is_empty() {
-        if let Some(account_id) = options.local_account_id.as_deref() {
-            if !account_id.trim().is_empty() {
-                accounts.insert(account_id);
-            }
-        }
+    if accounts.is_empty()
+        && let Some(account_id) = options.local_account_id.as_deref()
+        && !account_id.trim().is_empty()
+    {
+        accounts.insert(account_id);
     }
     accounts
 }
@@ -14473,6 +14471,7 @@ fn plan_copy_canary_orders(
     Ok(plans)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn copy_execution_canary_report(
     config: &config::AppConfig,
     options: &CopyExecutionCanaryOptions,
