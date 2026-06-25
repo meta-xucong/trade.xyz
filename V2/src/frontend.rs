@@ -8439,7 +8439,7 @@ fn build_copy_summary_response_from_entries(
         if live_total_fees_usd.is_some() {
             local.fees_usd = live_total_fees_usd;
         }
-        if !local.kind.eq_ignore_ascii_case("local_live") {
+        if !copy_pnl_account_summary_is_live_local(&local.kind) {
             merge_copy_ledger_positions_into_local_summary(local, &ledger_positions);
         }
         local.total_pnl_usd = copy_sum_optional([local.realized_pnl_usd, local.unrealized_pnl_usd]);
@@ -8860,6 +8860,11 @@ fn copy_pnl_account_summary_has_current_state(summary: &CopyPnlAccountSummary) -
     summary.open_position_count > 0
         || summary.position_value_usd.is_some()
         || summary.unrealized_pnl_usd.is_some()
+}
+
+fn copy_pnl_account_summary_is_live_local(kind: &str) -> bool {
+    let normalized = kind.trim().to_ascii_lowercase();
+    normalized == "local_live" || normalized == "local_live_aggregate"
 }
 
 #[derive(Debug, Default)]
@@ -17422,6 +17427,55 @@ mod tests {
 
         let local = summary.local_summary.expect("local summary");
         assert_eq!(local.kind, "local_live");
+        assert_eq!(local.open_position_count, 1);
+        assert_eq!(local.positions.len(), 1);
+        assert_eq!(local.positions[0].coin, "xyz:GOLD");
+    }
+
+    #[test]
+    fn copy_summary_does_not_merge_stale_ledger_positions_into_live_local_aggregate() {
+        let live_accounts = CopyLiveAccountSummaries {
+            local: Some(CopyPnlAccountSummary {
+                id: "local_all".to_string(),
+                kind: "local_live_aggregate".to_string(),
+                positions: vec![CopyPnlPositionSummary {
+                    coin: "xyz:GOLD".to_string(),
+                    side: "long".to_string(),
+                    size: 0.01,
+                    position_value_usd: Some(100.0),
+                    unrealized_pnl_usd: Some(1.0),
+                    entry_px: Some(4000.0),
+                }],
+                position_value_usd: Some(100.0),
+                open_position_count: 1,
+                unrealized_pnl_usd: Some(1.0),
+                total_pnl_usd: Some(1.0),
+                ..CopyPnlAccountSummary::default()
+            }),
+            locals: Vec::new(),
+            targets: Vec::new(),
+        };
+        let ledger_positions = vec![CopyPnlPositionSummary {
+            coin: "xyz:SNDK".to_string(),
+            side: "short".to_string(),
+            size: -321.0,
+            position_value_usd: Some(321.0),
+            unrealized_pnl_usd: None,
+            entry_px: None,
+        }];
+
+        let summary = build_copy_summary_response_from_entries(
+            Vec::new(),
+            None,
+            400,
+            CopyPnlReportSummary::default(),
+            None,
+            ledger_positions,
+            live_accounts,
+        );
+
+        let local = summary.local_summary.expect("local aggregate summary");
+        assert_eq!(local.kind, "local_live_aggregate");
         assert_eq!(local.open_position_count, 1);
         assert_eq!(local.positions.len(), 1);
         assert_eq!(local.positions[0].coin, "xyz:GOLD");

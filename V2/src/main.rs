@@ -1284,6 +1284,61 @@ mod tests {
     }
 
     #[test]
+    fn copy_canary_order_evidence_accepts_filled_status_without_matching_fill() {
+        let now = now_ms();
+        let cloid = "3e45b7c8-8322-5e0c-81a2-7cafc276de89".to_string();
+        let mut evidence = CopyExecutionCanaryOrderEvidence {
+            account_id: "addr_a".to_string(),
+            worker_id: "worker-addr_a".to_string(),
+            signal_id: "signal".to_string(),
+            coin: "@166".to_string(),
+            oid: Some(479539771358),
+            cloid: cloid.clone(),
+            order_status: Some(crate::hyperliquid::OrderStatusResponse {
+                status: "order".to_string(),
+                order: Some(crate::hyperliquid::OrderStatusInfo {
+                    order: crate::hyperliquid::OrderStatusOrder {
+                        coin: "@166".to_string(),
+                        side: "B".to_string(),
+                        limit_px: "1.0037".to_string(),
+                        sz: "59.06".to_string(),
+                        oid: 479539771358,
+                        timestamp: now,
+                        trigger_condition: "N/A".to_string(),
+                        is_trigger: false,
+                        trigger_px: "0.0".to_string(),
+                        children: Vec::new(),
+                        is_position_tpsl: false,
+                        reduce_only: false,
+                        order_type: "Limit".to_string(),
+                        orig_sz: "60.37".to_string(),
+                        tif: "Ioc".to_string(),
+                        cloid: Some("0x".to_string() + &cloid.replace('-', "")),
+                    },
+                    status: "filled".to_string(),
+                    status_timestamp: now,
+                }),
+            }),
+            user_fill_count: 235,
+            matching_fill_count: 0,
+            matching_fills: Vec::new(),
+            error: None,
+        };
+
+        assert!(super::copy_execution_canary_order_evidence_ok(&evidence));
+
+        evidence
+            .order_status
+            .as_mut()
+            .unwrap()
+            .order
+            .as_mut()
+            .unwrap()
+            .status = "open".to_string();
+        assert!(!super::copy_execution_canary_order_evidence_ok(&evidence));
+    }
+
+    #[test]
     fn copy_live_daemon_live_submit_health_rejects_missing_evidence() {
         let report = CopyLiveDaemonPersistentLiveSubmitReport {
             ok: false,
@@ -14636,7 +14691,20 @@ fn copy_execution_canary_report(
 }
 
 fn copy_execution_canary_order_evidence_ok(evidence: &CopyExecutionCanaryOrderEvidence) -> bool {
-    evidence.error.is_none() && evidence.order_status.is_some() && evidence.matching_fill_count > 0
+    evidence.error.is_none()
+        && evidence.order_status.is_some()
+        && (evidence.matching_fill_count > 0
+            || evidence
+                .order_status
+                .as_ref()
+                .is_some_and(copy_execution_canary_order_status_is_filled))
+}
+
+fn copy_execution_canary_order_status_is_filled(status: &hyperliquid::OrderStatusResponse) -> bool {
+    status
+        .order
+        .as_ref()
+        .is_some_and(|info| info.status.eq_ignore_ascii_case("filled"))
 }
 
 fn reconcile_copy_canary_ledger(
