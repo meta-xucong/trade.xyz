@@ -2353,7 +2353,7 @@
             <div class="panel metric">
               <div class="metric-label" data-i18n="metric.position_value">Position Value</div>
               <div class="metric-value" id="positionValue">$0.00</div>
-              <div class="metric-sub" data-i18n="metric.position_value_sub">real position value (closable basis)</div>
+              <div class="metric-sub" data-i18n="metric.position_value_sub">live position notional (truth source)</div>
             </div>
             <div class="panel metric">
               <div class="metric-label" data-i18n="metric.unrealized">Unrealized PnL</div>
@@ -3608,6 +3608,7 @@
           "dashboard.strategy_pnl_no_attribution": "No exact order attribution yet",
           "dashboard.cancel_all_orders": "Cancel This Version / Stop Strategies",
           "dashboard.cancel_all_orders_tip": "Cancel this version's Fib entry orders across all markets and stop all running Fib strategies. Orders from other versions/tools and existing TP/SL protection are left untouched.",
+          "dashboard.cancel_all_orders_confirm": "Cancel this version's Fib entry orders and stop all running Fib strategies now? Existing positions and TP/SL protection orders are not closed.",
           "dashboard.cancel_all_orders_running": "Canceling this version's strategy entry orders across all markets, please wait...",
           "dashboard.order.source": "Source",
           "dashboard.order.strategy": "Strategy",
@@ -3639,7 +3640,7 @@
           "metric.realized": "Daily Realized",
           "metric.realized_sub": "session total",
           "metric.position_value": "Position Value",
-          "metric.position_value_sub": "real position value (closable basis)",
+          "metric.position_value_sub": "live position notional (truth source)",
           "table.account": "Account",
           "table.coin": "Coin",
           "table.size": "Size",
@@ -4327,6 +4328,7 @@
           "dashboard.strategy_pnl_no_attribution": "暂无精确订单归因",
           "dashboard.cancel_all_orders": "撤本版本挂单 / 停止策略",
           "dashboard.cancel_all_orders_tip": "撤销当前版本在所有市场内拥有归属记录的斐波那契入场挂单，并停止当前版本所有运行中的斐波那契策略。其他版本/其他工具的订单，以及已有持仓保护用的 TP/SL 单不会被撤。",
+          "dashboard.cancel_all_orders_confirm": "确认立即撤销本版本的斐波那契入场挂单，并停止所有运行中的 Fib 策略吗？现有持仓和 TP/SL 保护单不会被平掉。",
           "dashboard.cancel_all_orders_running": "正在撤销本版本所有市场的策略入场挂单，请稍候...",
           "dashboard.order.source": "来源",
           "dashboard.order.strategy": "策略",
@@ -4358,7 +4360,7 @@
           "metric.realized": "当日已实现",
           "metric.realized_sub": "会话累计",
           "metric.position_value": "仓位总价值",
-          "metric.position_value_sub": "当前持仓实际价值合计（可平仓口径）",
+          "metric.position_value_sub": "当前持仓名义价值合计（统一仓位真相）",
           "table.account": "账户",
           "table.coin": "交易对",
           "table.size": "仓位",
@@ -9596,12 +9598,9 @@
               );
               for (const position of scopedPositions) {
                 const row = perpPositionFromFunding(account.account_id, position);
+                positionValueUsd += parseNum(row.position_value_usd);
                 positions.push(row);
               }
-              // Perp "real position value" uses closable-equity basis:
-              // account equity minus currently withdrawable cash.
-              // This avoids showing leveraged notional as position value.
-              positionValueUsd = Math.max(accountValueUsd - availableUsdc, 0);
               equityUsd = accountValueUsd;
             }
           }
@@ -10598,6 +10597,8 @@
         const market = activeDashboardMarket();
         const submit = !!(state.app && state.app.dry_run === false);
         if (submit && !ensureVaultUnlockedForLiveAction(t("dashboard.cancel_all_orders"), "openOrdersResult")) return;
+        const ok = window.confirm(t("dashboard.cancel_all_orders_confirm"));
+        if (!ok) return;
         $("openOrdersResult").textContent = t("dashboard.cancel_all_orders_running");
         setButtonBusy("dashboardCancelOpenOrdersAction", true);
         try {

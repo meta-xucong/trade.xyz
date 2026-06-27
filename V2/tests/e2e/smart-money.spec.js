@@ -342,11 +342,69 @@ test("dashboard attribution consumes backend position truth fields", async ({ pa
         { key: "dust", source: "backend_dust_threshold", ratio: 1 },
       ],
     });
+    const derivedDashboard = deriveDashboardView(
+      [{ account_id: "addr_a" }, { account_id: "addr_b" }],
+      {
+        results: [
+          {
+            ok: true,
+            data: {
+              account_id: "addr_a",
+              xyz_perp: {
+                withdrawable_usd: 80,
+                account_value_usd: 100,
+                positions: [{
+                  coin: "xyz:SP500",
+                  size: 0.063,
+                  entry_price: 7334.5,
+                  position_value_usd: 462.0735,
+                  unrealized_pnl_usd: -2.1,
+                  owner: "copy",
+                  attribution_source: "backend_position_truth",
+                  copy_ratio: 1,
+                  attribution_parts: [{ key: "copy", source: "copy_ledger_live_position", ratio: 1 }],
+                }],
+              },
+            },
+          },
+          {
+            ok: true,
+            data: {
+              account_id: "addr_b",
+              xyz_perp: {
+                withdrawable_usd: 25.747876,
+                account_value_usd: 62.718611,
+                positions: [{
+                  coin: "xyz:SP500",
+                  size: 0.018,
+                  entry_price: 7334.5,
+                  position_value_usd: 132.021,
+                  unrealized_pnl_usd: -0.7,
+                  owner: "copy",
+                  attribution_source: "backend_position_truth",
+                  copy_ratio: 1,
+                  attribution_parts: [{ key: "copy", source: "copy_ledger_live_position", ratio: 1 }],
+                }],
+              },
+            },
+          },
+        ],
+      },
+      "xyz_perp"
+    );
+    const rowPositionValue = derivedDashboard.positions.reduce(
+      (sum, position) => sum + Number(position.position_value_usd || 0),
+      0
+    );
 
     return {
       noBackend,
       backendMixed,
       backendDust,
+      dashboardTotalPositionValue: derivedDashboard.pnl.total_position_value_usd,
+      dashboardRowPositionValue: rowPositionValue,
+      dashboardLegacyMarginValue:
+        derivedDashboard.pnl.total_equity_usd - derivedDashboard.pnl.total_available_usdc,
     };
   });
 
@@ -359,4 +417,38 @@ test("dashboard attribution consumes backend position truth fields", async ({ pa
   expect(result.backendMixed.unattributed_ratio).toBe(0.25);
   expect(result.backendDust.owner).toBe("dust");
   expect(result.backendDust.dust_ratio).toBe(1);
+  expect(result.dashboardTotalPositionValue).toBeCloseTo(594.0945, 4);
+  expect(result.dashboardTotalPositionValue).toBeCloseTo(result.dashboardRowPositionValue, 6);
+  expect(result.dashboardTotalPositionValue).not.toBeCloseTo(result.dashboardLegacyMarginValue, 4);
+});
+
+test("dashboard cancel-all action requires confirmation before calling the API", async ({ page }) => {
+  await page.goto("/");
+
+  const result = await page.evaluate(async () => {
+    const originalApi = api;
+    const originalConfirm = window.confirm;
+    let apiCalled = false;
+    try {
+      api = async () => {
+        apiCalled = true;
+        throw new Error("cancel API should not be called after dismissed confirmation");
+      };
+      window.confirm = () => false;
+      state.app = { ...(state.app || {}), dry_run: true };
+
+      await dashboardCancelOpenOrdersAction();
+      return {
+        apiCalled,
+        resultText: document.querySelector("#openOrdersResult")?.textContent || "",
+      };
+    } finally {
+      api = originalApi;
+      window.confirm = originalConfirm;
+    }
+  });
+
+  expect(result.apiCalled).toBe(false);
+  expect(result.resultText).not.toContain("Canceling");
+  expect(result.resultText).not.toContain("正在撤销");
 });
