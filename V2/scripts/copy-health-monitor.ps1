@@ -211,6 +211,48 @@ function Invoke-Json {
     return Invoke-RestMethod -Uri $uri -Method $Method -ContentType "application/json" -Body ($Body | ConvertTo-Json -Compress -Depth 8) -TimeoutSec 15
 }
 
+function Convert-ToDoubleOrZero {
+    param([object]$Value)
+    $parsed = 0.0
+    if ([double]::TryParse([string]$Value, [ref]$parsed)) {
+        return $parsed
+    }
+    return 0.0
+}
+
+function Get-PositionTruthRiskDiagnostic {
+    try {
+        $state = Invoke-Json "/api/state"
+    } catch {
+        return ""
+    }
+    $payload = $state
+    if ($state.PSObject.Properties.Name -contains "ok") {
+        if (-not [bool]$state.ok) {
+            return ""
+        }
+        if (($state.PSObject.Properties.Name -contains "data") -and $null -ne $state.data) {
+            $payload = $state.data
+        }
+    }
+    if ($null -eq $payload -or $null -eq $payload.position_truth) {
+        return ""
+    }
+    $truth = $payload.position_truth
+    $unattributedValue = Convert-ToDoubleOrZero $truth.unattributed_position_value_usd
+    if ($unattributedValue + 1e-9 -lt 10.0) {
+        return ""
+    }
+    $positions = @($payload.positions | Where-Object {
+        ([string]$_.owner) -eq "unattributed" -and
+        ((Convert-ToDoubleOrZero $_.position_value_usd) + 1e-9 -ge 10.0)
+    } | ForEach-Object {
+        "$($_.account_id):$($_.coin):size=$($_.size):value=$($_.position_value_usd):pnl=$($_.pnl_usd)"
+    })
+    $positionText = if ($positions.Count -gt 0) { $positions -join "," } else { "none" }
+    return "unattributed_position_value_usd=$unattributedValue count=$($truth.unattributed_position_count) positions=$positionText"
+}
+
 function Get-LatestRunDiagnostic {
     try {
         $status = Invoke-Json "/api/copy/live-soak/status"
@@ -720,6 +762,19 @@ while ($true) {
     try {
         if (Test-CopyLiveSoakPaused) {
             Write-MonitorLog "paused_by_operator; automatic restart disabled"
+            Start-Sleep -Seconds $PollSecs
+            continue
+        }
+        $positionTruthRisk = Get-PositionTruthRiskDiagnostic
+        if (-not [string]::IsNullOrWhiteSpace($positionTruthRisk)) {
+            $diagnostic = "position_truth_unattributed_live_exposure; $positionTruthRisk"
+            Write-MonitorLog "detected stopped soak; diagnostic: $diagnostic"
+            if (Test-StopCandidateConfirmed -Reason "position_truth_unattributed" -Diagnostic $diagnostic) {
+                Send-ConfirmedStopNotification -Reason "position_truth_unattributed" -Diagnostic $diagnostic
+                Set-Content -LiteralPath $copyLiveSoakPausePath -Value "position_truth_unattributed $(Get-Date -Format o)" -Encoding ascii
+                Stop-SoakProcessesForRestart -Reason "position_truth_unattributed"
+                Reset-StopCandidate "paused_after_position_truth_risk"
+            }
             Start-Sleep -Seconds $PollSecs
             continue
         }

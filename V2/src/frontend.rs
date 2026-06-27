@@ -4474,6 +4474,7 @@ struct PositionTruthKey {
 #[derive(Debug, Clone, Default)]
 struct PositionTruthEvidence {
     copy_position_value_usd: f64,
+    copy_lineage_position_value_usd: f64,
     fib_open_size: f64,
     fib_position_value_usd: f64,
     fib_residual: bool,
@@ -4492,6 +4493,46 @@ impl PositionTruthSnapshot {
         }
         let key = position_truth_key(account_id, &position.coin, &position.side);
         self.by_key.entry(key).or_default().copy_position_value_usd += value;
+    }
+
+    fn add_copy_lineage_position_value(
+        &mut self,
+        account_id: &str,
+        coin: &str,
+        side: &str,
+        value: f64,
+    ) {
+        if value <= DISPLAY_USD_EPSILON {
+            return;
+        }
+        let key = position_truth_key(account_id, coin, side);
+        self.by_key
+            .entry(key)
+            .or_default()
+            .copy_lineage_position_value_usd += value;
+    }
+
+    fn add_copy_lineage_from_entries(&mut self, entries: &[CopyLedgerEntry]) {
+        for entry in entries {
+            if !copy_ledger_entry_is_open_lineage(entry)
+                || !copy_ledger_entry_has_live_order_evidence(entry)
+                || entry.local_account_id.trim().is_empty()
+                || entry.coin.trim().is_empty()
+            {
+                continue;
+            }
+            let value = entry
+                .filled_notional_usd
+                .max(entry.remaining_notional_usd)
+                .max(entry.planned_notional_usd)
+                .max(0.0);
+            self.add_copy_lineage_position_value(
+                &entry.local_account_id,
+                &entry.coin,
+                copy_ledger_display_side(entry.local_side),
+                value,
+            );
+        }
     }
 
     fn add_fib_position(
@@ -4546,6 +4587,7 @@ impl PositionTruthSnapshot {
             0.0
         }
         .clamp(0.0, 1.0);
+        let mut copy_source = "copy_ledger_live_position";
         if fib_ratio <= POSITION_TRUTH_RATIO_EPSILON
             && copy_ratio > POSITION_TRUTH_RATIO_EPSILON
             && copy_ratio < 1.0
@@ -4553,6 +4595,17 @@ impl PositionTruthSnapshot {
             && live_value - evidence.copy_position_value_usd <= pnl_usd.abs() + DISPLAY_USD_EPSILON
         {
             copy_ratio = 1.0;
+        }
+        let copy_lineage_value = evidence
+            .copy_lineage_position_value_usd
+            .max(evidence.copy_position_value_usd);
+        if fib_ratio <= POSITION_TRUTH_RATIO_EPSILON
+            && copy_ratio > POSITION_TRUTH_RATIO_EPSILON
+            && copy_ratio < 1.0
+            && copy_lineage_value + DISPLAY_USD_EPSILON >= live_value
+        {
+            copy_ratio = 1.0;
+            copy_source = "copy_ledger_same_coin_lineage_residual";
         }
         let combined = fib_ratio + copy_ratio;
         if combined > 1.0 && combined > POSITION_TRUTH_RATIO_EPSILON {
@@ -4593,7 +4646,7 @@ impl PositionTruthSnapshot {
         if copy_ratio > POSITION_TRUTH_RATIO_EPSILON {
             parts.push(position_attribution_part(
                 "copy",
-                "copy_ledger_live_position",
+                copy_source,
                 copy_ratio,
                 live_value,
                 pnl_usd,
@@ -4724,6 +4777,7 @@ fn build_position_truth_snapshot(
     if let Ok(persistence) =
         load_copy_persistence_snapshot(&copy_live_soak_dir().join(COPY_LIVE_SOAK_CURRENT_SNAPSHOT))
     {
+        snapshot.add_copy_lineage_from_entries(&persistence.ledger_entries);
         for account in copy_ledger_local_account_summaries(
             config,
             copy_settings.as_ref(),
@@ -4789,6 +4843,20 @@ fn build_position_truth_snapshot(
         }
     }
     snapshot
+}
+
+fn copy_ledger_entry_is_open_lineage(entry: &CopyLedgerEntry) -> bool {
+    if matches!(entry.status, CopyLedgerStatus::Rejected) {
+        return false;
+    }
+    let signal_id = entry.signal_id.to_ascii_lowercase();
+    if signal_id.contains("-close-") {
+        return false;
+    }
+    matches!(
+        entry.status,
+        CopyLedgerStatus::PendingOpen | CopyLedgerStatus::Open
+    ) || signal_id.contains("-open-")
 }
 
 fn fib_strategy_truth_side(record: &FibInstanceRecord) -> &'static str {
@@ -8005,18 +8073,19 @@ async fn build_copy_summary_response(state: &FrontendAppState) -> Result<CopySum
         .as_ref()
         .map(|snapshot| copy_ledger_position_summaries(&snapshot.ledger_entries))
         .unwrap_or_default();
+    let live_accounts = read_copy_live_account_summaries(state, copy_settings.as_ref())
+        .await
+        .unwrap_or_default();
     let ledger_local_summaries = snapshot
         .as_ref()
         .map(|snapshot| {
-            copy_ledger_local_account_summaries(
+            copy_ledger_local_account_summaries_with_live_lineage(
                 &config,
                 copy_settings.as_ref(),
                 &snapshot.ledger_entries,
+                &live_accounts.locals,
             )
         })
-        .unwrap_or_default();
-    let live_accounts = read_copy_live_account_summaries(state, copy_settings.as_ref())
-        .await
         .unwrap_or_default();
     Ok(build_copy_summary_response_from_entries(
         entries,
@@ -10083,6 +10152,108 @@ fn copy_ledger_local_account_summaries(
         });
     }
     summaries
+}
+
+fn copy_ledger_local_account_summaries_with_live_lineage(
+    config: &AppConfig,
+    settings: Option<&CopyUiSettings>,
+    entries: &[CopyLedgerEntry],
+    live_accounts: &[CopyPnlAccountSummary],
+) -> Vec<CopyPnlAccountSummary> {
+    let mut summaries = copy_ledger_local_account_summaries(config, settings, entries);
+    let lineage_values = copy_ledger_lineage_position_value_map(entries);
+    if lineage_values.is_empty() || live_accounts.is_empty() {
+        return summaries;
+    }
+
+    let index_by_id = summaries
+        .iter()
+        .enumerate()
+        .map(|(index, account)| (account.id.clone(), index))
+        .collect::<HashMap<_, _>>();
+    for live in live_accounts {
+        let Some(summary_index) = index_by_id.get(&live.id).copied() else {
+            continue;
+        };
+        let summary = &mut summaries[summary_index];
+        let position_index_by_key = summary
+            .positions
+            .iter()
+            .enumerate()
+            .map(|(index, position)| (copy_pnl_position_identity(position), index))
+            .collect::<HashMap<_, _>>();
+        let mut changed = false;
+        for live_position in &live.positions {
+            let position_key = copy_pnl_position_identity(live_position);
+            let Some(position_index) = position_index_by_key.get(&position_key).copied() else {
+                continue;
+            };
+            let live_value = copy_pnl_position_value_usd(live_position);
+            if live_value <= DISPLAY_USD_EPSILON {
+                continue;
+            }
+            let current_value = copy_pnl_position_value_usd(&summary.positions[position_index]);
+            if current_value <= DISPLAY_USD_EPSILON
+                || current_value + DISPLAY_USD_EPSILON >= live_value
+            {
+                continue;
+            }
+            let lineage_value = lineage_values
+                .get(&(
+                    live.id.clone(),
+                    position_key.0.clone(),
+                    position_key.1.clone(),
+                ))
+                .copied()
+                .unwrap_or_default();
+            if lineage_value + DISPLAY_USD_EPSILON < live_value {
+                continue;
+            }
+            summary.positions[position_index] = live_position.clone();
+            changed = true;
+        }
+        if changed {
+            summary.position_value_usd = copy_sum_optional(
+                summary
+                    .positions
+                    .iter()
+                    .map(|position| position.position_value_usd),
+            );
+            summary.open_position_count = summary.positions.len();
+        }
+    }
+    summaries
+}
+
+fn copy_ledger_lineage_position_value_map(
+    entries: &[CopyLedgerEntry],
+) -> HashMap<(String, String, String), f64> {
+    let mut values = HashMap::<(String, String, String), f64>::new();
+    for entry in entries {
+        if !copy_ledger_entry_is_open_lineage(entry)
+            || !copy_ledger_entry_has_live_order_evidence(entry)
+            || entry.local_account_id.trim().is_empty()
+            || entry.coin.trim().is_empty()
+        {
+            continue;
+        }
+        let value = entry
+            .filled_notional_usd
+            .max(entry.remaining_notional_usd)
+            .max(entry.planned_notional_usd)
+            .max(0.0);
+        if value <= DISPLAY_USD_EPSILON {
+            continue;
+        }
+        *values
+            .entry((
+                entry.local_account_id.clone(),
+                entry.coin.trim().to_ascii_lowercase(),
+                copy_ledger_display_side(entry.local_side).to_string(),
+            ))
+            .or_insert(0.0) += value;
+    }
+    values
 }
 
 fn copy_ledger_position_summaries(entries: &[CopyLedgerEntry]) -> Vec<CopyPnlPositionSummary> {
@@ -17618,8 +17789,8 @@ mod tests {
         build_basic_plan, build_copy_live_soak_status_response_from_dir,
         build_copy_shadow_history_response_from_path, build_copy_summary_response_from_entries,
         build_fib_strategy_pnl_summary, build_position_truth_snapshot,
-        copy_ledger_position_summaries, copy_pnl_account_summary_from_live_positions,
-        copy_pnl_account_summary_has_current_state,
+        copy_ledger_local_account_summaries_with_live_lineage, copy_ledger_position_summaries,
+        copy_pnl_account_summary_from_live_positions, copy_pnl_account_summary_has_current_state,
         dashboard_cancel_stopped_without_open_orders_count, dashboard_cancel_strategy_ids,
         dashboard_order_is_cancelable_fib_entry, default_copy_leaders, default_copy_markets,
         ensure_fib_pair_available, failed_readiness_blockers, feishu_test_response_ok,
@@ -18906,6 +19077,107 @@ mod tests {
         assert_eq!(local.position_value_usd, Some(200.0));
         assert_eq!(local.unrealized_pnl_usd, Some(20.0));
         assert_eq!(summary.unrealized_pnl_usd, Some(12.5));
+    }
+
+    #[test]
+    fn copy_summary_treats_live_same_coin_lineage_residual_as_copy_owned() {
+        let configured = CopyUiSettings {
+            leaders: default_copy_leaders(),
+            markets: default_copy_markets(),
+            copy_ratio: 0.2,
+            principal_cap_usd: 35.0,
+            leverage: crate::strategies::smart_money::COPY_MAX_LEVERAGE,
+            account_id: "addr_a".to_string(),
+            account_ids: vec!["addr_a".to_string()],
+            updated_at_ms: 123,
+        };
+        let live_position = CopyPnlPositionSummary {
+            coin: "xyz:SP500".to_string(),
+            side: "long".to_string(),
+            size: 0.081,
+            position_value_usd: Some(594.10),
+            unrealized_pnl_usd: Some(-2.82),
+            entry_px: Some(7350.0),
+        };
+        let local_a = CopyPnlAccountSummary {
+            id: "addr_a".to_string(),
+            kind: "local_live".to_string(),
+            truth_state: "current".to_string(),
+            unrealized_pnl_usd: Some(-2.82),
+            total_pnl_usd: Some(-2.82),
+            position_value_usd: Some(594.10),
+            open_position_count: 1,
+            positions: vec![live_position],
+            ..CopyPnlAccountSummary::default()
+        };
+        let live_accounts = CopyLiveAccountSummaries {
+            local: aggregate_copy_local_account_summaries(&[local_a.clone()]),
+            locals: vec![local_a],
+            targets: Vec::new(),
+        };
+        let ledger_entries = vec![
+            crate::strategies::smart_money::CopyLedgerEntry {
+                local_account_id: "addr_a".to_string(),
+                leader_id: "leader_4".to_string(),
+                leader_group: "leader_4".to_string(),
+                signal_id: "copy-leader_4-open-sp500".to_string(),
+                coin: "xyz:SP500".to_string(),
+                local_side: OrderSide::Buy,
+                order_cloid: Some("cloid-open-active".to_string()),
+                order_oid: Some(123),
+                submitted_at_ms: Some(100),
+                filled_at_ms: Some(101),
+                planned_notional_usd: 500.67,
+                pending_notional_usd: 0.0,
+                filled_notional_usd: 500.67,
+                remaining_notional_usd: 500.67,
+                status: crate::strategies::smart_money::CopyLedgerStatus::Open,
+            },
+            crate::strategies::smart_money::CopyLedgerEntry {
+                local_account_id: "addr_a".to_string(),
+                leader_id: "leader_4".to_string(),
+                leader_group: "leader_4".to_string(),
+                signal_id: "copy-leader_4-closed-open-sp500".to_string(),
+                coin: "xyz:SP500".to_string(),
+                local_side: OrderSide::Buy,
+                order_cloid: Some("cloid-open-closed".to_string()),
+                order_oid: Some(456),
+                submitted_at_ms: Some(200),
+                filled_at_ms: Some(201),
+                planned_notional_usd: 149.33,
+                pending_notional_usd: 0.0,
+                filled_notional_usd: 149.33,
+                remaining_notional_usd: 0.0,
+                status: crate::strategies::smart_money::CopyLedgerStatus::Closed,
+            },
+        ];
+        let ledger_local_summaries = copy_ledger_local_account_summaries_with_live_lineage(
+            &test_app_config_with_addr_a(),
+            Some(&configured),
+            &ledger_entries,
+            &live_accounts.locals,
+        );
+
+        let summary = build_copy_summary_response_from_entries(
+            Vec::new(),
+            None,
+            3_000_000,
+            CopyPnlReportSummary::default(),
+            Some(&configured),
+            ledger_local_summaries,
+            Vec::new(),
+            live_accounts,
+        );
+
+        let copy_owned = summary.copy_owned_summary.expect("copy owned summary");
+        assert_eq!(copy_owned.position_value_usd, Some(594.10));
+        assert_eq!(copy_owned.unrealized_pnl_usd, Some(-2.82));
+        assert!(
+            summary
+                .other_local_summary
+                .as_ref()
+                .is_none_or(|summary| summary.open_position_count == 0)
+        );
     }
 
     #[test]
@@ -20475,6 +20747,34 @@ mod tests {
         assert!(attribution.unattributed_ratio.abs() < 0.000001);
         assert!((attribution.copy_pnl_usd - 2.2808).abs() < 0.000001);
         assert!(attribution.unattributed_pnl_usd.abs() < 0.000001);
+    }
+
+    #[test]
+    fn position_truth_treats_same_coin_copy_lineage_residual_as_copy_owned() {
+        let mut truth = PositionTruthSnapshot::default();
+        truth.add_copy_position(
+            "addr_a",
+            &CopyPnlPositionSummary {
+                coin: "xyz:SP500".to_string(),
+                side: "long".to_string(),
+                size: 500.67,
+                position_value_usd: Some(500.67),
+                unrealized_pnl_usd: None,
+                entry_px: None,
+            },
+        );
+        truth.add_copy_lineage_position_value("addr_a", "xyz:SP500", "long", 650.0);
+
+        let attribution =
+            truth.attribution_for_live_position("addr_a", "xyz:SP500", 0.081, 594.10, -2.82);
+
+        assert_eq!(attribution.owner, "copy");
+        assert!((attribution.copy_ratio - 1.0).abs() < 0.000001);
+        assert!(attribution.unattributed_ratio.abs() < 0.000001);
+        assert_eq!(
+            attribution.attribution_parts[0].source,
+            "copy_ledger_same_coin_lineage_residual"
+        );
     }
 
     #[test]

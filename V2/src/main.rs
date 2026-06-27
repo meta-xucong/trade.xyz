@@ -4734,6 +4734,130 @@ mod tests {
     }
 
     #[test]
+    fn copy_live_daemon_follow_position_health_rejects_unsubmitted_qnt_shadow_tail() {
+        let mut options = follow_position_options();
+        options.max_total_notional_usd = 3_000.0;
+        let snapshot = crate::strategies::smart_money::CopyPersistenceSnapshot {
+            schema_version: 1,
+            saved_at_ms: now_ms(),
+            seen_event_keys: vec!["leader-semantic:leader_4:xyz:QNT:open".to_string()],
+            ledger_entries: vec![crate::strategies::smart_money::CopyLedgerEntry {
+                local_account_id: "addr_a".to_string(),
+                leader_id: "leader_4".to_string(),
+                leader_group: "leader_4".to_string(),
+                signal_id: "copy-leader_4-qnt-open".to_string(),
+                coin: "xyz:QNT".to_string(),
+                local_side: crate::domain::OrderSide::Sell,
+                order_cloid: None,
+                order_oid: None,
+                submitted_at_ms: None,
+                filled_at_ms: None,
+                planned_notional_usd: 350.0,
+                pending_notional_usd: 350.0,
+                filled_notional_usd: 0.0,
+                remaining_notional_usd: 0.0,
+                status: crate::strategies::smart_money::CopyLedgerStatus::PendingOpen,
+            }],
+        };
+        let reconciliations = vec![CopyBoundedLiveWindowReconcile {
+            account_id: "addr_a".to_string(),
+            ok: false,
+            open_order_count: Some(0),
+            asset_positions: Some(1),
+            position_summaries: vec![super::CopyBoundedLiveWindowPositionSummary {
+                coin: "xyz:QNT".to_string(),
+                szi: "-4.9".to_string(),
+                position_value: Some("365.6282".to_string()),
+            }],
+            account_value: Some("158.0".to_string()),
+            withdrawable: Some("0.2".to_string()),
+            total_ntl_pos: Some("365.6282".to_string()),
+            total_margin_used: Some("36.6".to_string()),
+            error: None,
+        }];
+
+        assert!(
+            !super::copy_live_daemon_reconciliations_healthy_for_snapshot(
+                &options,
+                &reconciliations,
+                &snapshot
+            )
+        );
+        let detail = super::copy_live_daemon_reconcile_health_detail_for_snapshot(
+            &options,
+            &reconciliations,
+            &snapshot,
+        );
+        assert!(detail.contains("addr_a:xyz:QNT:sell"));
+        assert!(detail.contains("uncovered=365.628200"));
+    }
+
+    #[test]
+    fn copy_live_daemon_follow_position_health_accepts_evidenced_copy_lineage_residual() {
+        let mut options = follow_position_options();
+        options.max_total_notional_usd = 3_000.0;
+        let active_sp500 = crate::strategies::smart_money::CopyLedgerEntry {
+            local_account_id: "addr_a".to_string(),
+            leader_id: "leader_4".to_string(),
+            leader_group: "leader_4".to_string(),
+            signal_id: "copy-leader_4-sp500-open-active".to_string(),
+            coin: "xyz:SP500".to_string(),
+            local_side: crate::domain::OrderSide::Buy,
+            order_cloid: Some("11111111-1111-5111-8111-111111111111".to_string()),
+            order_oid: Some(9001),
+            submitted_at_ms: Some(now_ms()),
+            filled_at_ms: Some(now_ms()),
+            planned_notional_usd: 500.67,
+            pending_notional_usd: 0.0,
+            filled_notional_usd: 500.67,
+            remaining_notional_usd: 500.67,
+            status: crate::strategies::smart_money::CopyLedgerStatus::Open,
+        };
+        let closed_open_sp500 = crate::strategies::smart_money::CopyLedgerEntry {
+            signal_id: "copy-leader_4-sp500-open-closed".to_string(),
+            order_cloid: Some("22222222-2222-5222-8222-222222222222".to_string()),
+            order_oid: Some(9002),
+            submitted_at_ms: Some(now_ms()),
+            filled_at_ms: Some(now_ms()),
+            planned_notional_usd: 149.33,
+            filled_notional_usd: 149.33,
+            remaining_notional_usd: 0.0,
+            status: crate::strategies::smart_money::CopyLedgerStatus::Closed,
+            ..active_sp500.clone()
+        };
+        let snapshot = crate::strategies::smart_money::CopyPersistenceSnapshot {
+            schema_version: 1,
+            saved_at_ms: now_ms(),
+            seen_event_keys: Vec::new(),
+            ledger_entries: vec![active_sp500, closed_open_sp500],
+        };
+        let reconciliations = vec![CopyBoundedLiveWindowReconcile {
+            account_id: "addr_a".to_string(),
+            ok: false,
+            open_order_count: Some(0),
+            asset_positions: Some(1),
+            position_summaries: vec![super::CopyBoundedLiveWindowPositionSummary {
+                coin: "xyz:SP500".to_string(),
+                szi: "0.081".to_string(),
+                position_value: Some("594.10".to_string()),
+            }],
+            account_value: Some("158.0".to_string()),
+            withdrawable: Some("0.2".to_string()),
+            total_ntl_pos: Some("594.10".to_string()),
+            total_margin_used: Some("59.4".to_string()),
+            error: None,
+        }];
+
+        assert!(
+            super::copy_live_daemon_reconciliations_healthy_for_snapshot(
+                &options,
+                &reconciliations,
+                &snapshot
+            )
+        );
+    }
+
+    #[test]
     fn copy_live_daemon_recovers_open_ledger_from_historical_shadow_files() {
         let temp = std::env::temp_dir().join(format!(
             "trade_xyz_copy_recover_historical_shadow_{}",
@@ -14161,6 +14285,34 @@ fn copy_live_daemon_ledger_entry_has_submission(
             .is_some_and(|cloid| !cloid.trim().is_empty())
 }
 
+fn copy_live_daemon_ledger_entry_has_live_order_evidence(
+    entry: &strategies::smart_money::CopyLedgerEntry,
+) -> bool {
+    copy_live_daemon_ledger_entry_has_submission(entry)
+        || entry.filled_at_ms.is_some()
+        || entry.filled_notional_usd > 0.0
+}
+
+fn copy_live_daemon_ledger_entry_is_open_lineage(
+    entry: &strategies::smart_money::CopyLedgerEntry,
+) -> bool {
+    if matches!(
+        entry.status,
+        strategies::smart_money::CopyLedgerStatus::Rejected
+    ) {
+        return false;
+    }
+    let signal_id = entry.signal_id.to_ascii_lowercase();
+    if signal_id.contains("-close-") {
+        return false;
+    }
+    matches!(
+        entry.status,
+        strategies::smart_money::CopyLedgerStatus::PendingOpen
+            | strategies::smart_money::CopyLedgerStatus::Open
+    ) || signal_id.contains("-open-")
+}
+
 fn copy_live_daemon_persistent_submit_snapshot_safe_to_save(
     report: &CopyLiveDaemonPersistentLiveSubmitReport,
 ) -> bool {
@@ -14568,6 +14720,34 @@ fn copy_live_daemon_unmapped_position_keys(
     snapshot: &strategies::smart_money::CopyPersistenceSnapshot,
     reconciliations: &[CopyBoundedLiveWindowReconcile],
 ) -> Vec<String> {
+    let copy_lineage_notional_by_key = snapshot
+        .ledger_entries
+        .iter()
+        .filter(|entry| {
+            copy_live_daemon_ledger_entry_is_open_lineage(entry)
+                && copy_live_daemon_ledger_entry_has_live_order_evidence(entry)
+                && !entry.local_account_id.trim().is_empty()
+                && !entry.coin.trim().is_empty()
+        })
+        .fold(
+            HashMap::<(String, String, String), f64>::new(),
+            |mut acc, entry| {
+                let notional = entry
+                    .filled_notional_usd
+                    .max(entry.remaining_notional_usd)
+                    .max(entry.planned_notional_usd)
+                    .max(0.0);
+                if notional > 1e-9 {
+                    *acc.entry((
+                        entry.local_account_id.clone(),
+                        entry.coin.clone(),
+                        copy_live_daemon_order_side_key(entry.local_side),
+                    ))
+                    .or_insert(0.0) += notional;
+                }
+                acc
+            },
+        );
     let mut unmapped = Vec::new();
     for reconciliation in reconciliations
         .iter()
@@ -14578,33 +14758,29 @@ fn copy_live_daemon_unmapped_position_keys(
             else {
                 continue;
             };
-            let has_mapping = snapshot.ledger_entries.iter().any(|entry| {
-                entry.local_account_id == reconciliation.account_id
-                    && entry.coin == position.coin
-                    && entry.local_side == local_side
-                    && matches!(
-                        entry.status,
-                        strategies::smart_money::CopyLedgerStatus::Open
-                            | strategies::smart_money::CopyLedgerStatus::PendingOpen
-                            | strategies::smart_money::CopyLedgerStatus::PendingReduce
-                            | strategies::smart_money::CopyLedgerStatus::PendingClose
-                    )
-            });
-            if !has_mapping {
-                let position_notional = position
-                    .position_value
-                    .as_deref()
-                    .and_then(|value| value.trim().parse::<f64>().ok())
-                    .map(f64::abs)
-                    .unwrap_or_default();
-                if position_notional + 1e-9 < trading::HYPERLIQUID_MIN_ORDER_NOTIONAL_USD {
-                    continue;
-                }
+            let position_notional = position
+                .position_value
+                .as_deref()
+                .and_then(|value| value.trim().parse::<f64>().ok())
+                .map(f64::abs)
+                .unwrap_or_default();
+            if position_notional + 1e-9 < trading::HYPERLIQUID_MIN_ORDER_NOTIONAL_USD {
+                continue;
+            }
+            let side_key = copy_live_daemon_order_side_key(local_side);
+            let mapped_notional = copy_lineage_notional_by_key
+                .get(&(
+                    reconciliation.account_id.clone(),
+                    position.coin.clone(),
+                    side_key.clone(),
+                ))
+                .copied()
+                .unwrap_or_default();
+            let uncovered_notional = (position_notional - mapped_notional).max(0.0);
+            if uncovered_notional + 1e-9 >= trading::HYPERLIQUID_MIN_ORDER_NOTIONAL_USD {
                 unmapped.push(format!(
-                    "{}:{}:{}",
-                    reconciliation.account_id,
-                    position.coin,
-                    copy_live_daemon_order_side_key(local_side)
+                    "{}:{}:{}:uncovered={uncovered_notional:.6}:live={position_notional:.6}:mapped={mapped_notional:.6}",
+                    reconciliation.account_id, position.coin, side_key
                 ));
             }
         }
