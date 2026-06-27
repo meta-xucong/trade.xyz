@@ -38,10 +38,6 @@ $stopCandidateReason = ""
 $stopCandidateCount = 0
 $lastStopNotificationReason = ""
 $lastStopNotificationAt = [datetime]::MinValue
-if ([double]::IsNaN($MaxTotalNotionalUsd) -or [double]::IsInfinity($MaxTotalNotionalUsd) -or $MaxTotalNotionalUsd -le 0.0) {
-    $MaxTotalNotionalUsd = $PrincipalCapUsd * $Leverage
-}
-
 function Write-MonitorLog {
     param([string]$Message)
     $line = "$(Get-Date -Format o) $Message"
@@ -854,6 +850,10 @@ function Test-CopyLiveSoakPaused {
 
 $monitorAccountIds = Get-RuntimeAccountIds
 $monitorMarkets = Get-RuntimeMarkets
+if ([double]::IsNaN($MaxTotalNotionalUsd) -or [double]::IsInfinity($MaxTotalNotionalUsd) -or $MaxTotalNotionalUsd -le 0.0) {
+    $accountCount = [Math]::Max($monitorAccountIds.Count, 1)
+    $MaxTotalNotionalUsd = $PrincipalCapUsd * $Leverage * $accountCount
+}
 Write-MonitorLog "monitor started poll_secs=$PollSecs stop_confirm_polls=$StopConfirmPolls notification_cooldown_secs=$NotificationCooldownSecs base_url=$BaseUrl accounts=$($monitorAccountIds -join ',') principal_cap=$PrincipalCapUsd leverage=$Leverage markets=$($monitorMarkets -join ',') max_total_notional=$MaxTotalNotionalUsd max_total_fees=$MaxTotalFeesUsd bot_exe=$BotExePath"
 
 while ($true) {

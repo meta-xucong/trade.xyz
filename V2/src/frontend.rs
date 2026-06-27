@@ -8602,11 +8602,20 @@ fn copy_live_soak_effective_max_total_notional_usd(
     payload: &CopyLiveSoakStartPayload,
     settings: &CopyUiSettings,
 ) -> f64 {
-    let configured_notional_cap = settings.principal_cap_usd * settings.leverage;
+    let configured_account_notional_cap = settings.principal_cap_usd * settings.leverage;
+    let account_count = settings
+        .account_ids
+        .iter()
+        .map(|account_id| account_id.trim())
+        .filter(|account_id| !account_id.is_empty())
+        .collect::<HashSet<_>>()
+        .len()
+        .max(1) as f64;
+    let configured_total_notional_cap = configured_account_notional_cap * account_count;
     payload
         .max_total_notional_usd
-        .unwrap_or(configured_notional_cap)
-        .max(configured_notional_cap)
+        .unwrap_or(configured_total_notional_cap)
+        .max(configured_total_notional_cap)
 }
 
 fn copy_live_soak_script_path() -> PathBuf {
@@ -19593,12 +19602,12 @@ mod tests {
 
         assert_eq!(
             copy_live_soak_effective_max_total_notional_usd(&payload, &settings),
-            350.0
+            700.0
         );
         payload.max_total_notional_usd = Some(100.0);
         assert_eq!(
             copy_live_soak_effective_max_total_notional_usd(&payload, &settings),
-            350.0
+            700.0
         );
         payload.max_total_notional_usd = Some(3_000.0);
         assert_eq!(

@@ -48,7 +48,7 @@ struct Cli {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::HashSet,
+        collections::{HashMap, HashSet},
         fs,
         process::Command,
         sync::atomic::{AtomicU64, Ordering},
@@ -1755,6 +1755,7 @@ mod tests {
             0.024,
             &flat,
             None,
+            &HashMap::new(),
         );
 
         assert!(!contract.ready_for_unattended_submit);
@@ -2657,6 +2658,7 @@ mod tests {
             0.024,
             &flat,
             None,
+            &HashMap::new(),
         );
 
         let bounded = contract
@@ -3399,6 +3401,7 @@ mod tests {
                 0.05,
                 &held_position,
                 contract,
+                &HashMap::new(),
             );
 
         assert!(executable.is_empty());
@@ -3494,6 +3497,7 @@ mod tests {
                 0.05,
                 &low_margin_position,
                 contract,
+                &HashMap::new(),
             );
 
         assert!(executable.is_empty());
@@ -3890,6 +3894,115 @@ mod tests {
     }
 
     #[test]
+    fn copy_live_daemon_live_account_cap_suppresses_new_symbol_when_global_budget_allows() {
+        let mut options = follow_position_options();
+        options.max_total_notional_usd = 700.0;
+        let persistence = crate::strategies::smart_money::CopyPersistenceSnapshot::empty();
+        let open_ref = CopyLiveDaemonWouldSubmitRef {
+            record_index: 0,
+            signal_id: "sig-account-cap-open".to_string(),
+            leader_id: "leader_a".to_string(),
+            leader_address: "0x00000000000000000000000000000000000000aa".to_string(),
+            order: CopyExecutionCanaryWouldSubmit {
+                account_id: "addr_a".to_string(),
+                worker_id: "worker-addr_a".to_string(),
+                coin: "xyz:JPY".to_string(),
+                side: crate::domain::OrderSide::Buy,
+                notional_usd: 20.0,
+                reduce_only: false,
+                cloid: "00000000-0000-0000-0000-000000000137".to_string(),
+            },
+        };
+        let reconciliations = vec![CopyBoundedLiveWindowReconcile {
+            account_id: "addr_a".to_string(),
+            ok: true,
+            open_order_count: Some(0),
+            asset_positions: Some(1),
+            position_summaries: vec![super::CopyBoundedLiveWindowPositionSummary {
+                coin: "xyz:GBP".to_string(),
+                szi: "250.0".to_string(),
+                position_value: Some("340.0".to_string()),
+            }],
+            account_value: Some("90.0".to_string()),
+            withdrawable: Some("80.0".to_string()),
+            total_ntl_pos: Some("340.0".to_string()),
+            total_margin_used: Some("34.0".to_string()),
+            error: None,
+        }];
+        let account_caps = HashMap::from([("addr_a".to_string(), 350.0)]);
+
+        let (prepared, suppressed) =
+            super::copy_live_daemon_prepare_refs_for_follow_position_limits_with_symbol_caps(
+                &[open_ref],
+                &options,
+                &persistence,
+                &reconciliations,
+                &account_caps,
+            );
+
+        assert!(prepared.is_empty());
+        assert_eq!(suppressed.len(), 1);
+        assert_eq!(
+            suppressed[0].reason_code,
+            "COPY_DAEMON_MAX_ACCOUNT_EXPOSURE"
+        );
+    }
+
+    #[test]
+    fn copy_live_daemon_submit_plan_uses_account_cap_not_global_budget() {
+        let mut options = follow_position_options();
+        options.max_total_notional_usd = 700.0;
+        options.max_total_fees_usd = 1.0;
+        let open_ref = CopyLiveDaemonWouldSubmitRef {
+            record_index: 0,
+            signal_id: "sig-submit-account-cap".to_string(),
+            leader_id: "leader_a".to_string(),
+            leader_address: "0x00000000000000000000000000000000000000aa".to_string(),
+            order: CopyExecutionCanaryWouldSubmit {
+                account_id: "addr_a".to_string(),
+                worker_id: "worker-addr_a".to_string(),
+                coin: "xyz:JPY".to_string(),
+                side: crate::domain::OrderSide::Buy,
+                notional_usd: 20.0,
+                reduce_only: false,
+                cloid: "00000000-0000-0000-0000-000000000138".to_string(),
+            },
+        };
+        let reconciliations = vec![CopyBoundedLiveWindowReconcile {
+            account_id: "addr_a".to_string(),
+            ok: true,
+            open_order_count: Some(0),
+            asset_positions: Some(1),
+            position_summaries: Vec::new(),
+            account_value: Some("90.0".to_string()),
+            withdrawable: Some("80.0".to_string()),
+            total_ntl_pos: Some("340.0".to_string()),
+            total_margin_used: Some("34.0".to_string()),
+            error: None,
+        }];
+        let account_caps = HashMap::from([("addr_a".to_string(), 350.0)]);
+
+        let contract = super::copy_live_daemon_submit_plan_contract_with_account_caps(
+            &options,
+            &[open_ref],
+            &[],
+            20.0,
+            0.02,
+            &reconciliations,
+            &account_caps,
+        );
+
+        assert!(!contract.ok, "{contract:#?}");
+        assert!(
+            contract
+                .checks
+                .iter()
+                .any(|check| check.name == "bounded_account_total_exposure" && !check.ok),
+            "{contract:#?}"
+        );
+    }
+
+    #[test]
     fn copy_live_daemon_margin_resize_leaves_reduce_only_refs_untouched() {
         let refs = vec![CopyLiveDaemonWouldSubmitRef {
             record_index: 0,
@@ -4022,6 +4135,8 @@ mod tests {
 
     #[test]
     fn copy_live_daemon_follow_position_allows_different_symbol_under_symbol_cap() {
+        let mut options = follow_position_options();
+        options.max_total_notional_usd = 100.0;
         let open_entry = crate::strategies::smart_money::CopyLedgerEntry {
             local_account_id: "addr_a".to_string(),
             leader_id: "leader_a".to_string(),
@@ -4063,7 +4178,7 @@ mod tests {
 
         let (prepared, suppressed) = copy_live_daemon_prepare_refs_for_follow_position_limits(
             &[open_ref],
-            &follow_position_options(),
+            &options,
             &persistence,
             &[],
         );
@@ -6592,6 +6707,7 @@ mod tests {
             0.0,
             &flat,
             Some(&live_submit),
+            &HashMap::new(),
         );
 
         assert!(live_submit.ok);
@@ -10730,14 +10846,16 @@ async fn run_copy_live_daemon_supervisor(
                                     );
                                 let pending_estimated_fees_usd =
                                     normalize_report_zero(pending_planned_notional_usd * 0.001);
-                                let immediate_contract = copy_live_daemon_submit_plan_contract(
-                                    &options,
-                                    &pending_executable_refs,
-                                    &candidate_suppressed_refs,
-                                    pending_planned_notional_usd,
-                                    pending_estimated_fees_usd,
-                                    &immediate_reconciliations,
-                                );
+                                let immediate_contract =
+                                    copy_live_daemon_submit_plan_contract_with_account_caps(
+                                        &options,
+                                        &pending_executable_refs,
+                                        &candidate_suppressed_refs,
+                                        pending_planned_notional_usd,
+                                        pending_estimated_fees_usd,
+                                        &immediate_reconciliations,
+                                        &account_symbol_caps,
+                                    );
                                 let (
                                     pending_executable_refs,
                                     mut contract_suppressed_refs,
@@ -10750,6 +10868,7 @@ async fn run_copy_live_daemon_supervisor(
                                     pending_estimated_fees_usd,
                                     &immediate_reconciliations,
                                     immediate_contract,
+                                    &account_symbol_caps,
                                 );
                                 let mut candidate_suppressed_refs = candidate_suppressed_refs;
                                 candidate_suppressed_refs.append(&mut contract_suppressed_refs);
@@ -10922,13 +11041,14 @@ async fn run_copy_live_daemon_supervisor(
     let planned_notional_usd =
         copy_live_daemon_open_notional_usd_from_orders(&executable_would_submit_orders);
     let estimated_fees_usd = normalize_report_zero(planned_notional_usd * 0.001);
-    let submit_plan_contract = copy_live_daemon_submit_plan_contract(
+    let submit_plan_contract = copy_live_daemon_submit_plan_contract_with_account_caps(
         &options,
         &executable_submit_plan_refs,
         &suppressed_submit_plan_refs,
         planned_notional_usd,
         estimated_fees_usd,
         &pre_submit_reconciliations,
+        &account_symbol_caps,
     );
     let (
         executable_submit_plan_refs,
@@ -10942,6 +11062,7 @@ async fn run_copy_live_daemon_supervisor(
         estimated_fees_usd,
         &pre_submit_reconciliations,
         submit_plan_contract,
+        &account_symbol_caps,
     );
     suppressed_submit_plan_refs.append(&mut contract_suppressed_submit_plan_refs);
     suppressed_submit_plan_refs = copy_live_daemon_pending_suppressed_refs(
@@ -11035,13 +11156,14 @@ async fn run_copy_live_daemon_supervisor(
                 message: suppressed.message.clone(),
             })
             .collect::<Vec<_>>();
-        submit_plan_contract = copy_live_daemon_submit_plan_contract(
+        submit_plan_contract = copy_live_daemon_submit_plan_contract_with_account_caps(
             &options,
             &executable_submit_plan_refs,
             &suppressed_submit_plan_refs,
             planned_notional_usd,
             estimated_fees_usd,
             &pre_submit_reconciliations,
+            &account_symbol_caps,
         );
     }
     if options.submit
@@ -11142,18 +11264,20 @@ async fn run_copy_live_daemon_supervisor(
     ));
     let final_reconciliations =
         reconcile_copy_bounded_window_accounts(config, &target_accounts).await;
-    let final_reconcile_health_ok = copy_live_daemon_reconciliations_healthy_for_snapshot(
-        &options,
-        &final_reconciliations,
-        &saved,
-    );
+    let final_reconcile_health_ok =
+        copy_live_daemon_reconciliations_healthy_for_mode_with_account_caps(
+            &options,
+            &final_reconciliations,
+            &account_symbol_caps,
+        ) && copy_live_daemon_unmapped_position_keys(&saved, &final_reconciliations).is_empty();
     checks.push(copy_shadow_smoke_check(
         "final_reconcile_health",
         final_reconcile_health_ok,
-        copy_live_daemon_reconcile_health_detail_for_snapshot(
+        copy_live_daemon_reconcile_health_detail_for_snapshot_with_account_caps(
             &options,
             &final_reconciliations,
             &saved,
+            &account_symbol_caps,
         ),
     ));
     let submit_evidence_contract = copy_live_daemon_submit_evidence_contract(
@@ -11164,6 +11288,7 @@ async fn run_copy_live_daemon_supervisor(
         estimated_fees_usd,
         &final_reconciliations,
         options.submit.then_some(&persistent_live_submit),
+        &account_symbol_caps,
     );
     let ok = copy_live_daemon_supervisor_ok(
         options.submit,
@@ -11431,19 +11556,61 @@ fn copy_live_daemon_watcher_progress_check(
     )
 }
 
+#[cfg(test)]
 fn copy_live_daemon_reconciliations_healthy_for_mode(
     options: &CopyLiveDaemonSupervisorOptions,
     reconciliations: &[CopyBoundedLiveWindowReconcile],
 ) -> bool {
-    !reconciliations.is_empty()
-        && reconciliations
-            .iter()
-            .all(|reconcile| copy_live_daemon_reconcile_healthy_for_mode(options, reconcile))
+    copy_live_daemon_reconciliations_healthy_for_mode_with_account_caps(
+        options,
+        reconciliations,
+        &HashMap::new(),
+    )
 }
 
+fn copy_live_daemon_reconciliations_healthy_for_mode_with_account_caps(
+    options: &CopyLiveDaemonSupervisorOptions,
+    reconciliations: &[CopyBoundedLiveWindowReconcile],
+    account_exposure_caps: &HashMap<String, f64>,
+) -> bool {
+    !reconciliations.is_empty()
+        && reconciliations.iter().all(|reconcile| {
+            copy_live_daemon_reconcile_healthy_for_mode_with_account_caps(
+                options,
+                reconcile,
+                account_exposure_caps,
+            )
+        })
+}
+
+#[cfg(test)]
 fn copy_live_daemon_reconcile_healthy_for_mode(
     options: &CopyLiveDaemonSupervisorOptions,
     reconcile: &CopyBoundedLiveWindowReconcile,
+) -> bool {
+    copy_live_daemon_reconcile_healthy_for_mode_with_account_caps(
+        options,
+        reconcile,
+        &HashMap::new(),
+    )
+}
+
+fn copy_live_daemon_account_exposure_cap(
+    options: &CopyLiveDaemonSupervisorOptions,
+    account_exposure_caps: &HashMap<String, f64>,
+    account_id: &str,
+) -> f64 {
+    account_exposure_caps
+        .get(account_id)
+        .copied()
+        .filter(|cap| cap.is_finite() && *cap > 0.0)
+        .unwrap_or(options.max_total_notional_usd)
+}
+
+fn copy_live_daemon_reconcile_healthy_for_mode_with_account_caps(
+    options: &CopyLiveDaemonSupervisorOptions,
+    reconcile: &CopyBoundedLiveWindowReconcile,
+    account_exposure_caps: &HashMap<String, f64>,
 ) -> bool {
     if !options.hold_positions_after_submit {
         return reconcile.ok;
@@ -11458,9 +11625,15 @@ fn copy_live_daemon_reconcile_healthy_for_mode(
     else {
         return false;
     };
-    total_ntl_pos.abs() <= options.max_total_notional_usd + 1e-6
+    let account_cap = copy_live_daemon_account_exposure_cap(
+        options,
+        account_exposure_caps,
+        &reconcile.account_id,
+    );
+    total_ntl_pos.abs() <= account_cap + 1e-6
 }
 
+#[cfg(test)]
 fn copy_live_daemon_reconciliations_healthy_for_snapshot(
     options: &CopyLiveDaemonSupervisorOptions,
     reconciliations: &[CopyBoundedLiveWindowReconcile],
@@ -11470,14 +11643,21 @@ fn copy_live_daemon_reconciliations_healthy_for_snapshot(
         && copy_live_daemon_unmapped_position_keys(snapshot, reconciliations).is_empty()
 }
 
-fn copy_live_daemon_reconcile_health_detail(
+fn copy_live_daemon_reconcile_health_detail_with_account_caps(
     options: &CopyLiveDaemonSupervisorOptions,
     reconciliations: &[CopyBoundedLiveWindowReconcile],
+    account_exposure_caps: &HashMap<String, f64>,
 ) -> String {
     if options.hold_positions_after_submit {
         let healthy_count = reconciliations
             .iter()
-            .filter(|reconcile| copy_live_daemon_reconcile_healthy_for_mode(options, reconcile))
+            .filter(|reconcile| {
+                copy_live_daemon_reconcile_healthy_for_mode_with_account_caps(
+                    options,
+                    reconcile,
+                    account_exposure_caps,
+                )
+            })
             .count();
         let no_open_orders = reconciliations
             .iter()
@@ -11493,11 +11673,26 @@ fn copy_live_daemon_reconcile_health_detail(
             })
             .map(f64::abs)
             .fold(0.0_f64, f64::max);
+        let cap_detail = if account_exposure_caps.is_empty() {
+            format!("global fallback cap {:.6}", options.max_total_notional_usd)
+        } else {
+            reconciliations
+                .iter()
+                .map(|reconcile| {
+                    let cap = copy_live_daemon_account_exposure_cap(
+                        options,
+                        account_exposure_caps,
+                        &reconcile.account_id,
+                    );
+                    format!("{}<= {:.6}", reconcile.account_id, cap)
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
         format!(
-            "follow-position mode: {healthy_count}/{} account(s) healthy, {no_open_orders}/{} account(s) have no open orders, max_total_ntl_pos={max_total_ntl:.6} must be <= {:.6}; positions may remain until target close signals",
+            "follow-position mode: {healthy_count}/{} account(s) healthy, {no_open_orders}/{} account(s) have no open orders, max_total_ntl_pos={max_total_ntl:.6}; per-account exposure caps: {cap_detail}; positions may remain until target close signals",
             reconciliations.len(),
-            reconciliations.len(),
-            options.max_total_notional_usd
+            reconciliations.len()
         )
     } else {
         format!(
@@ -11511,12 +11706,31 @@ fn copy_live_daemon_reconcile_health_detail(
     }
 }
 
+#[cfg(test)]
 fn copy_live_daemon_reconcile_health_detail_for_snapshot(
     options: &CopyLiveDaemonSupervisorOptions,
     reconciliations: &[CopyBoundedLiveWindowReconcile],
     snapshot: &strategies::smart_money::CopyPersistenceSnapshot,
 ) -> String {
-    let base = copy_live_daemon_reconcile_health_detail(options, reconciliations);
+    copy_live_daemon_reconcile_health_detail_for_snapshot_with_account_caps(
+        options,
+        reconciliations,
+        snapshot,
+        &HashMap::new(),
+    )
+}
+
+fn copy_live_daemon_reconcile_health_detail_for_snapshot_with_account_caps(
+    options: &CopyLiveDaemonSupervisorOptions,
+    reconciliations: &[CopyBoundedLiveWindowReconcile],
+    snapshot: &strategies::smart_money::CopyPersistenceSnapshot,
+    account_exposure_caps: &HashMap<String, f64>,
+) -> String {
+    let base = copy_live_daemon_reconcile_health_detail_with_account_caps(
+        options,
+        reconciliations,
+        account_exposure_caps,
+    );
     let unmapped = copy_live_daemon_unmapped_position_keys(snapshot, reconciliations);
     if unmapped.is_empty() {
         return base;
@@ -11577,6 +11791,7 @@ fn copy_live_daemon_submit_evidence_contract(
     estimated_fees_usd: f64,
     final_reconciliations: &[CopyBoundedLiveWindowReconcile],
     persistent_live_submit: Option<&CopyLiveDaemonPersistentLiveSubmitReport>,
+    account_exposure_caps: &HashMap<String, f64>,
 ) -> CopyLiveDaemonSubmitEvidenceContract {
     let cleanup_or_hold_evidence = if options.hold_positions_after_submit {
         "every accepted open is held under follow-position health gates until a mapped target close signal"
@@ -11661,11 +11876,16 @@ fn copy_live_daemon_submit_evidence_contract(
         copy_shadow_smoke_check(
             "flat_reconcile_policy",
             acceptance.require_flat_reconcile_after_submit
-                && copy_live_daemon_reconciliations_healthy_for_mode(
+                && copy_live_daemon_reconciliations_healthy_for_mode_with_account_caps(
                     options,
                     final_reconciliations,
+                    account_exposure_caps,
                 ),
-            copy_live_daemon_reconcile_health_detail(options, final_reconciliations),
+            copy_live_daemon_reconcile_health_detail_with_account_caps(
+                options,
+                final_reconciliations,
+                account_exposure_caps,
+            ),
         ),
         copy_shadow_smoke_check(
             "strict_order_evidence_policy",
@@ -11720,6 +11940,7 @@ fn copy_live_daemon_submit_evidence_contract(
     }
 }
 
+#[cfg(test)]
 fn copy_live_daemon_submit_plan_contract(
     options: &CopyLiveDaemonSupervisorOptions,
     executable_refs: &[CopyLiveDaemonWouldSubmitRef],
@@ -11727,6 +11948,26 @@ fn copy_live_daemon_submit_plan_contract(
     planned_notional_usd: f64,
     estimated_fees_usd: f64,
     final_reconciliations: &[CopyBoundedLiveWindowReconcile],
+) -> CopyLiveDaemonSubmitPlanContract {
+    copy_live_daemon_submit_plan_contract_with_account_caps(
+        options,
+        executable_refs,
+        suppressed_refs,
+        planned_notional_usd,
+        estimated_fees_usd,
+        final_reconciliations,
+        &HashMap::new(),
+    )
+}
+
+fn copy_live_daemon_submit_plan_contract_with_account_caps(
+    options: &CopyLiveDaemonSupervisorOptions,
+    executable_refs: &[CopyLiveDaemonWouldSubmitRef],
+    suppressed_refs: &[CopyLiveDaemonSuppressedWouldSubmitRef],
+    planned_notional_usd: f64,
+    estimated_fees_usd: f64,
+    final_reconciliations: &[CopyBoundedLiveWindowReconcile],
+    account_exposure_caps: &HashMap<String, f64>,
 ) -> CopyLiveDaemonSubmitPlanContract {
     let executable_cloids = executable_refs
         .iter()
@@ -11779,9 +12020,58 @@ fn copy_live_daemon_submit_plan_contract(
         .fold(0.0f64, f64::max);
     let projected_total_exposure_usd =
         normalize_report_zero(max_existing_total_ntl_pos_usd + planned_open_notional_usd);
-    let bounded_account_total_exposure_ok = planned_open_notional_usd <= 1e-9
-        || (!existing_total_ntl_values.is_empty()
-            && projected_total_exposure_usd <= options.max_total_notional_usd + 1e-9);
+    let existing_total_ntl_by_account = final_reconciliations
+        .iter()
+        .filter_map(|reconcile| {
+            let value = reconcile
+                .total_ntl_pos
+                .as_deref()
+                .and_then(|value| value.parse::<f64>().ok())?
+                .abs();
+            Some((reconcile.account_id.clone(), value))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut planned_open_notional_by_account = HashMap::<String, f64>::new();
+    for plan in executable_refs
+        .iter()
+        .filter(|plan| !plan.order.reduce_only)
+    {
+        *planned_open_notional_by_account
+            .entry(plan.order.account_id.clone())
+            .or_insert(0.0) += plan.order.notional_usd.max(0.0);
+    }
+    let account_exposure_details = planned_open_notional_by_account
+        .iter()
+        .map(|(account_id, planned)| {
+            let cap =
+                copy_live_daemon_account_exposure_cap(options, account_exposure_caps, account_id);
+            match existing_total_ntl_by_account.get(account_id) {
+                Some(existing) => {
+                    let projected = normalize_report_zero(*existing + *planned);
+                    (
+                        projected <= cap + 1e-9,
+                        format!(
+                            "{account_id}: existing_total_ntl_pos_usd={existing:.6} + planned_open_notional_usd={planned:.6} => projected_total_exposure_usd={projected:.6}, must be <= {cap:.6}"
+                        ),
+                    )
+                }
+                None => (
+                    false,
+                    format!(
+                        "{account_id}: planned_open_notional_usd={planned:.6} requires a successful account total_ntl_pos reconciliation before live submit"
+                    ),
+                ),
+            }
+        })
+        .collect::<Vec<_>>();
+    let bounded_account_total_exposure_ok = if planned_open_notional_usd <= 1e-9 {
+        true
+    } else if account_exposure_caps.is_empty() {
+        !existing_total_ntl_values.is_empty()
+            && projected_total_exposure_usd <= options.max_total_notional_usd + 1e-9
+    } else {
+        !account_exposure_details.is_empty() && account_exposure_details.iter().all(|(ok, _)| *ok)
+    };
     let open_margin_requirements =
         copy_live_daemon_open_margin_requirements(executable_refs, estimated_fees_usd);
     let open_margin_check =
@@ -11859,6 +12149,12 @@ fn copy_live_daemon_submit_plan_contract(
                 format!(
                     "planned_open_notional_usd={planned_open_notional_usd:.6} requires a successful account total_ntl_pos reconciliation before live submit"
                 )
+            } else if !account_exposure_caps.is_empty() {
+                account_exposure_details
+                    .iter()
+                    .map(|(_, detail)| detail.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ")
             } else {
                 format!(
                     "existing_total_ntl_pos_usd={max_existing_total_ntl_pos_usd:.6} + planned_open_notional_usd={planned_open_notional_usd:.6} => projected_total_exposure_usd={projected_total_exposure_usd:.6}, must be <= {:.6}",
@@ -11880,12 +12176,20 @@ fn copy_live_daemon_submit_plan_contract(
             if reduce_only_only_plan {
                 copy_live_daemon_reconciliations_ready_for_reduce_only(final_reconciliations)
             } else {
-                copy_live_daemon_reconciliations_healthy_for_mode(options, final_reconciliations)
+                copy_live_daemon_reconciliations_healthy_for_mode_with_account_caps(
+                    options,
+                    final_reconciliations,
+                    account_exposure_caps,
+                )
             },
             if reduce_only_only_plan {
                 copy_live_daemon_reduce_only_reconcile_health_detail(final_reconciliations)
             } else {
-                copy_live_daemon_reconcile_health_detail(options, final_reconciliations)
+                copy_live_daemon_reconcile_health_detail_with_account_caps(
+                    options,
+                    final_reconciliations,
+                    account_exposure_caps,
+                )
             },
         ),
     ];
@@ -11986,6 +12290,7 @@ fn copy_live_daemon_suppress_refs_rejected_by_submit_contract(
     estimated_fees_usd: f64,
     reconciliations: &[CopyBoundedLiveWindowReconcile],
     contract: CopyLiveDaemonSubmitPlanContract,
+    account_exposure_caps: &HashMap<String, f64>,
 ) -> (
     Vec<CopyLiveDaemonWouldSubmitRef>,
     Vec<CopyLiveDaemonSuppressedWouldSubmitRef>,
@@ -12065,13 +12370,14 @@ fn copy_live_daemon_suppress_refs_rejected_by_submit_contract(
     } else {
         0.0
     };
-    let adjusted_contract = copy_live_daemon_submit_plan_contract(
+    let adjusted_contract = copy_live_daemon_submit_plan_contract_with_account_caps(
         options,
         &retained_executable,
         &all_suppressed_refs,
         adjusted_planned_notional_usd,
         adjusted_estimated_fees_usd,
         reconciliations,
+        account_exposure_caps,
     );
     (retained_executable, newly_suppressed, adjusted_contract)
 }
@@ -14902,6 +15208,7 @@ fn copy_live_daemon_prepare_refs_for_follow_position_limits_with_symbol_caps(
         .collect::<HashSet<_>>();
     let mut pending_by_key = HashMap::<(String, String, String), f64>::new();
     let mut effective_exposure_by_symbol = HashMap::<(String, String), f64>::new();
+    let mut effective_exposure_by_account = HashMap::<String, f64>::new();
     let mut live_exposure_by_symbol = reconciliations
         .iter()
         .filter(|reconcile| reconcile.error.is_none())
@@ -14974,6 +15281,9 @@ fn copy_live_daemon_prepare_refs_for_follow_position_limits_with_symbol_caps(
             *effective_exposure_by_symbol
                 .entry((entry.local_account_id.clone(), entry.coin.clone()))
                 .or_insert(0.0) += exposure_delta;
+            *effective_exposure_by_account
+                .entry(entry.local_account_id.clone())
+                .or_insert(0.0) += exposure_delta;
         }
         if !matches!(
             entry.status,
@@ -15041,16 +15351,19 @@ fn copy_live_daemon_prepare_refs_for_follow_position_limits_with_symbol_caps(
                 .copied()
                 .map(|value| value.max(0.0));
             let current_exposure = live_account_exposure.unwrap_or_else(|| {
-                effective_exposure_by_symbol
-                    .get(&exposure_key)
+                effective_exposure_by_account
+                    .get(&plan.order.account_id)
                     .copied()
                     .unwrap_or(0.0)
                     .max(0.0)
             });
             let next_exposure = current_exposure + plan.order.notional_usd.max(0.0);
-            if options.hold_positions_after_submit
-                && next_exposure > options.max_total_notional_usd + 1e-9
-            {
+            let account_cap = copy_live_daemon_account_exposure_cap(
+                options,
+                account_symbol_caps,
+                &plan.order.account_id,
+            );
+            if options.hold_positions_after_submit && next_exposure > account_cap + 1e-9 {
                 let exposure_source = if live_account_exposure.is_some() {
                     "live account"
                 } else {
@@ -15061,7 +15374,7 @@ fn copy_live_daemon_prepare_refs_for_follow_position_limits_with_symbol_caps(
                     reason_code: "COPY_DAEMON_MAX_ACCOUNT_EXPOSURE".to_string(),
                     message: format!(
                         "follow-position {exposure_source} exposure would become {next_exposure:.6}, above cap {:.6}; existing exposure {:.6}, candidate {:.6}",
-                        options.max_total_notional_usd,
+                        account_cap,
                         current_exposure,
                         plan.order.notional_usd
                     ),
@@ -15071,7 +15384,10 @@ fn copy_live_daemon_prepare_refs_for_follow_position_limits_with_symbol_caps(
                     live_exposure_by_account.insert(plan.order.account_id.clone(), next_exposure);
                     live_exposure_by_symbol.insert(exposure_key, next_symbol_exposure);
                 } else {
-                    effective_exposure_by_symbol.insert(exposure_key, next_exposure);
+                    let next_account_exposure = next_exposure;
+                    effective_exposure_by_account
+                        .insert(plan.order.account_id.clone(), next_account_exposure);
+                    effective_exposure_by_symbol.insert(exposure_key, next_symbol_exposure);
                 }
                 prepared.push(plan.clone());
             }
