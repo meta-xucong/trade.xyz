@@ -253,6 +253,101 @@ function Get-PositionTruthRiskDiagnostic {
     return "unattributed_position_value_usd=$unattributedValue count=$($truth.unattributed_position_count) positions=$positionText"
 }
 
+function Get-ResolvedBotExePath {
+    $resolvedBotExePath = $BotExePath
+    if ([string]::IsNullOrWhiteSpace($resolvedBotExePath)) {
+        $resolvedBotExePath = $env:TRADE_XYZ_BOT_EXE
+    }
+    return $resolvedBotExePath
+}
+
+function Invoke-UnattributedLedgerRecovery {
+    param([string]$Diagnostic)
+    $resolvedBotExePath = Get-ResolvedBotExePath
+    if ([string]::IsNullOrWhiteSpace($resolvedBotExePath) -or -not (Test-Path -LiteralPath $resolvedBotExePath)) {
+        Write-MonitorLog "unattributed recovery skipped; bot exe unavailable path=$resolvedBotExePath"
+        return $false
+    }
+    $status = $null
+    try {
+        $statusResponse = Invoke-Json "/api/copy/live-soak/status"
+        if ($statusResponse.ok) {
+            $status = $statusResponse.data
+        }
+    } catch {
+        Write-MonitorLog "unattributed recovery status lookup failed: $($_.Exception.Message)"
+    }
+    $runId = if ($null -ne $status -and -not [string]::IsNullOrWhiteSpace([string]$status.run_id)) {
+        [string]$status.run_id
+    } else {
+        Get-Date -Format "yyyyMMdd-HHmmss"
+    }
+    $shadowPath = ".codex-longrun\persistent-live-soak-$runId-shadow.jsonl"
+    if ($null -ne $status -and -not [string]::IsNullOrWhiteSpace([string]$status.latest_log_path)) {
+        $candidate = [string]$status.latest_log_path
+        if ($candidate -match "persistent-live-soak-(.+?)-run\.log$") {
+            $shadowPath = ".codex-longrun\persistent-live-soak-$($Matches[1])-shadow.jsonl"
+        }
+    }
+
+    $runtimeAccountIds = Get-RuntimeAccountIds
+    $runtimeMarkets = Get-RuntimeMarkets
+    $args = @("copy-live-daemon-supervisor", "--config", "V2\config\local.toml")
+    for ($index = 0; $index -lt $Leaders.Count; $index++) {
+        $leaderAddress = [string]$Leaders[$index]
+        if (-not [string]::IsNullOrWhiteSpace($leaderAddress)) {
+            $args += @("--leader", "leader_$($index + 1)=$leaderAddress")
+        }
+    }
+    foreach ($market in $runtimeMarkets) {
+        $args += @("--market", $market)
+    }
+    foreach ($accountId in $runtimeAccountIds) {
+        $args += @("--account-id", $accountId)
+    }
+    $args += @(
+        "--side", "buy",
+        "--persistence", $PersistencePath,
+        "--shadow-history", $shadowPath,
+        "--leader-notional-usd", "1750",
+        "--leader-size", "1",
+        "--duration-secs", "2",
+        "--max-events", "1",
+        "--max-live-orders", "2",
+        "--max-total-notional-usd", [string]$MaxTotalNotionalUsd,
+        "--max-total-fees-usd", [string]$MaxTotalFeesUsd,
+        "--max-slippage-bps", "50",
+        "--cleanup-max-slippage-bps", "50",
+        "--hold-positions-after-submit", "true",
+        "--live-gate", "true",
+        "--allow-live-submit", "false",
+        "--confirm-mainnet-live", "true",
+        "--submit", "false"
+    )
+    $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+    $recoveryReportPath = ".codex-longrun\copy-unattributed-ledger-recovery-$stamp.json"
+    Write-MonitorLog "unattributed recovery starting run_id=$runId shadow=$shadowPath report=$recoveryReportPath diagnostic=$Diagnostic"
+    try {
+        $output = & $resolvedBotExePath @args 2>&1 | Out-String
+        Set-Content -LiteralPath $recoveryReportPath -Value $output -Encoding utf8
+        $exitCode = $LASTEXITCODE
+        if ($exitCode -ne 0) {
+            Write-MonitorLog "unattributed recovery failed exit_code=$exitCode report=$recoveryReportPath"
+            return $false
+        }
+    } catch {
+        Write-MonitorLog "unattributed recovery command failed: $($_.Exception.Message)"
+        return $false
+    }
+    $remainingRisk = Get-PositionTruthRiskDiagnostic
+    if ([string]::IsNullOrWhiteSpace($remainingRisk)) {
+        Write-MonitorLog "unattributed recovery succeeded; position truth risk cleared report=$recoveryReportPath"
+        return $true
+    }
+    Write-MonitorLog "unattributed recovery did not clear risk; remaining=$remainingRisk report=$recoveryReportPath"
+    return $false
+}
+
 function Get-LatestRunDiagnostic {
     try {
         $status = Invoke-Json "/api/copy/live-soak/status"
@@ -770,10 +865,21 @@ while ($true) {
             $diagnostic = "position_truth_unattributed_live_exposure; $positionTruthRisk"
             Write-MonitorLog "detected stopped soak; diagnostic: $diagnostic"
             if (Test-StopCandidateConfirmed -Reason "position_truth_unattributed" -Diagnostic $diagnostic) {
-                Send-ConfirmedStopNotification -Reason "position_truth_unattributed" -Diagnostic $diagnostic
-                Set-Content -LiteralPath $copyLiveSoakPausePath -Value "position_truth_unattributed $(Get-Date -Format o)" -Encoding ascii
-                Stop-SoakProcessesForRestart -Reason "position_truth_unattributed"
-                Reset-StopCandidate "paused_after_position_truth_risk"
+                try {
+                    Stop-SoakProcessesForRestart -Reason "position_truth_unattributed_recovery"
+                    if (Invoke-UnattributedLedgerRecovery -Diagnostic $diagnostic) {
+                        Reset-StopCandidate "recovered_after_position_truth_risk"
+                        Start-CopyLiveSoak
+                    } else {
+                        Send-ConfirmedStopNotification -Reason "position_truth_unattributed" -Diagnostic $diagnostic
+                        Set-Content -LiteralPath $copyLiveSoakPausePath -Value "position_truth_unattributed $(Get-Date -Format o)" -Encoding ascii
+                        Reset-StopCandidate "paused_after_position_truth_risk"
+                    }
+                } catch {
+                    Send-ConfirmedStopNotification -Reason "position_truth_unattributed" -Diagnostic "$diagnostic; recovery_error=$($_.Exception.Message)"
+                    Set-Content -LiteralPath $copyLiveSoakPausePath -Value "position_truth_unattributed $(Get-Date -Format o)" -Encoding ascii
+                    Reset-StopCandidate "paused_after_position_truth_risk"
+                }
             }
             Start-Sleep -Seconds $PollSecs
             continue
