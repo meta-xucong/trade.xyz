@@ -2,7 +2,7 @@ param(
     [string]$BaseUrl = "http://127.0.0.1:18845",
     [int]$PollSecs = 60,
     [int]$WindowSecs = 600,
-    [int]$StaleRoundGraceSecs = 900,
+    [int]$StaleRoundGraceSecs = 1200,
     [double]$PrincipalCapUsd = 35.0,
     [double]$Leverage = 10.0,
     [double]$MaxTotalNotionalUsd = 0.0,

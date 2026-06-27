@@ -9173,7 +9173,7 @@ async fn read_copy_live_account_summaries(
         .unwrap_or_default();
 
     let local_summaries = tokio::time::timeout(
-        Duration::from_secs(5),
+        Duration::from_secs(8),
         read_copy_live_local_account_rows(
             &config,
             &state.realtime,
@@ -9187,7 +9187,7 @@ async fn read_copy_live_account_summaries(
     let local_summary = aggregate_copy_local_account_summaries(&local_summaries);
 
     let targets = tokio::time::timeout(
-        Duration::from_secs(5),
+        Duration::from_secs(8),
         read_copy_live_target_account_rows(
             &config,
             &state.realtime,
@@ -9438,9 +9438,13 @@ async fn copy_live_account_market_observation(
         };
         let observed = state.is_some();
         let positions = if let Some(ref state) = state {
-            let spot_snapshot = fetch_spot_market_snapshot_cached(&config.app.environment, 15_000)
-                .await
-                .ok();
+            let spot_snapshot = tokio::time::timeout(
+                Duration::from_secs(1),
+                fetch_spot_market_snapshot_cached(&config.app.environment, 15_000),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok);
             copy_pnl_positions_from_spot(state, spot_snapshot.as_ref())
         } else {
             Vec::new()
@@ -10194,13 +10198,25 @@ fn copy_ledger_local_account_summaries_with_live_lineage(
             continue;
         };
         let summary = &mut summaries[summary_index];
+        let live_position_index_by_key = live
+            .positions
+            .iter()
+            .map(|position| copy_pnl_position_identity(position))
+            .collect::<HashSet<_>>();
+        let mut changed = false;
+        if live.truth_state.eq_ignore_ascii_case("current") {
+            let before_len = summary.positions.len();
+            summary.positions.retain(|position| {
+                live_position_index_by_key.contains(&copy_pnl_position_identity(position))
+            });
+            changed |= summary.positions.len() != before_len;
+        }
         let position_index_by_key = summary
             .positions
             .iter()
             .enumerate()
             .map(|(index, position)| (copy_pnl_position_identity(position), index))
             .collect::<HashMap<_, _>>();
-        let mut changed = false;
         for live_position in &live.positions {
             let position_key = copy_pnl_position_identity(live_position);
             let Some(position_index) = position_index_by_key.get(&position_key).copied() else {
@@ -10211,9 +10227,7 @@ fn copy_ledger_local_account_summaries_with_live_lineage(
                 continue;
             }
             let current_value = copy_pnl_position_value_usd(&summary.positions[position_index]);
-            if current_value <= DISPLAY_USD_EPSILON
-                || current_value + DISPLAY_USD_EPSILON >= live_value
-            {
+            if current_value <= DISPLAY_USD_EPSILON {
                 continue;
             }
             let lineage_value = lineage_values
@@ -10225,6 +10239,14 @@ fn copy_ledger_local_account_summaries_with_live_lineage(
                 .copied()
                 .unwrap_or_default();
             if lineage_value + DISPLAY_USD_EPSILON < live_value {
+                continue;
+            }
+            if current_value > live_value + DISPLAY_USD_EPSILON {
+                summary.positions[position_index] = live_position.clone();
+                changed = true;
+                continue;
+            }
+            if current_value + DISPLAY_USD_EPSILON >= live_value {
                 continue;
             }
             summary.positions[position_index] = live_position.clone();
@@ -19197,6 +19219,133 @@ mod tests {
                 .as_ref()
                 .is_none_or(|summary| summary.open_position_count == 0)
         );
+    }
+
+    #[test]
+    fn copy_summary_caps_stale_ledger_above_smaller_live_lineage_position() {
+        let configured = CopyUiSettings {
+            leaders: default_copy_leaders(),
+            markets: default_copy_markets(),
+            copy_ratio: 0.2,
+            principal_cap_usd: 35.0,
+            leverage: crate::strategies::smart_money::COPY_MAX_LEVERAGE,
+            account_id: "addr_a".to_string(),
+            account_ids: vec!["addr_a".to_string()],
+            updated_at_ms: 123,
+        };
+        let live_position = CopyPnlPositionSummary {
+            coin: "xyz:GBP".to_string(),
+            side: "long".to_string(),
+            size: 40.0,
+            position_value_usd: Some(53.052),
+            unrealized_pnl_usd: Some(-0.048454),
+            entry_px: Some(1.327511),
+        };
+        let local_a = CopyPnlAccountSummary {
+            id: "addr_a".to_string(),
+            kind: "local_live".to_string(),
+            truth_state: "current".to_string(),
+            unrealized_pnl_usd: Some(-0.048454),
+            total_pnl_usd: Some(-0.048454),
+            position_value_usd: Some(53.052),
+            open_position_count: 1,
+            positions: vec![live_position],
+            ..CopyPnlAccountSummary::default()
+        };
+        let live_accounts = CopyLiveAccountSummaries {
+            local: aggregate_copy_local_account_summaries(&[local_a.clone()]),
+            locals: vec![local_a],
+            targets: Vec::new(),
+        };
+        let ledger_entries = vec![crate::strategies::smart_money::CopyLedgerEntry {
+            local_account_id: "addr_a".to_string(),
+            leader_id: "leader_4".to_string(),
+            leader_group: "leader_4".to_string(),
+            signal_id: "copy-leader_4-open-gbp".to_string(),
+            coin: "xyz:GBP".to_string(),
+            local_side: OrderSide::Buy,
+            order_cloid: Some("cloid-open-gbp".to_string()),
+            order_oid: Some(481_300_502_879),
+            submitted_at_ms: Some(100),
+            filled_at_ms: Some(101),
+            planned_notional_usd: 201.7192,
+            pending_notional_usd: 0.0,
+            filled_notional_usd: 201.7192,
+            remaining_notional_usd: 149.2211,
+            status: crate::strategies::smart_money::CopyLedgerStatus::Open,
+        }];
+        let ledger_local_summaries = copy_ledger_local_account_summaries_with_live_lineage(
+            &test_app_config_with_addr_a(),
+            Some(&configured),
+            &ledger_entries,
+            &live_accounts.locals,
+        );
+
+        let summary = build_copy_summary_response_from_entries(
+            Vec::new(),
+            None,
+            3_000_000,
+            CopyPnlReportSummary::default(),
+            Some(&configured),
+            ledger_local_summaries,
+            Vec::new(),
+            live_accounts,
+        );
+
+        let copy_owned = summary.copy_owned_summary.expect("copy owned summary");
+        assert_eq!(copy_owned.open_position_count, 1);
+        assert_eq!(copy_owned.position_value_usd, Some(53.052));
+        assert_eq!(copy_owned.unrealized_pnl_usd, Some(-0.048454));
+    }
+
+    #[test]
+    fn copy_summary_drops_stale_ledger_position_when_current_live_account_is_flat() {
+        let configured = CopyUiSettings {
+            leaders: default_copy_leaders(),
+            markets: default_copy_markets(),
+            copy_ratio: 0.2,
+            principal_cap_usd: 35.0,
+            leverage: crate::strategies::smart_money::COPY_MAX_LEVERAGE,
+            account_id: "addr_a".to_string(),
+            account_ids: vec!["addr_a".to_string()],
+            updated_at_ms: 123,
+        };
+        let local_a = copy_pnl_account_summary_from_live_positions(
+            "addr_a".to_string(),
+            "local_live".to_string(),
+            "0x00000000000000000000000000000000000000aa".to_string(),
+            Vec::new(),
+            vec![MARKET_XYZ_PERP.to_string()],
+            Vec::new(),
+        );
+        let ledger_entries = vec![crate::strategies::smart_money::CopyLedgerEntry {
+            local_account_id: "addr_a".to_string(),
+            leader_id: "leader_4".to_string(),
+            leader_group: "leader_4".to_string(),
+            signal_id: "copy-leader_4-open-flat-gbp".to_string(),
+            coin: "xyz:GBP".to_string(),
+            local_side: OrderSide::Buy,
+            order_cloid: Some("cloid-flat-gbp".to_string()),
+            order_oid: Some(481_300_502_880),
+            submitted_at_ms: Some(100),
+            filled_at_ms: Some(101),
+            planned_notional_usd: 149.2211,
+            pending_notional_usd: 0.0,
+            filled_notional_usd: 149.2211,
+            remaining_notional_usd: 149.2211,
+            status: crate::strategies::smart_money::CopyLedgerStatus::Open,
+        }];
+
+        let ledger_local_summaries = copy_ledger_local_account_summaries_with_live_lineage(
+            &test_app_config_with_addr_a(),
+            Some(&configured),
+            &ledger_entries,
+            &[local_a],
+        );
+
+        assert_eq!(ledger_local_summaries.len(), 1);
+        assert_eq!(ledger_local_summaries[0].open_position_count, 0);
+        assert!(ledger_local_summaries[0].positions.is_empty());
     }
 
     #[test]

@@ -3,7 +3,7 @@ param(
     [int]$MaxRounds = 0,
     [int]$SleepSecs = 5,
     [int]$DegradedSleepSecs = 60,
-    [int]$RoundTimeoutBufferSecs = 1800,
+    [int]$RoundTimeoutBufferSecs = 900,
     [double]$MaxTotalNotionalUsd = 200.0,
     [double]$MaxTotalFeesUsd = 1.0,
     [int]$MaxEvents = 20000,
