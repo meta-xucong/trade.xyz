@@ -72,7 +72,10 @@ mod tests {
         copy_daemon_live_leverage_update_options,
         copy_daemon_live_leverage_update_options_with_max,
         copy_daemon_submitted_reports_needing_cleanup, copy_execution_canary_report,
-        copy_live_daemon_error_is_safe_pre_submit_skip, copy_live_daemon_live_submit_health_ok,
+        copy_live_daemon_defer_open_refs_after_immediate_live_submit,
+        copy_live_daemon_error_is_safe_pre_submit_skip,
+        copy_live_daemon_immediate_submit_should_stop_round,
+        copy_live_daemon_live_submit_health_ok,
         copy_live_daemon_merge_persistence_snapshots_for_save,
         copy_live_daemon_merge_persistent_live_submit_reports,
         copy_live_daemon_open_notional_usd_from_refs, copy_live_daemon_pending_plan_refs,
@@ -1219,6 +1222,80 @@ mod tests {
         let check = copy_live_daemon_watcher_progress_check("completed_duration", 0, 600, 600_000);
         assert!(check.ok, "{check:#?}");
         assert!(check.detail.contains("completed_duration"));
+    }
+
+    #[test]
+    fn copy_live_daemon_watcher_progress_allows_immediate_submit_stop() {
+        let check = copy_live_daemon_watcher_progress_check(
+            "stopped_after_immediate_live_submit",
+            42,
+            600,
+            45_000,
+        );
+        assert!(check.ok, "{check:#?}");
+        assert!(check.detail.contains("stopped_after_immediate_live_submit"));
+    }
+
+    #[test]
+    fn copy_live_daemon_immediate_submit_stop_requires_live_submission() {
+        let submitted_at_ms = now_ms();
+        let live_report = CopyLiveDaemonPersistentLiveSubmitReport {
+            ok: true,
+            mode: "persistent_live_submit".to_string(),
+            submit_requested: true,
+            submit_plan_contract_ok: true,
+            submitted_reports: vec![crate::domain::WorkerReport::Submitted(
+                crate::domain::OrderSubmitted {
+                    signal_id: "sig-live".to_string(),
+                    intent_id: "intent-live".to_string(),
+                    worker_id: "worker-addr_a".to_string(),
+                    account_id: "addr_a".to_string(),
+                    cloid: "11111111-1111-5111-8111-111111111111".to_string(),
+                    coin: "xyz:QNT".to_string(),
+                    side: crate::domain::OrderSide::Sell,
+                    notional_usd: 50.0,
+                    submitted_price: Some(74.0),
+                    submitted_size: Some(0.67),
+                    exchange_status: Some("filled".to_string()),
+                    oid: Some(90001),
+                    filled_size: Some(0.67),
+                    avg_fill_price: Some(74.0),
+                    dry_run: false,
+                    submitted_at_ms,
+                },
+            )],
+            order_evidence: Vec::new(),
+            cleanup_runbooks: Vec::new(),
+            cleanup_errors: Vec::new(),
+            ledger_reconciliations: Vec::new(),
+            ledger_reconciliation_snapshot:
+                crate::strategies::smart_money::CopyPersistenceSnapshot {
+                    schema_version: 1,
+                    saved_at_ms: submitted_at_ms,
+                    seen_event_keys: Vec::new(),
+                    ledger_entries: Vec::new(),
+                },
+            checks: Vec::new(),
+        };
+        assert!(copy_live_daemon_immediate_submit_should_stop_round(
+            &live_report
+        ));
+
+        let mut dry_run_report = live_report.clone();
+        if let crate::domain::WorkerReport::Submitted(submitted) =
+            &mut dry_run_report.submitted_reports[0]
+        {
+            submitted.dry_run = true;
+        }
+        assert!(!copy_live_daemon_immediate_submit_should_stop_round(
+            &dry_run_report
+        ));
+
+        let mut empty_report = live_report;
+        empty_report.submitted_reports.clear();
+        assert!(!copy_live_daemon_immediate_submit_should_stop_round(
+            &empty_report
+        ));
     }
 
     #[test]
@@ -6794,6 +6871,101 @@ mod tests {
     }
 
     #[test]
+    fn copy_live_daemon_defers_open_refs_after_immediate_live_submit() {
+        let open_ref = CopyLiveDaemonWouldSubmitRef {
+            record_index: 0,
+            signal_id: "sig-open".to_string(),
+            leader_id: "leader_a".to_string(),
+            leader_address: "0x00000000000000000000000000000000000000aa".to_string(),
+            order: CopyExecutionCanaryWouldSubmit {
+                account_id: "addr_a".to_string(),
+                worker_id: "worker-addr_a".to_string(),
+                coin: "xyz:QNT".to_string(),
+                side: crate::domain::OrderSide::Sell,
+                notional_usd: 120.0,
+                reduce_only: false,
+                cloid: "00000000-0000-0000-0000-000000000011".to_string(),
+            },
+        };
+        let reduce_ref = CopyLiveDaemonWouldSubmitRef {
+            record_index: 1,
+            signal_id: "sig-reduce".to_string(),
+            leader_id: "leader_a".to_string(),
+            leader_address: "0x00000000000000000000000000000000000000aa".to_string(),
+            order: CopyExecutionCanaryWouldSubmit {
+                account_id: "addr_a".to_string(),
+                worker_id: "worker-addr_a".to_string(),
+                coin: "xyz:QNT".to_string(),
+                side: crate::domain::OrderSide::Buy,
+                notional_usd: 25.0,
+                reduce_only: true,
+                cloid: "00000000-0000-0000-0000-000000000012".to_string(),
+            },
+        };
+        let submitted_at_ms = now_ms();
+        let live_chunk = CopyLiveDaemonPersistentLiveSubmitReport {
+            ok: true,
+            mode: "persistent_live_submit".to_string(),
+            submit_requested: true,
+            submit_plan_contract_ok: true,
+            submitted_reports: vec![crate::domain::WorkerReport::Submitted(
+                crate::domain::OrderSubmitted {
+                    signal_id: "sig-live".to_string(),
+                    intent_id: "intent-live".to_string(),
+                    worker_id: "worker-addr_a".to_string(),
+                    account_id: "addr_a".to_string(),
+                    cloid: "00000000-0000-0000-0000-000000000010".to_string(),
+                    coin: "xyz:QNT".to_string(),
+                    side: crate::domain::OrderSide::Sell,
+                    notional_usd: 50.0,
+                    submitted_price: Some(74.0),
+                    submitted_size: Some(0.67),
+                    exchange_status: Some("filled".to_string()),
+                    oid: Some(90010),
+                    filled_size: Some(0.67),
+                    avg_fill_price: Some(74.0),
+                    dry_run: false,
+                    submitted_at_ms,
+                },
+            )],
+            order_evidence: Vec::new(),
+            cleanup_runbooks: Vec::new(),
+            cleanup_errors: Vec::new(),
+            ledger_reconciliations: Vec::new(),
+            ledger_reconciliation_snapshot:
+                crate::strategies::smart_money::CopyPersistenceSnapshot {
+                    schema_version: 1,
+                    saved_at_ms: submitted_at_ms,
+                    seen_event_keys: Vec::new(),
+                    ledger_entries: Vec::new(),
+                },
+            checks: Vec::new(),
+        };
+
+        let (pending, suppressed) = copy_live_daemon_defer_open_refs_after_immediate_live_submit(
+            vec![open_ref.clone(), reduce_ref.clone()],
+            std::slice::from_ref(&live_chunk),
+        );
+
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].signal_id, reduce_ref.signal_id);
+        assert_eq!(suppressed.len(), 1);
+        assert_eq!(suppressed[0].plan.signal_id, open_ref.signal_id);
+        assert_eq!(
+            suppressed[0].reason_code,
+            "COPY_DAEMON_DEFER_OPEN_AFTER_LIVE_SUBMIT"
+        );
+
+        let (pending_without_live_submit, suppressed_without_live_submit) =
+            copy_live_daemon_defer_open_refs_after_immediate_live_submit(
+                vec![open_ref, reduce_ref],
+                &[],
+            );
+        assert_eq!(pending_without_live_submit.len(), 2);
+        assert!(suppressed_without_live_submit.is_empty());
+    }
+
+    #[test]
     fn copy_live_daemon_pending_suppressed_refs_excludes_already_submitted_cloids() {
         let submitted = CopyLiveDaemonWouldSubmitRef {
             record_index: 0,
@@ -10488,6 +10660,10 @@ async fn run_copy_live_daemon_supervisor(
                                 }
                                 let submit_ok =
                                     copy_live_daemon_live_submit_health_ok(&immediate_submit);
+                                let stop_after_live_submit =
+                                    copy_live_daemon_immediate_submit_should_stop_round(
+                                        &immediate_submit,
+                                    );
                                 live_submit_chunks.push(immediate_submit);
                                 if !submit_ok {
                                     checks.push(copy_shadow_smoke_check(
@@ -10497,6 +10673,11 @@ async fn run_copy_live_daemon_supervisor(
                                     ));
                                     input.watcher_status =
                                         "stopped_immediate_submit_failed".to_string();
+                                    break;
+                                }
+                                if stop_after_live_submit {
+                                    input.watcher_status =
+                                        "stopped_after_immediate_live_submit".to_string();
                                     break;
                                 }
                             }
@@ -10511,7 +10692,10 @@ async fn run_copy_live_daemon_supervisor(
             }
         }
 
-        if !watcher_handle.is_finished() && input.events_received > 0 {
+        if !watcher_handle.is_finished()
+            && input.events_received > 0
+            && input.watcher_status == "completed_duration"
+        {
             input.watcher_status = if input.events_received >= options.max_events {
                 "stopped_max_events".to_string()
             } else {
@@ -10601,6 +10785,11 @@ async fn run_copy_live_daemon_supervisor(
     strategies::smart_money::save_copy_persistence_snapshot(&options.persistence_path, &saved)?;
     let pending_would_submit_plan_refs =
         copy_live_daemon_pending_plan_refs(&would_submit_plan_refs, &submitted_plan_cloids);
+    let (pending_would_submit_plan_refs, mut deferred_open_suppressed_refs) =
+        copy_live_daemon_defer_open_refs_after_immediate_live_submit(
+            pending_would_submit_plan_refs,
+            &live_submit_chunks,
+        );
     let (executable_submit_plan_refs, mut suppressed_submit_plan_refs) =
         copy_live_daemon_executable_refs_for_snapshot(
             &pending_would_submit_plan_refs,
@@ -10608,6 +10797,7 @@ async fn run_copy_live_daemon_supervisor(
             &saved,
             &pre_submit_reconciliations,
         );
+    suppressed_submit_plan_refs.append(&mut deferred_open_suppressed_refs);
     let (executable_submit_plan_refs, mut effective_min_suppressed_refs) =
         copy_live_daemon_suppress_refs_below_effective_min(
             config,
@@ -11093,6 +11283,12 @@ fn copy_live_daemon_reconcile_only_degraded_round(
         && final_reconciliations
             .iter()
             .all(|reconcile| reconcile.error.is_some())
+}
+
+fn copy_live_daemon_immediate_submit_should_stop_round(
+    report: &CopyLiveDaemonPersistentLiveSubmitReport,
+) -> bool {
+    !copy_canary_live_submitted_reports(&report.submitted_reports).is_empty()
 }
 
 fn copy_live_daemon_watcher_progress_check(
@@ -14138,6 +14334,36 @@ fn copy_live_daemon_pending_suppressed_refs(
         .filter(|suppressed| !submitted_plan_cloids.contains(&suppressed.plan.order.cloid))
         .cloned()
         .collect()
+}
+
+fn copy_live_daemon_defer_open_refs_after_immediate_live_submit(
+    refs: Vec<CopyLiveDaemonWouldSubmitRef>,
+    live_submit_chunks: &[CopyLiveDaemonPersistentLiveSubmitReport],
+) -> (
+    Vec<CopyLiveDaemonWouldSubmitRef>,
+    Vec<CopyLiveDaemonSuppressedWouldSubmitRef>,
+) {
+    if !live_submit_chunks
+        .iter()
+        .any(copy_live_daemon_immediate_submit_should_stop_round)
+    {
+        return (refs, Vec::new());
+    }
+
+    let mut pending = Vec::new();
+    let mut suppressed = Vec::new();
+    for plan in refs {
+        if plan.order.reduce_only {
+            pending.push(plan);
+        } else {
+            suppressed.push(CopyLiveDaemonSuppressedWouldSubmitRef {
+                plan,
+                reason_code: "COPY_DAEMON_DEFER_OPEN_AFTER_LIVE_SUBMIT".to_string(),
+                message: "open/increase ref deferred after an immediate live submit; next soak round must reload exchange state and ledger evidence before opening more exposure".to_string(),
+            });
+        }
+    }
+    (pending, suppressed)
 }
 
 fn copy_live_daemon_submitted_report_cloids(
