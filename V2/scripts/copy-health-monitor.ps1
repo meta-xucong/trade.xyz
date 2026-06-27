@@ -320,7 +320,7 @@ function Invoke-UnattributedLedgerRecovery {
         "--cleanup-max-slippage-bps", "50",
         "--hold-positions-after-submit", "true",
         "--live-gate", "true",
-        "--allow-live-submit", "false",
+        "--allow-live-submit", "true",
         "--confirm-mainnet-live", "true",
         "--submit", "false"
     )

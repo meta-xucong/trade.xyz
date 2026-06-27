@@ -4244,6 +4244,82 @@ mod tests {
     }
 
     #[test]
+    fn copy_live_daemon_persistence_merge_closed_reduce_does_not_consume_later_open() {
+        let earlier_open = crate::strategies::smart_money::CopyLedgerEntry {
+            local_account_id: "addr_a".to_string(),
+            leader_id: "leader_a".to_string(),
+            leader_group: "leader_a".to_string(),
+            signal_id: "sig-open-before".to_string(),
+            coin: "xyz:JPY".to_string(),
+            local_side: crate::domain::OrderSide::Buy,
+            order_cloid: Some("11111111-1111-5111-8111-111111111111".to_string()),
+            order_oid: Some(9001),
+            submitted_at_ms: Some(1_000),
+            filled_at_ms: Some(1_100),
+            planned_notional_usd: 50.0,
+            pending_notional_usd: 0.0,
+            filled_notional_usd: 49.0,
+            remaining_notional_usd: 49.0,
+            status: crate::strategies::smart_money::CopyLedgerStatus::Open,
+        };
+        let later_open = crate::strategies::smart_money::CopyLedgerEntry {
+            signal_id: "sig-open-after".to_string(),
+            order_cloid: Some("33333333-3333-5333-8333-333333333333".to_string()),
+            order_oid: Some(9003),
+            submitted_at_ms: Some(3_000),
+            filled_at_ms: Some(3_100),
+            ..earlier_open.clone()
+        };
+        let closed_reduce = crate::strategies::smart_money::CopyLedgerEntry {
+            signal_id: "sig-close-close-123".to_string(),
+            order_cloid: Some("22222222-2222-5222-8222-222222222222".to_string()),
+            order_oid: Some(9002),
+            submitted_at_ms: Some(2_000),
+            filled_at_ms: Some(2_100),
+            planned_notional_usd: 49.0,
+            pending_notional_usd: 0.0,
+            filled_notional_usd: 49.0,
+            remaining_notional_usd: 0.0,
+            status: crate::strategies::smart_money::CopyLedgerStatus::Closed,
+            ..earlier_open.clone()
+        };
+        let existing = crate::strategies::smart_money::CopyPersistenceSnapshot {
+            schema_version: 1,
+            saved_at_ms: now_ms(),
+            seen_event_keys: Vec::new(),
+            ledger_entries: vec![earlier_open, later_open],
+        };
+        let incoming = crate::strategies::smart_money::CopyPersistenceSnapshot {
+            schema_version: 1,
+            saved_at_ms: now_ms(),
+            seen_event_keys: Vec::new(),
+            ledger_entries: vec![closed_reduce],
+        };
+
+        let merged = copy_live_daemon_merge_persistence_snapshots_for_save(existing, incoming);
+
+        let earlier = merged
+            .ledger_entries
+            .iter()
+            .find(|entry| entry.signal_id == "sig-open-before")
+            .expect("earlier open entry");
+        assert_eq!(
+            earlier.status,
+            crate::strategies::smart_money::CopyLedgerStatus::Closed
+        );
+        let later = merged
+            .ledger_entries
+            .iter()
+            .find(|entry| entry.signal_id == "sig-open-after")
+            .expect("later open entry");
+        assert_eq!(
+            later.status,
+            crate::strategies::smart_money::CopyLedgerStatus::Open
+        );
+        assert_eq!(later.remaining_notional_usd, 49.0);
+    }
+
+    #[test]
     fn copy_live_daemon_prunes_stale_ledger_entries_without_live_position() {
         let stale_open = crate::strategies::smart_money::CopyLedgerEntry {
             local_account_id: "addr_a".to_string(),
@@ -4570,6 +4646,98 @@ mod tests {
             crate::strategies::smart_money::CopyLedgerStatus::Open
         );
         assert!((entry.remaining_notional_usd - 349.996).abs() < 1e-9);
+    }
+
+    #[test]
+    fn copy_live_daemon_recovers_open_ledger_when_only_pending_reduce_exists() {
+        let temp = std::env::temp_dir().join(format!(
+            "trade_xyz_copy_recover_pending_reduce_{}",
+            now_ms()
+        ));
+        std::fs::create_dir_all(&temp).expect("test dir");
+        let shadow_path = temp.join("shadow.jsonl");
+        let shadow = crate::strategies::smart_money::CopyShadowHistoryEntry {
+            schema_version: 1,
+            occurred_at_ms: 3_000,
+            status: "would_copy".to_string(),
+            leader_id: "leader_4".to_string(),
+            leader_address: "0x9dead8fffcbf130e7658f672d2c081d91178d617".to_string(),
+            coin: "xyz:JPY".to_string(),
+            action_kind: "IncreaseLong".to_string(),
+            action_event_id: "evt-jpy-open-after-reduce".to_string(),
+            live_gate: "live_allowed".to_string(),
+            risk_reject_reason: None,
+            signal_id: Some("sig-jpy-live-open".to_string()),
+            side: Some(crate::domain::OrderSide::Buy),
+            reduce_only: Some(false),
+            notional_usd: Some(82.41),
+            ledger_status: Some(crate::strategies::smart_money::CopyLedgerStatus::PendingOpen),
+            local_account_id: Some("addr_b".to_string()),
+            ..Default::default()
+        };
+        std::fs::write(
+            &shadow_path,
+            format!("{}\n", serde_json::to_string(&shadow).expect("shadow json")),
+        )
+        .expect("shadow file");
+
+        let pending_reduce = crate::strategies::smart_money::CopyLedgerEntry {
+            local_account_id: "addr_b".to_string(),
+            leader_id: "leader_4".to_string(),
+            leader_group: "leader_4".to_string(),
+            signal_id: "sig-jpy-old-reduce-close-123".to_string(),
+            coin: "xyz:JPY".to_string(),
+            local_side: crate::domain::OrderSide::Buy,
+            order_cloid: None,
+            order_oid: None,
+            submitted_at_ms: Some(2_000),
+            filled_at_ms: None,
+            planned_notional_usd: 85.6,
+            pending_notional_usd: 85.6,
+            filled_notional_usd: 0.0,
+            remaining_notional_usd: 85.6,
+            status: crate::strategies::smart_money::CopyLedgerStatus::PendingReduce,
+        };
+        let snapshot = crate::strategies::smart_money::CopyPersistenceSnapshot {
+            schema_version: 1,
+            saved_at_ms: now_ms(),
+            seen_event_keys: Vec::new(),
+            ledger_entries: vec![pending_reduce],
+        };
+        let reconciliations = vec![CopyBoundedLiveWindowReconcile {
+            account_id: "addr_b".to_string(),
+            ok: false,
+            open_order_count: Some(0),
+            asset_positions: Some(1),
+            position_summaries: vec![super::CopyBoundedLiveWindowPositionSummary {
+                coin: "xyz:JPY".to_string(),
+                szi: "0.51".to_string(),
+                position_value: Some("82.4109".to_string()),
+            }],
+            account_value: None,
+            withdrawable: None,
+            total_ntl_pos: Some("82.4109".to_string()),
+            total_margin_used: Some("8.24".to_string()),
+            error: None,
+        }];
+        let mut options = follow_position_options();
+        options.account_ids = vec!["addr_a".to_string(), "addr_b".to_string()];
+        options.shadow_history_path = shadow_path;
+
+        let recovered = super::copy_live_daemon_recover_open_ledger_from_live_positions(
+            snapshot,
+            &reconciliations,
+            &options,
+        )
+        .expect("recover ledger");
+
+        assert!(recovered.ledger_entries.iter().any(|entry| {
+            entry.local_account_id == "addr_b"
+                && entry.coin == "xyz:JPY"
+                && entry.signal_id == "sig-jpy-live-open"
+                && entry.status == crate::strategies::smart_money::CopyLedgerStatus::Open
+                && (entry.remaining_notional_usd - 82.4109).abs() < 1e-9
+        }));
     }
 
     #[test]
@@ -14737,8 +14905,6 @@ fn copy_live_daemon_recover_open_ledger_from_live_positions(
                         entry.status,
                         strategies::smart_money::CopyLedgerStatus::Open
                             | strategies::smart_money::CopyLedgerStatus::PendingOpen
-                            | strategies::smart_money::CopyLedgerStatus::PendingReduce
-                            | strategies::smart_money::CopyLedgerStatus::PendingClose
                     )
             });
             if has_live_mapping {
@@ -15003,7 +15169,7 @@ fn copy_live_daemon_ledger_entry_identity(
 fn copy_live_daemon_apply_closed_reduces_to_open_entries(
     ledger_entries: &mut [strategies::smart_money::CopyLedgerEntry],
 ) {
-    let mut reductions_by_key = HashMap::<(String, String, String), f64>::new();
+    let mut reductions = Vec::<((String, String, String), f64, Option<u64>)>::new();
     for entry in ledger_entries.iter() {
         if !copy_live_daemon_closed_reduce_entry_consumes_open(entry) {
             continue;
@@ -15020,12 +15186,17 @@ fn copy_live_daemon_apply_closed_reduces_to_open_entries(
             entry.coin.clone(),
             copy_live_daemon_order_side_key(entry.local_side),
         );
-        *reductions_by_key.entry(key).or_insert(0.0) += reduction_notional;
+        reductions.push((
+            key,
+            reduction_notional,
+            copy_live_daemon_ledger_entry_event_time_ms(entry),
+        ));
     }
 
-    if reductions_by_key.is_empty() {
+    if reductions.is_empty() {
         return;
     }
+    reductions.sort_by(|left, right| left.2.cmp(&right.2));
 
     let mut open_indices_by_key = HashMap::<(String, String, String), Vec<usize>>::new();
     for (index, entry) in ledger_entries.iter().enumerate() {
@@ -15042,14 +15213,27 @@ fn copy_live_daemon_apply_closed_reduces_to_open_entries(
         );
         open_indices_by_key.entry(key).or_default().push(index);
     }
+    for indices in open_indices_by_key.values_mut() {
+        indices.sort_by(|left, right| {
+            copy_live_daemon_ledger_entry_event_time_ms(&ledger_entries[*left]).cmp(
+                &copy_live_daemon_ledger_entry_event_time_ms(&ledger_entries[*right]),
+            )
+        });
+    }
 
-    for (key, mut reduction_notional) in reductions_by_key {
+    for (key, mut reduction_notional, reduction_time_ms) in reductions {
         let Some(indices) = open_indices_by_key.get(&key) else {
             continue;
         };
         for index in indices {
             if reduction_notional <= 1e-9 {
                 break;
+            }
+            let open_time_ms = copy_live_daemon_ledger_entry_event_time_ms(&ledger_entries[*index]);
+            if let (Some(open_time_ms), Some(reduction_time_ms)) = (open_time_ms, reduction_time_ms)
+                && open_time_ms > reduction_time_ms
+            {
+                continue;
             }
             let baseline = ledger_entries[*index]
                 .filled_notional_usd
@@ -15065,6 +15249,12 @@ fn copy_live_daemon_apply_closed_reduces_to_open_entries(
             }
         }
     }
+}
+
+fn copy_live_daemon_ledger_entry_event_time_ms(
+    entry: &strategies::smart_money::CopyLedgerEntry,
+) -> Option<u64> {
+    entry.filled_at_ms.or(entry.submitted_at_ms)
 }
 
 fn copy_live_daemon_closed_reduce_entry_consumes_open(
