@@ -1578,6 +1578,84 @@ mod tests {
     }
 
     #[test]
+    fn copy_live_daemon_live_submit_health_accepts_reduce_only_already_flat_error() {
+        let report = CopyLiveDaemonPersistentLiveSubmitReport {
+            ok: false,
+            mode: "persistent_live_submit".to_string(),
+            submit_requested: true,
+            submit_plan_contract_ok: true,
+            submitted_reports: vec![
+                crate::domain::WorkerReport::Submitted(crate::domain::OrderSubmitted {
+                    signal_id: "signal-qnt-close".to_string(),
+                    intent_id: "intent-qnt-close".to_string(),
+                    worker_id: "worker-addr_a".to_string(),
+                    account_id: "addr_a".to_string(),
+                    cloid: "8b9ffb1e-0623-55fd-a1b1-84634a911c91".to_string(),
+                    coin: "xyz:QNT".to_string(),
+                    side: crate::domain::OrderSide::Buy,
+                    notional_usd: 242.15425,
+                    submitted_price: Some(74.509),
+                    submitted_size: Some(3.25),
+                    exchange_status: Some("filled".to_string()),
+                    oid: Some(481205177012),
+                    filled_size: Some(3.25),
+                    avg_fill_price: Some(74.509),
+                    dry_run: false,
+                    submitted_at_ms: 1782572600145,
+                }),
+                crate::domain::WorkerReport::Error(crate::domain::WorkerError {
+                    worker_id: "worker-addr_b".to_string(),
+                    account_id: "addr_b".to_string(),
+                    message:
+                        "exchange returned action-level order error: Reduce only order would increase position. asset=110081"
+                            .to_string(),
+                    error_at_ms: 1782572605421,
+                }),
+            ],
+            order_evidence: vec![CopyExecutionCanaryOrderEvidence {
+                account_id: "addr_a".to_string(),
+                worker_id: "worker-addr_a".to_string(),
+                signal_id: "signal-qnt-close".to_string(),
+                coin: "xyz:QNT".to_string(),
+                oid: Some(481205177012),
+                cloid: "8b9ffb1e-0623-55fd-a1b1-84634a911c91".to_string(),
+                order_status: Some(crate::hyperliquid::OrderStatusResponse {
+                    status: "order".to_string(),
+                    order: None,
+                }),
+                user_fill_count: 1,
+                matching_fill_count: 1,
+                matching_fills: Vec::new(),
+                error: None,
+            }],
+            cleanup_runbooks: Vec::new(),
+            cleanup_errors: Vec::new(),
+            ledger_reconciliations: Vec::new(),
+            ledger_reconciliation_snapshot:
+                crate::strategies::smart_money::CopyPersistenceSnapshot::new(
+                    1782572605421,
+                    Vec::new(),
+                    &crate::strategies::smart_money::CopyLedger::new(),
+                ),
+            checks: vec![
+                CopyShadowSmokeCheck {
+                    name: "submitted_reports".to_string(),
+                    ok: false,
+                    detail: "1 live submitted report(s), 1 pre-submit skipped ref(s)"
+                        .to_string(),
+                },
+                CopyShadowSmokeCheck {
+                    name: "persistent_live_submit_chunks".to_string(),
+                    ok: false,
+                    detail: "1 persistent live submit chunk(s) merged".to_string(),
+                },
+            ],
+        };
+
+        assert!(copy_live_daemon_live_submit_health_ok(&report));
+    }
+
+    #[test]
     fn copy_live_daemon_follow_position_mode_allows_bounded_open_position_health() {
         let mut options = CopyLiveDaemonSupervisorOptions {
             leaders: Vec::new(),
@@ -13268,6 +13346,8 @@ fn copy_live_daemon_error_is_safe_pre_submit_skip(message: &str) -> bool {
             && normalized.contains("below exchange minimum")
         || normalized.contains("exchange returned action-level order error")
             && normalized.contains("minimum value")
+        || normalized.contains("exchange returned action-level order error")
+            && normalized.contains("reduce only order would increase position")
 }
 
 async fn copy_live_daemon_suppress_refs_below_effective_min(

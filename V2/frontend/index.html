@@ -3335,6 +3335,7 @@
         dashboardOpenOrders: [],
         spotHiddenPositionPairs: [],
         dashboardPnl: null,
+        positionTruth: null,
         dashboardTpslRulesByKey: {},
         dashboardTpslRulesCache: {},
         dashboardTpslDraftsByKey: {},
@@ -4055,6 +4056,9 @@
           "copy.local_position_detail": "Selected account live positions",
           "copy.other_local_detail": "Unassigned / other strategy account detail",
           "copy.other_local_position_detail": "Unassigned / other strategy position detail",
+          "copy.other_local_pnl": "Other Local Position PnL",
+          "copy.other_local_positions": "{count} other local position(s)",
+          "copy.other_local_note": "{count} open position(s) are outside Smart Money Copy ownership; other-local unrealized PnL is {pnl}.",
           "copy.trade_count": "Trades",
           "copy.current_run_orders": "Current Soak Orders",
           "copy.history_total_orders": "Current run total",
@@ -4081,7 +4085,7 @@
           "copy.target_truth_current": "All target accounts refreshed; {count} target position(s) are open now.",
           "copy.target_truth_partial": "Only part of the target side refreshed. Unknown is not the same as flat.",
           "copy.target_truth_unknown": "Target positions are unknown right now. Unknown is not the same as flat.",
-          "copy.truth_reconcile_note": "Copied {copy} + unassigned {other} = total live {total} position(s).",
+          "copy.truth_reconcile_note": "Copied {copy} + other local {other} = selected-account live total {total} position(s).",
           "copy.pnl_report": "PnL Report",
           "copy.pnl_report_time": "Report Time",
           "copy.pnl_report_missing": "PnL report not found yet.",
@@ -4775,6 +4779,9 @@
           "copy.local_position_detail": "选中账号全部实时持仓",
           "copy.other_local_detail": "未归属 / 其他策略账号明细",
           "copy.other_local_position_detail": "未归属 / 其他策略持仓明细",
+          "copy.other_local_pnl": "其他本地持仓盈亏",
+          "copy.other_local_positions": "{count} 个其他本地持仓",
+          "copy.other_local_note": "当前有 {count} 个其他本地持仓不属于聪明钱跟单归属；其他本地未实现盈亏为 {pnl}。",
           "copy.trade_count": "交易次数",
           "copy.current_run_orders": "当前长测订单",
           "copy.history_total_orders": "当前运行累计",
@@ -4801,7 +4808,7 @@
           "copy.target_truth_current": "目标侧已全部刷新，当前共有 {count} 条持仓。",
           "copy.target_truth_partial": "目标侧只刷新到一部分账号，未知不等于空仓。",
           "copy.target_truth_unknown": "目标侧当前是未知状态，未知不等于空仓。",
-          "copy.truth_reconcile_note": "跟单归属 {copy} 条 + 未归属 {other} 条 = 选中账号实时总仓位 {total} 条。",
+          "copy.truth_reconcile_note": "跟单归属 {copy} 条 + 其他本地 {other} 条 = 选中账号实时总持仓 {total} 条。",
           "copy.pnl_report": "盈亏报告",
           "copy.pnl_report_time": "报告时间",
           "copy.pnl_report_missing": "暂未找到盈亏报告。",
@@ -9542,9 +9549,41 @@
         return summary;
       }
 
-      function applyDashboardAttributionToPnl(pnl, positions) {
+      function dashboardTruthTotalPositionValue(positionTruth) {
+        if (!positionTruth || typeof positionTruth !== "object") return null;
+        const keys = [
+          "copy_position_value_usd",
+          "fib_position_value_usd",
+          "unattributed_position_value_usd",
+          "dust_position_value_usd",
+        ];
+        const hasTruthValue = keys.some((key) =>
+          Object.prototype.hasOwnProperty.call(positionTruth, key)
+        );
+        if (!hasTruthValue && !Object.prototype.hasOwnProperty.call(positionTruth, "position_count")) {
+          return null;
+        }
+        return keys.reduce((sum, key) => sum + Math.abs(parseNum(positionTruth?.[key])), 0);
+      }
+
+      function dashboardRowsTotalPositionValue(positions) {
+        return (Array.isArray(positions) ? positions : []).reduce(
+          (sum, position) => sum + dashboardPositionNotionalUsd(position),
+          0
+        );
+      }
+
+      function dashboardTotalPositionValue(pnl, positions, positionTruth = null) {
+        const truthTotal = dashboardTruthTotalPositionValue(positionTruth);
+        if (truthTotal != null) return truthTotal;
+        if (Array.isArray(positions)) return dashboardRowsTotalPositionValue(positions);
+        return parseNum(pnl?.total_position_value_usd);
+      }
+
+      function applyDashboardAttributionToPnl(pnl, positions, positionTruth = null) {
         return {
           ...(pnl || {}),
+          total_position_value_usd: dashboardTotalPositionValue(pnl, positions, positionTruth),
           ...dashboardPositionAttributionSummary(positions),
         };
       }
@@ -11860,7 +11899,7 @@
                 <div class="fib-instance-section-title">${t("copy.other_local_detail")}</div>
                 ${copyAccountRowsHtml(otherLocalSummaries, {
                   accountLabel: t("copy.local_copy_accounts"),
-                  pnlLabel: t("copy.unattributed_pnl"),
+                  pnlLabel: t("copy.other_local_pnl"),
                   emptyText: t("copy.no_positions"),
                 })}
                 <div class="fib-instance-section-title">${t("copy.other_local_position_detail")}</div>
@@ -11878,7 +11917,7 @@
             <div class="copy-metric-grid">
               ${copyMetricHtml(t("copy.my_copy_pnl"), nullableMoney(myDisplayTotal), mySub, myDisplayTotal)}
               ${copyMetricHtml(t("copy.target_raw_pnl"), nullableMoney(targetTotal), targetSub, targetTotal)}
-              ${copyMetricHtml(t("copy.unattributed_pnl"), money(unattributedPnl || 0), t("copy.unattributed_positions", { count: number(unattributedCount, 0) }), unattributedPnl || 0)}
+              ${copyMetricHtml(t("copy.other_local_pnl"), money(unattributedPnl || 0), t("copy.other_local_positions", { count: number(unattributedCount, 0) }), unattributedPnl || 0)}
               ${copyMetricHtml(t("copy.target_accounts"), number(summary.leader_count || 0, 0), `${t("copy.open_positions")} ${copyTargetOpenPositionText(summary)} · ${copyTargetPositionStateText(summary)}`)}
               ${copyMetricHtml(t("copy.current_run_orders"), number(summary.submitted_reports || 0, 0), `${t("copy.history_total_orders")} · ${t("copy.summary_notional")} ${money(summary.copied_notional_usd || 0)}`)}
             </div>
@@ -11915,7 +11954,7 @@
                   <div><span>${t("copy.my_copy_pnl")}</span><strong class="${escapeHtml(pnlClass(myDisplayTotal))}">${escapeHtml(nullableMoney(myDisplayTotal))}</strong></div>
                   <div><span>${t("copy.all_local_pnl")}</span><strong class="${escapeHtml(pnlClass(localDisplayTotal))}">${escapeHtml(nullableMoney(localDisplayTotal))}</strong></div>
                   <div><span>${t("copy.target_raw_pnl")}</span><strong class="${escapeHtml(pnlClass(targetTotal))}">${escapeHtml(nullableMoney(targetTotal))}</strong></div>
-                  <div><span>${t("copy.unattributed_pnl")}</span><strong class="${escapeHtml(pnlClass(unattributedPnl || 0))}">${escapeHtml(money(unattributedPnl || 0))}</strong></div>
+                  <div><span>${t("copy.other_local_pnl")}</span><strong class="${escapeHtml(pnlClass(unattributedPnl || 0))}">${escapeHtml(money(unattributedPnl || 0))}</strong></div>
                   <div><span>${t("copy.fees")}</span><strong>${escapeHtml(myFees == null ? "-" : money(myFees))}</strong></div>
                   <div><span>${t("copy.summary_rejected")}</span><strong>${escapeHtml(number(summary.rejected_count || 0, 0))} / ${escapeHtml(number(summary.deduped_count || 0, 0))}</strong></div>
                   <div><span>${t("copy.open_positions")}</span><strong>${escapeHtml(copyTargetOpenPositionText(summary))}</strong></div>
@@ -11929,7 +11968,7 @@
                   <span>${escapeHtml(reportText)}</span>
                   <span>${escapeHtml(t("copy.pnl_scope_note"))}</span>
                   ${hasRealtimeCopyPnl && local.unrealized_pnl_usd == null && summary.unrealized_pnl_usd == null ? `<span>${escapeHtml(t("copy.realtime_attribution_note"))}</span>` : ""}
-                  ${unattributedCount > 0 ? `<span>${escapeHtml(t("copy.unattributed_warning", { count: number(unattributedCount, 0), pnl: money(unattributedPnl || 0) }))}</span>` : ""}
+                  ${unattributedCount > 0 ? `<span>${escapeHtml(t("copy.other_local_note", { count: number(unattributedCount, 0), pnl: money(unattributedPnl || 0) }))}</span>` : ""}
                 </div>
                 <div class="fib-instance-section-title">${t("copy.copy_owned_detail")}</div>
                 ${copyAccountRowsHtml(copyOwnedSummaries, {
@@ -13386,6 +13425,7 @@
           const data = await api("/api/state");
           state.app = data.app;
           state.accounts = data.accounts;
+          state.positionTruth = data.position_truth || null;
           state.recentEventsRaw = Array.isArray(data.recent_events) ? data.recent_events : [];
           state.symbolPolicies = data.symbol_policies || {
             manual_blocked_symbols: [],
@@ -13406,12 +13446,16 @@
           if (!state.dashboardSnapshotReady) {
             state.dashboardAccounts = data.accounts;
             state.dashboardPositions = data.positions || [];
-            state.dashboardPnl = data.pnl || {
-              total_equity_usd: 0,
-              total_available_usdc: 0,
-              total_unrealized_pnl_usd: 0,
-              total_position_value_usd: 0,
-            };
+            state.dashboardPnl = applyDashboardAttributionToPnl(
+              data.pnl || {
+                total_equity_usd: 0,
+                total_available_usdc: 0,
+                total_unrealized_pnl_usd: 0,
+                total_position_value_usd: 0,
+              },
+              state.dashboardPositions,
+              state.positionTruth,
+            );
           }
 
           renderDashboardMetrics(state.dashboardPnl || {

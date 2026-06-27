@@ -261,7 +261,7 @@ test("smart money summary keeps copy-owned truth separate from other live positi
   });
 
   const summary = page.locator("#copySummary");
-  await expect(summary).toContainText(/跟单归属 1 条 \+ 未归属 1 条 = 选中账号实时总仓位 2 条|Copied 1 \+ unassigned 1 = total live 2/);
+  await expect(summary).toContainText(/跟单归属 1 条 \+ 其他本地 1 条 = 选中账号实时总持仓 2 条|Copied 1 \+ other local 1 = selected-account live total 2/);
   await expect(summary.locator(".copy-position-row").first()).toContainText(/GOLD/i);
   await expect(summary.locator(".copy-position-row").first()).not.toContainText(/MU/i);
 
@@ -396,6 +396,40 @@ test("dashboard attribution consumes backend position truth fields", async ({ pa
       (sum, position) => sum + Number(position.position_value_usd || 0),
       0
     );
+    const statePnlWithoutPositionTotal = applyDashboardAttributionToPnl(
+      {
+        total_equity_usd: 162.72,
+        total_available_usdc: 44.12,
+        total_unrealized_pnl_usd: 1.25,
+      },
+      [{
+        coin: "xyz:GBP",
+        size: 1,
+        position_value_usd: 100,
+        pnl_usd: 1.25,
+        owner: "copy",
+        attribution_source: "backend_position_truth",
+        copy_ratio: 1,
+        attribution_parts: [{ key: "copy", source: "copy_ledger_live_position", ratio: 1 }],
+      }],
+      {
+        source: "backend_position_truth",
+        position_count: 2,
+        copy_position_value_usd: 100,
+        fib_position_value_usd: 25,
+        unattributed_position_value_usd: 10,
+        dust_position_value_usd: 0.5,
+      }
+    );
+    const statePnlRowsFallback = applyDashboardAttributionToPnl(
+      { total_equity_usd: 162.72, total_available_usdc: 44.12, total_unrealized_pnl_usd: 1.25 },
+      [{
+        coin: "xyz:GBP",
+        size: 1,
+        position_value_usd: 100,
+        pnl_usd: 1.25,
+      }]
+    );
 
     return {
       noBackend,
@@ -405,6 +439,8 @@ test("dashboard attribution consumes backend position truth fields", async ({ pa
       dashboardRowPositionValue: rowPositionValue,
       dashboardLegacyMarginValue:
         derivedDashboard.pnl.total_equity_usd - derivedDashboard.pnl.total_available_usdc,
+      stateTruthPositionValue: statePnlWithoutPositionTotal.total_position_value_usd,
+      stateRowsFallbackPositionValue: statePnlRowsFallback.total_position_value_usd,
     };
   });
 
@@ -420,6 +456,8 @@ test("dashboard attribution consumes backend position truth fields", async ({ pa
   expect(result.dashboardTotalPositionValue).toBeCloseTo(594.0945, 4);
   expect(result.dashboardTotalPositionValue).toBeCloseTo(result.dashboardRowPositionValue, 6);
   expect(result.dashboardTotalPositionValue).not.toBeCloseTo(result.dashboardLegacyMarginValue, 4);
+  expect(result.stateTruthPositionValue).toBeCloseTo(135.5, 6);
+  expect(result.stateRowsFallbackPositionValue).toBeCloseTo(100, 6);
 });
 
 test("dashboard cancel-all action requires confirmation before calling the API", async ({ page }) => {
