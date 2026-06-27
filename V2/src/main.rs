@@ -5058,6 +5058,98 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn copy_live_daemon_saves_progress_snapshot_immediately_after_submit() -> Result<()> {
+        let config_path = write_test_config("127.0.0.1:18053")?;
+        let mut config = crate::config::load_config(std::path::Path::new(&config_path))?;
+        config.app.dry_run = false;
+        config.manual_ops.manual_live_enabled = true;
+        let account = config
+            .account("addr_a")
+            .context("addr_a should exist in test config")?;
+        let leader = CopyShadowSmokeLeader {
+            leader_id: "leader_a".to_string(),
+            leader_address: "0x00000000000000000000000000000000000000aa".to_string(),
+        };
+        let canary_options = CopyExecutionCanaryOptions {
+            leaders: vec!["leader_a=0x00000000000000000000000000000000000000aa".to_string()],
+            account_ids: vec!["addr_a".to_string()],
+            coin: "xyz:XYZ100".to_string(),
+            side: crate::domain::OrderSide::Buy,
+            local_account_id: None,
+            shadow_history_path: std::env::temp_dir()
+                .join(format!("unused-copy-progress-{}.jsonl", now_ms())),
+            leader_notional_usd: 120.0,
+            leader_size: 1.0,
+            live: true,
+            allow_live_submit: true,
+            confirm_mainnet_live: false,
+            cleanup_after_submit: true,
+            cleanup_max_slippage_bps: 50.0,
+            preflight_only: false,
+            max_orders: 1,
+        };
+        let records = build_synthetic_copy_shadow_records(
+            &config,
+            &canary_options,
+            account,
+            &leader,
+            &["addr_a".to_string()],
+        );
+        let signal = records
+            .iter()
+            .find_map(|record| record.signal.as_ref())
+            .context("synthetic canary should emit one copy signal")?;
+        let cloid = "99999999-9999-5999-8999-999999999999".to_string();
+        let submitted_at_ms = now_ms();
+        let submitted = crate::domain::WorkerReport::Submitted(crate::domain::OrderSubmitted {
+            signal_id: signal.signal_id.clone(),
+            intent_id: "intent-progress".to_string(),
+            worker_id: "worker-addr_a".to_string(),
+            account_id: "addr_a".to_string(),
+            cloid: cloid.clone(),
+            coin: "xyz:XYZ100".to_string(),
+            side: crate::domain::OrderSide::Buy,
+            notional_usd: 50.0,
+            submitted_price: Some(100.0),
+            submitted_size: Some(0.5),
+            exchange_status: Some("filled".to_string()),
+            oid: Some(9001),
+            filled_size: Some(0.5),
+            avg_fill_price: Some(100.0),
+            dry_run: false,
+            submitted_at_ms,
+        });
+        let persistence_path = std::env::temp_dir().join(format!(
+            "copy-live-progress-snapshot-{}.json",
+            submitted_at_ms
+        ));
+        let mut options = follow_position_options();
+        options.persistence_path = persistence_path.clone();
+
+        assert!(super::copy_live_daemon_save_live_submit_progress_snapshot(
+            &options,
+            &records,
+            &[submitted],
+        )?);
+
+        let saved =
+            crate::strategies::smart_money::load_copy_persistence_snapshot(&persistence_path)?;
+        fs::remove_file(&persistence_path).ok();
+        assert_eq!(saved.ledger_entries.len(), 1);
+        let entry = &saved.ledger_entries[0];
+        assert_eq!(entry.signal_id, signal.signal_id);
+        assert_eq!(entry.order_cloid.as_deref(), Some(cloid.as_str()));
+        assert_eq!(entry.order_oid, Some(9001));
+        assert_eq!(entry.submitted_at_ms, Some(submitted_at_ms));
+        assert_eq!(
+            entry.status,
+            crate::strategies::smart_money::CopyLedgerStatus::Open
+        );
+        assert!(entry.remaining_notional_usd > 0.0);
+        Ok(())
+    }
+
     fn follow_position_options() -> CopyLiveDaemonSupervisorOptions {
         CopyLiveDaemonSupervisorOptions {
             leaders: Vec::new(),
@@ -12124,6 +12216,8 @@ async fn copy_live_daemon_persistent_live_submit(
     }
 
     let mut submitted_reports = Vec::new();
+    let mut progress_snapshot_save_count = 0usize;
+    let mut progress_snapshot_errors = Vec::new();
     for plan in &submit_ready_refs {
         submitted_reports.push(
             execute_copy_daemon_submit_ref(config, options, plan)
@@ -12137,6 +12231,17 @@ async fn copy_live_daemon_persistent_live_submit(
                     })
                 }),
         );
+        if copy_canary_has_live_submission(&submitted_reports) {
+            match copy_live_daemon_save_live_submit_progress_snapshot(
+                options,
+                approved_records,
+                &submitted_reports,
+            ) {
+                Ok(true) => progress_snapshot_save_count += 1,
+                Ok(false) => {}
+                Err(error) => progress_snapshot_errors.push(error.to_string()),
+            }
+        }
     }
     let live_submitted_count = copy_canary_live_submitted_reports(&submitted_reports).len();
     let order_evidence = if live_submitted_count > 0 {
@@ -12194,6 +12299,25 @@ async fn copy_live_daemon_persistent_live_submit(
             submit_ready_refs.len(),
             executable_refs.len().saturating_sub(submit_ready_refs.len())
         ),
+    ));
+    checks.push(copy_shadow_smoke_check(
+        "live_submit_progress_snapshot_saved",
+        live_submitted_count == 0
+            || (progress_snapshot_save_count >= live_submitted_count
+                && progress_snapshot_errors.is_empty()),
+        if live_submitted_count == 0 {
+            "no live submitted report required an immediate progress snapshot".to_string()
+        } else if progress_snapshot_errors.is_empty() {
+            format!(
+                "{progress_snapshot_save_count} immediate progress snapshot save(s) for {live_submitted_count} live submitted report(s)"
+            )
+        } else {
+            format!(
+                "{} immediate progress snapshot save error(s): {}",
+                progress_snapshot_errors.len(),
+                progress_snapshot_errors.join("; ")
+            )
+        },
     ));
     let evidence_ok = live_submitted_count == 0
         || (order_evidence.len() == live_submitted_count
@@ -14327,6 +14451,31 @@ fn copy_live_daemon_persistent_submit_snapshot_safe_to_save(
             .iter()
             .all(copy_execution_canary_order_evidence_ok);
     evidence_ok && report.cleanup_errors.is_empty()
+}
+
+fn copy_live_daemon_save_live_submit_progress_snapshot(
+    options: &CopyLiveDaemonSupervisorOptions,
+    approved_records: &[strategies::smart_money::CopyDryRunShadowRecord],
+    submitted_reports: &[domain::WorkerReport],
+) -> Result<bool> {
+    if !copy_canary_has_live_submission(submitted_reports) {
+        return Ok(false);
+    }
+    let existing_snapshot =
+        strategies::smart_money::load_copy_persistence_snapshot(&options.persistence_path)?;
+    let (_reconciliations, progress_snapshot) = reconcile_copy_canary_ledger(
+        Some(&existing_snapshot),
+        approved_records,
+        submitted_reports,
+        &[],
+    );
+    let snapshot_for_save =
+        copy_live_daemon_merge_persistence_snapshots_for_save(existing_snapshot, progress_snapshot);
+    strategies::smart_money::save_copy_persistence_snapshot(
+        &options.persistence_path,
+        &snapshot_for_save,
+    )?;
+    Ok(true)
 }
 
 fn copy_live_daemon_persistence_snapshot_for_save(
