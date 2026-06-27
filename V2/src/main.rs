@@ -3179,6 +3179,76 @@ mod tests {
     }
 
     #[test]
+    fn copy_live_daemon_submit_refs_allow_large_reduce_only_exit() -> Result<()> {
+        let config_path = write_test_config("127.0.0.1:18041")?;
+        let mut config = crate::config::load_config(std::path::Path::new(&config_path))?;
+        let account = config
+            .accounts
+            .iter_mut()
+            .find(|account| account.account_id == "addr_b")
+            .context("addr_b test account")?;
+        account.max_order_notional_usd = 350.0;
+
+        let now = crate::domain::now_ms();
+        let signal = crate::domain::CoordinatorSignal {
+            signal_id: format!("copy-leader_a-large-gbp-reduce-close-{now}"),
+            source: crate::domain::SignalSource::SmartMoney,
+            created_at_ms: now,
+            dispatch_at_ms: now,
+            expires_at_ms: now + 60_000,
+            target_accounts: vec!["addr_b".to_string()],
+            dedupe_key: "leader_a-large-gbp-reduce".to_string(),
+            order: crate::domain::SignalOrder {
+                market: Some("xyz_perp".to_string()),
+                dex: Some("xyz".to_string()),
+                coin: "xyz:GBP".to_string(),
+                side: crate::domain::OrderSide::Sell,
+                notional_usd: 700.0,
+                reduce_only: true,
+                execution_mode: crate::domain::ExecutionMode::Taker,
+                max_slippage_bps: 50.0,
+                limit_price: None,
+                apply_account_ratio: false,
+            },
+        };
+        let record = crate::strategies::smart_money::CopyDryRunShadowRecord {
+            action: crate::strategies::smart_money::SemanticLeaderAction {
+                leader_id: "leader_a".to_string(),
+                leader_address: "0x00000000000000000000000000000000000000aa".to_string(),
+                market: Some("xyz_perp".to_string()),
+                dex: Some("xyz".to_string()),
+                coin: "xyz:GBP".to_string(),
+                event_id: "large-gbp-reduce".to_string(),
+                kind: crate::strategies::smart_money::LeaderActionKind::ReduceLong,
+                confidence: crate::strategies::smart_money::LeaderActionConfidence::Strong,
+                leader_notional_usd: 700.0,
+                close_leader_notional_usd: Some(700.0),
+                open_leader_notional_usd: None,
+                exchange_time_ms: now,
+                received_at_ms: now,
+                reason: "test large mapped reduce".to_string(),
+            },
+            live_gate: crate::strategies::smart_money::CopyLiveGateDecision::LiveAllowed,
+            risk_decision: crate::strategies::smart_money::CopySignalRiskDecision::Approved {
+                side: crate::domain::OrderSide::Sell,
+                reduce_only: true,
+                notional_usd: 700.0,
+            },
+            signal: Some(signal),
+            ledger_entry: None,
+            persistence_snapshot: crate::strategies::smart_money::CopyPersistenceSnapshot::empty(),
+        };
+
+        let refs = plan_copy_daemon_acceptance_order_refs(&config, &[record])?;
+
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].order.account_id, "addr_b");
+        assert!(refs[0].order.reduce_only);
+        assert_eq!(refs[0].order.notional_usd, 700.0);
+        Ok(())
+    }
+
+    #[test]
     fn copy_live_daemon_contract_exposure_failure_suppresses_open_ref() {
         let options = CopyLiveDaemonSupervisorOptions {
             leaders: Vec::new(),
@@ -10692,6 +10762,15 @@ async fn run_copy_live_daemon_supervisor(
         )?;
     }
     let saved = strategies::smart_money::load_copy_persistence_snapshot(&options.persistence_path)?;
+    checks.push(copy_shadow_smoke_check(
+        "approved_records_have_submit_refs",
+        would_submit_plan_refs.len() >= approved_records.len(),
+        format!(
+            "{} approved shadow record(s), {} submit plan ref(s)",
+            approved_records.len(),
+            would_submit_plan_refs.len()
+        ),
+    ));
     checks.push(copy_shadow_smoke_check(
         "max_live_order_count",
         executable_would_submit_orders

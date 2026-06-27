@@ -203,7 +203,7 @@ struct AccountNotionalRisk;
 
 impl RiskCheck for AccountNotionalRisk {
     fn check(&self, ctx: &RiskContext, intent: &TradeIntent) -> RiskCheckResult {
-        if intent.sizing.notional_usd <= ctx.max_order_notional_usd {
+        if intent.reduce_only || intent.sizing.notional_usd <= ctx.max_order_notional_usd {
             RiskCheckResult::pass()
         } else {
             RiskCheckResult::reject(
@@ -451,6 +451,63 @@ mod tests {
             RiskDecision::Approved(order) => assert!(order.reduce_only),
             RiskDecision::Rejected(rejection) => {
                 panic!("expected reduce-only approval, got {rejection:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn account_notional_risk_allows_reduce_only_above_open_limit() {
+        let config = AppConfig::default();
+        let account = AccountConfig {
+            account_id: "addr_a".to_string(),
+            address: "0x1".to_string(),
+            secret_id: "addr_a_api_wallet".to_string(),
+            api_wallet_env: String::new(),
+            transfer_secret_id: String::new(),
+            transfer_wallet_env: String::new(),
+            enabled: true,
+            worker_enabled: true,
+            copy_ratio: 1.0,
+            max_order_notional_usd: 100.0,
+            blocked_markets: Vec::new(),
+        };
+        let signal = CoordinatorSignal {
+            signal_id: "sig-reduce-above-limit".to_string(),
+            source: SignalSource::SmartMoney,
+            created_at_ms: now_ms(),
+            dispatch_at_ms: now_ms(),
+            expires_at_ms: now_ms() + 1000,
+            target_accounts: vec!["addr_a".to_string()],
+            dedupe_key: "dedupe-reduce-above-limit".to_string(),
+            order: SignalOrder {
+                market: None,
+                dex: None,
+                coin: "xyz:GBP".to_string(),
+                side: OrderSide::Sell,
+                notional_usd: 700.0,
+                reduce_only: true,
+                execution_mode: ExecutionMode::Taker,
+                max_slippage_bps: 20.0,
+                limit_price: None,
+                apply_account_ratio: false,
+            },
+        };
+        let intent = signal.to_trade_intent("addr_a", "worker-addr_a", account.copy_ratio);
+        let ctx = RiskContext::from_account_for_module(
+            &config,
+            &account,
+            true,
+            signal.source.module_scope(),
+        );
+        let decision = RiskGateway::dry_run_default().evaluate(&ctx, intent);
+
+        match decision {
+            RiskDecision::Approved(order) => {
+                assert!(order.reduce_only);
+                assert_eq!(order.notional_usd, 700.0);
+            }
+            RiskDecision::Rejected(rejection) => {
+                panic!("expected reduce-only approval above open limit, got {rejection:?}")
             }
         }
     }
