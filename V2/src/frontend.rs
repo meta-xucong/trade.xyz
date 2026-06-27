@@ -8541,10 +8541,8 @@ fn start_copy_live_soak_from_frontend(
     let vault_password = state
         .resolve_vault_password(&vault_path, "")
         .context("vault must be unlocked before starting live copy soak")?;
-    let max_total_notional_usd = payload
-        .max_total_notional_usd
-        .unwrap_or(settings.principal_cap_usd * settings.leverage * 4.0)
-        .max(settings.principal_cap_usd * settings.leverage);
+    let max_total_notional_usd =
+        copy_live_soak_effective_max_total_notional_usd(&payload, &settings);
     let max_total_fees_usd = payload.max_total_fees_usd.unwrap_or(1.0).max(0.1);
     let script_path = copy_live_soak_script_path();
     anyhow::ensure!(
@@ -8598,6 +8596,17 @@ fn start_copy_live_soak_from_frontend(
         message: "copy live soak start requested".to_string(),
         status,
     })
+}
+
+fn copy_live_soak_effective_max_total_notional_usd(
+    payload: &CopyLiveSoakStartPayload,
+    settings: &CopyUiSettings,
+) -> f64 {
+    let configured_notional_cap = settings.principal_cap_usd * settings.leverage;
+    payload
+        .max_total_notional_usd
+        .unwrap_or(configured_notional_cap)
+        .max(configured_notional_cap)
 }
 
 fn copy_live_soak_script_path() -> PathBuf {
@@ -17790,6 +17799,7 @@ mod tests {
         build_copy_shadow_history_response_from_path, build_copy_summary_response_from_entries,
         build_fib_strategy_pnl_summary, build_position_truth_snapshot,
         copy_ledger_local_account_summaries_with_live_lineage, copy_ledger_position_summaries,
+        copy_live_soak_effective_max_total_notional_usd,
         copy_pnl_account_summary_from_live_positions, copy_pnl_account_summary_has_current_state,
         dashboard_cancel_stopped_without_open_orders_count, dashboard_cancel_strategy_ids,
         dashboard_order_is_cancelable_fib_entry, default_copy_leaders, default_copy_markets,
@@ -19560,6 +19570,41 @@ mod tests {
             Some(".codex-longrun\\snapshot.json")
         );
         assert!(payload.confirm_mainnet_live);
+    }
+
+    #[test]
+    fn copy_live_soak_default_total_notional_uses_configured_notional_cap() {
+        let settings = CopyUiSettings {
+            leaders: default_copy_leaders(),
+            markets: default_copy_markets(),
+            copy_ratio: 0.2,
+            principal_cap_usd: 35.0,
+            leverage: 10.0,
+            account_id: "addr_a".to_string(),
+            account_ids: vec!["addr_a".to_string(), "addr_b".to_string()],
+            updated_at_ms: 0,
+        };
+        let mut payload: CopyLiveSoakStartPayload = serde_json::from_value(json!({
+            "window_secs": 30,
+            "max_rounds": 0,
+            "confirm_mainnet_live": true
+        }))
+        .expect("payload should parse");
+
+        assert_eq!(
+            copy_live_soak_effective_max_total_notional_usd(&payload, &settings),
+            350.0
+        );
+        payload.max_total_notional_usd = Some(100.0);
+        assert_eq!(
+            copy_live_soak_effective_max_total_notional_usd(&payload, &settings),
+            350.0
+        );
+        payload.max_total_notional_usd = Some(3_000.0);
+        assert_eq!(
+            copy_live_soak_effective_max_total_notional_usd(&payload, &settings),
+            3_000.0
+        );
     }
 
     #[test]

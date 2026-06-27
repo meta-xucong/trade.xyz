@@ -3785,6 +3785,111 @@ mod tests {
     }
 
     #[test]
+    fn copy_live_daemon_live_symbol_cap_suppresses_additional_same_coin_open() {
+        let mut options = follow_position_options();
+        options.max_total_notional_usd = 3_000.0;
+        let persistence = crate::strategies::smart_money::CopyPersistenceSnapshot::empty();
+        let open_ref = CopyLiveDaemonWouldSubmitRef {
+            record_index: 0,
+            signal_id: "sig-new-qnt-open".to_string(),
+            leader_id: "leader_a".to_string(),
+            leader_address: "0x00000000000000000000000000000000000000aa".to_string(),
+            order: CopyExecutionCanaryWouldSubmit {
+                account_id: "addr_b".to_string(),
+                worker_id: "worker-addr_b".to_string(),
+                coin: "xyz:QNT".to_string(),
+                side: crate::domain::OrderSide::Sell,
+                notional_usd: 50.0,
+                reduce_only: false,
+                cloid: "00000000-0000-0000-0000-000000000135".to_string(),
+            },
+        };
+        let reconciliations = vec![CopyBoundedLiveWindowReconcile {
+            account_id: "addr_b".to_string(),
+            ok: true,
+            open_order_count: Some(0),
+            asset_positions: Some(1),
+            position_summaries: vec![super::CopyBoundedLiveWindowPositionSummary {
+                coin: "xyz:QNT".to_string(),
+                szi: "-8.58".to_string(),
+                position_value: Some("637.30".to_string()),
+            }],
+            account_value: Some("78.0".to_string()),
+            withdrawable: Some("100.0".to_string()),
+            total_ntl_pos: Some("720.0".to_string()),
+            total_margin_used: Some("72.0".to_string()),
+            error: None,
+        }];
+        let account_symbol_caps = std::collections::HashMap::from([("addr_b".to_string(), 350.0)]);
+
+        let (prepared, suppressed) =
+            super::copy_live_daemon_prepare_refs_for_follow_position_limits_with_symbol_caps(
+                &[open_ref],
+                &options,
+                &persistence,
+                &reconciliations,
+                &account_symbol_caps,
+            );
+
+        assert!(prepared.is_empty());
+        assert_eq!(suppressed.len(), 1);
+        assert_eq!(suppressed[0].reason_code, "COPY_DAEMON_MAX_SYMBOL_EXPOSURE");
+    }
+
+    #[test]
+    fn copy_live_daemon_live_symbol_cap_allows_reduce_only_exit_above_cap() {
+        let mut options = follow_position_options();
+        options.max_total_notional_usd = 3_000.0;
+        let persistence = crate::strategies::smart_money::CopyPersistenceSnapshot::empty();
+        let reduce_ref = CopyLiveDaemonWouldSubmitRef {
+            record_index: 0,
+            signal_id: "sig-qnt-reduce".to_string(),
+            leader_id: "leader_a".to_string(),
+            leader_address: "0x00000000000000000000000000000000000000aa".to_string(),
+            order: CopyExecutionCanaryWouldSubmit {
+                account_id: "addr_b".to_string(),
+                worker_id: "worker-addr_b".to_string(),
+                coin: "xyz:QNT".to_string(),
+                side: crate::domain::OrderSide::Buy,
+                notional_usd: 637.30,
+                reduce_only: true,
+                cloid: "00000000-0000-0000-0000-000000000136".to_string(),
+            },
+        };
+        let reconciliations = vec![CopyBoundedLiveWindowReconcile {
+            account_id: "addr_b".to_string(),
+            ok: true,
+            open_order_count: Some(0),
+            asset_positions: Some(1),
+            position_summaries: vec![super::CopyBoundedLiveWindowPositionSummary {
+                coin: "xyz:QNT".to_string(),
+                szi: "-8.58".to_string(),
+                position_value: Some("637.30".to_string()),
+            }],
+            account_value: Some("78.0".to_string()),
+            withdrawable: Some("0.0".to_string()),
+            total_ntl_pos: Some("720.0".to_string()),
+            total_margin_used: Some("72.0".to_string()),
+            error: None,
+        }];
+        let account_symbol_caps = std::collections::HashMap::from([("addr_b".to_string(), 350.0)]);
+
+        let (prepared, suppressed) =
+            super::copy_live_daemon_prepare_refs_for_follow_position_limits_with_symbol_caps(
+                &[reduce_ref],
+                &options,
+                &persistence,
+                &reconciliations,
+                &account_symbol_caps,
+            );
+
+        assert_eq!(prepared.len(), 1);
+        assert!(suppressed.is_empty(), "{suppressed:#?}");
+        assert!(prepared[0].order.reduce_only);
+        assert_eq!(prepared[0].order.notional_usd, 637.30);
+    }
+
+    #[test]
     fn copy_live_daemon_margin_resize_leaves_reduce_only_refs_untouched() {
         let refs = vec![CopyLiveDaemonWouldSubmitRef {
             record_index: 0,
@@ -10596,12 +10701,15 @@ async fn run_copy_live_daemon_supervisor(
                                 &would_submit_plan_refs,
                                 &submitted_plan_cloids,
                             );
+                            let account_symbol_caps =
+                                copy_live_daemon_account_symbol_caps(config, &target_accounts);
                             let (candidate_executable_refs, mut candidate_suppressed_refs) =
-                                copy_live_daemon_executable_refs_for_snapshot(
+                                copy_live_daemon_executable_refs_for_snapshot_with_symbol_caps(
                                     &pending_candidate_plan_refs,
                                     &options,
                                     &immediate_snapshot,
                                     &immediate_reconciliations,
+                                    &account_symbol_caps,
                                 );
                             let (candidate_executable_refs, mut effective_min_suppressed_refs) =
                                 copy_live_daemon_suppress_refs_below_effective_min(
@@ -10790,12 +10898,14 @@ async fn run_copy_live_daemon_supervisor(
             pending_would_submit_plan_refs,
             &live_submit_chunks,
         );
+    let account_symbol_caps = copy_live_daemon_account_symbol_caps(config, &target_accounts);
     let (executable_submit_plan_refs, mut suppressed_submit_plan_refs) =
-        copy_live_daemon_executable_refs_for_snapshot(
+        copy_live_daemon_executable_refs_for_snapshot_with_symbol_caps(
             &pending_would_submit_plan_refs,
             &options,
             &saved,
             &pre_submit_reconciliations,
+            &account_symbol_caps,
         );
     suppressed_submit_plan_refs.append(&mut deferred_open_suppressed_refs);
     let (executable_submit_plan_refs, mut effective_min_suppressed_refs) =
@@ -14616,6 +14726,7 @@ fn copy_live_daemon_signal_id_without_timestamp(signal_id: &str) -> &str {
         .unwrap_or(signal_id)
 }
 
+#[cfg(test)]
 fn copy_live_daemon_executable_refs_for_snapshot(
     refs: &[CopyLiveDaemonWouldSubmitRef],
     options: &CopyLiveDaemonSupervisorOptions,
@@ -14625,20 +14736,58 @@ fn copy_live_daemon_executable_refs_for_snapshot(
     Vec<CopyLiveDaemonWouldSubmitRef>,
     Vec<CopyLiveDaemonSuppressedWouldSubmitRef>,
 ) {
+    copy_live_daemon_executable_refs_for_snapshot_with_symbol_caps(
+        refs,
+        options,
+        persistence,
+        reconciliations,
+        &HashMap::new(),
+    )
+}
+
+fn copy_live_daemon_executable_refs_for_snapshot_with_symbol_caps(
+    refs: &[CopyLiveDaemonWouldSubmitRef],
+    options: &CopyLiveDaemonSupervisorOptions,
+    persistence: &strategies::smart_money::CopyPersistenceSnapshot,
+    reconciliations: &[CopyBoundedLiveWindowReconcile],
+    account_symbol_caps: &HashMap<String, f64>,
+) -> (
+    Vec<CopyLiveDaemonWouldSubmitRef>,
+    Vec<CopyLiveDaemonSuppressedWouldSubmitRef>,
+) {
     let (margin_adjusted_refs, mut suppressed_refs) =
         copy_live_daemon_resize_open_refs_for_margin(refs, reconciliations);
     let (prepared_refs, mut follow_suppressed_refs) =
-        copy_live_daemon_prepare_refs_for_follow_position_limits(
+        copy_live_daemon_prepare_refs_for_follow_position_limits_with_symbol_caps(
             &margin_adjusted_refs,
             options,
             persistence,
             reconciliations,
+            account_symbol_caps,
         );
     suppressed_refs.append(&mut follow_suppressed_refs);
     let (executable_refs, mut cap_suppressed_refs) =
         partition_copy_live_daemon_would_submit_refs(&prepared_refs, options);
     suppressed_refs.append(&mut cap_suppressed_refs);
     (executable_refs, suppressed_refs)
+}
+
+fn copy_live_daemon_account_symbol_caps(
+    config: &config::AppConfig,
+    account_ids: &[String],
+) -> HashMap<String, f64> {
+    account_ids
+        .iter()
+        .filter_map(|account_id| {
+            let account = config.account(account_id)?;
+            let cap = account.max_order_notional_usd;
+            if cap.is_finite() && cap > 0.0 {
+                Some((account.account_id.clone(), cap))
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 fn copy_live_daemon_resize_open_refs_for_margin(
@@ -14718,11 +14867,31 @@ fn copy_live_daemon_resize_open_refs_for_margin(
     (prepared, suppressed)
 }
 
+#[cfg(test)]
 fn copy_live_daemon_prepare_refs_for_follow_position_limits(
     refs: &[CopyLiveDaemonWouldSubmitRef],
     options: &CopyLiveDaemonSupervisorOptions,
     persistence: &strategies::smart_money::CopyPersistenceSnapshot,
     reconciliations: &[CopyBoundedLiveWindowReconcile],
+) -> (
+    Vec<CopyLiveDaemonWouldSubmitRef>,
+    Vec<CopyLiveDaemonSuppressedWouldSubmitRef>,
+) {
+    copy_live_daemon_prepare_refs_for_follow_position_limits_with_symbol_caps(
+        refs,
+        options,
+        persistence,
+        reconciliations,
+        &HashMap::new(),
+    )
+}
+
+fn copy_live_daemon_prepare_refs_for_follow_position_limits_with_symbol_caps(
+    refs: &[CopyLiveDaemonWouldSubmitRef],
+    options: &CopyLiveDaemonSupervisorOptions,
+    persistence: &strategies::smart_money::CopyPersistenceSnapshot,
+    reconciliations: &[CopyBoundedLiveWindowReconcile],
+    account_symbol_caps: &HashMap<String, f64>,
 ) -> (
     Vec<CopyLiveDaemonWouldSubmitRef>,
     Vec<CopyLiveDaemonSuppressedWouldSubmitRef>,
@@ -14733,6 +14902,33 @@ fn copy_live_daemon_prepare_refs_for_follow_position_limits(
         .collect::<HashSet<_>>();
     let mut pending_by_key = HashMap::<(String, String, String), f64>::new();
     let mut effective_exposure_by_symbol = HashMap::<(String, String), f64>::new();
+    let mut live_exposure_by_symbol = reconciliations
+        .iter()
+        .filter(|reconcile| reconcile.error.is_none())
+        .flat_map(|reconcile| {
+            reconcile
+                .position_summaries
+                .iter()
+                .filter_map(move |position| {
+                    let value = position
+                        .position_value
+                        .as_deref()
+                        .and_then(|value| value.trim().parse::<f64>().ok())?
+                        .abs();
+                    if value.is_finite() {
+                        Some(((reconcile.account_id.clone(), position.coin.clone()), value))
+                    } else {
+                        None
+                    }
+                })
+        })
+        .fold(
+            HashMap::<(String, String), f64>::new(),
+            |mut acc, (key, value)| {
+                *acc.entry(key).or_insert(0.0) += value;
+                acc
+            },
+        );
     let mut live_exposure_by_account = reconciliations
         .iter()
         .filter(|reconcile| reconcile.error.is_none())
@@ -14800,6 +14996,46 @@ fn copy_live_daemon_prepare_refs_for_follow_position_limits(
     for plan in refs {
         if !plan.order.reduce_only {
             let exposure_key = (plan.order.account_id.clone(), plan.order.coin.clone());
+            let live_symbol_exposure = live_exposure_by_symbol
+                .get(&exposure_key)
+                .copied()
+                .map(|value| value.max(0.0));
+            let current_symbol_exposure = live_symbol_exposure.unwrap_or_else(|| {
+                effective_exposure_by_symbol
+                    .get(&exposure_key)
+                    .copied()
+                    .unwrap_or(0.0)
+                    .max(0.0)
+            });
+            let next_symbol_exposure = current_symbol_exposure + plan.order.notional_usd.max(0.0);
+            if options.hold_positions_after_submit {
+                if let Some(symbol_cap) = account_symbol_caps
+                    .get(&plan.order.account_id)
+                    .copied()
+                    .filter(|cap| cap.is_finite() && *cap > 0.0)
+                {
+                    if next_symbol_exposure > symbol_cap + 1e-9 {
+                        let exposure_source = if live_symbol_exposure.is_some() {
+                            "live symbol"
+                        } else {
+                            "ledger symbol"
+                        };
+                        suppressed.push(CopyLiveDaemonSuppressedWouldSubmitRef {
+                            plan: plan.clone(),
+                            reason_code: "COPY_DAEMON_MAX_SYMBOL_EXPOSURE".to_string(),
+                            message: format!(
+                                "follow-position {exposure_source} exposure for {} {} would become {next_symbol_exposure:.6}, above account symbol cap {symbol_cap:.6}; existing exposure {:.6}, candidate {:.6}",
+                                plan.order.account_id,
+                                plan.order.coin,
+                                current_symbol_exposure,
+                                plan.order.notional_usd
+                            ),
+                        });
+                        continue;
+                    }
+                }
+            }
+
             let live_account_exposure = live_exposure_by_account
                 .get(&plan.order.account_id)
                 .copied()
@@ -14833,6 +15069,7 @@ fn copy_live_daemon_prepare_refs_for_follow_position_limits(
             } else {
                 if live_account_exposure.is_some() {
                     live_exposure_by_account.insert(plan.order.account_id.clone(), next_exposure);
+                    live_exposure_by_symbol.insert(exposure_key, next_symbol_exposure);
                 } else {
                     effective_exposure_by_symbol.insert(exposure_key, next_exposure);
                 }

@@ -5,7 +5,7 @@ param(
     [int]$StaleRoundGraceSecs = 900,
     [double]$PrincipalCapUsd = 35.0,
     [double]$Leverage = 10.0,
-    [double]$MaxTotalNotionalUsd = 700.0,
+    [double]$MaxTotalNotionalUsd = 0.0,
     [double]$MaxTotalFeesUsd = 1.0,
     [int]$StopConfirmPolls = 3,
     [int]$NotificationCooldownSecs = 900,
@@ -38,6 +38,9 @@ $stopCandidateReason = ""
 $stopCandidateCount = 0
 $lastStopNotificationReason = ""
 $lastStopNotificationAt = [datetime]::MinValue
+if ([double]::IsNaN($MaxTotalNotionalUsd) -or [double]::IsInfinity($MaxTotalNotionalUsd) -or $MaxTotalNotionalUsd -le 0.0) {
+    $MaxTotalNotionalUsd = $PrincipalCapUsd * $Leverage
+}
 
 function Write-MonitorLog {
     param([string]$Message)
