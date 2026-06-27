@@ -985,7 +985,13 @@ impl CopyDryRunShadowPipeline {
             })
             .unwrap_or(self.strategy.config.default_copy_ratio);
         let mapped_close_notional_usd = self
-            .mapped_close_notional_usd(action)
+            .mapped_close_notional_usd(
+                action,
+                matches!(
+                    evaluate_copy_live_gate(self.config.live_gate),
+                    CopyLiveGateDecision::LiveAllowed
+                ),
+            )
             .filter(|notional| *notional > 0.0);
         let is_mapped_close = mapped_close_notional_usd.is_some();
         let is_close_or_reduce =
@@ -1094,14 +1100,31 @@ impl CopyDryRunShadowPipeline {
         })
     }
 
-    fn mapped_close_notional_usd(&self, action: &SemanticLeaderAction) -> Option<f64> {
+    fn mapped_close_notional_usd(
+        &self,
+        action: &SemanticLeaderAction,
+        submitted_only: bool,
+    ) -> Option<f64> {
         let close_side = action.kind.close_side()?;
-        Some(self.ledger.mapped_close_notional_usd_for_leader_group(
-            &self.config.local_account_id,
-            &action.leader_id,
-            &action.coin,
-            close_side,
-        ))
+        let exposure_side = opposite_order_side(close_side);
+        if submitted_only {
+            Some(
+                self.ledger
+                    .submitted_effective_exposure_usd_for_leader_group(
+                        &self.config.local_account_id,
+                        &action.leader_id,
+                        &action.coin,
+                        exposure_side,
+                    ),
+            )
+        } else {
+            Some(self.ledger.mapped_close_notional_usd_for_leader_group(
+                &self.config.local_account_id,
+                &action.leader_id,
+                &action.coin,
+                close_side,
+            ))
+        }
     }
 }
 
@@ -2926,6 +2949,71 @@ mod tests {
                 .effective_exposure_usd("addr_a", "xyz:XYZ100", OrderSide::Buy),
             0.0
         );
+    }
+
+    #[test]
+    fn live_shadow_partial_reduce_ignores_unsubmitted_pending_reduce_for_mapping() {
+        let now = now_ms();
+        let mut config = dry_run_shadow_config();
+        config.live_gate = CopyLiveGateInput {
+            process_dry_run: false,
+            live_copy_enabled: true,
+            account_worker_live: true,
+        };
+        let mut open = ledger_entry(
+            "sig-open",
+            OrderSide::Buy,
+            75.0,
+            0.0,
+            75.0,
+            75.0,
+            CopyLedgerStatus::Open,
+        );
+        open.submitted_at_ms = Some(now - 10);
+        open.filled_at_ms = Some(now - 9);
+        open.order_oid = Some(42);
+        let pending_reduce = ledger_entry(
+            "sig-stale-unsubmitted-reduce",
+            OrderSide::Buy,
+            75.0,
+            75.0,
+            0.0,
+            75.0,
+            CopyLedgerStatus::PendingReduce,
+        );
+        let mut ledger = CopyLedger::new();
+        ledger.push(open);
+        ledger.push(pending_reduce);
+        let mut pipeline = CopyDryRunShadowPipeline::new(config, copy_strategy(), ledger);
+
+        pipeline.handle_watcher_event(position_event("leader_a", 10.0, 100.0), now);
+        pipeline.handle_watcher_event(
+            CopyLeaderWatcherEvent::Fill {
+                leader_id: "leader_a".to_string(),
+                leader_address: "0xABC".to_string(),
+                fill: leader_fill(
+                    "shadow-live-partial-reduce-with-stale-pending-1",
+                    "leader_a",
+                    OrderSide::Sell,
+                    100.0,
+                ),
+                is_snapshot: false,
+            },
+            now + 1,
+        );
+        let records = pipeline.handle_watcher_event(position_event("leader_a", 1.0, 10.0), now + 2);
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].action.kind, LeaderActionKind::ReduceLong);
+        assert_eq!(
+            records[0].risk_decision,
+            CopySignalRiskDecision::Approved {
+                side: OrderSide::Sell,
+                reduce_only: true,
+                notional_usd: 75.0,
+            }
+        );
+        assert!(records[0].signal.is_some());
     }
 
     #[test]

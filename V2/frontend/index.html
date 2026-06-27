@@ -1566,10 +1566,17 @@
         white-space: normal;
       }
 
-      .position-owner-badge[data-owner="unattributed"] {
+      .position-owner-badge[data-owner="unattributed"],
+      .position-owner-badge[data-owner="dust"] {
         color: #ffd9a8;
         border-color: rgba(255, 190, 120, 0.28);
         background: rgba(255, 190, 120, 0.08);
+      }
+
+      .position-owner-badge[data-owner="mixed"] {
+        color: #b9d7ff;
+        border-color: rgba(120, 170, 255, 0.24);
+        background: rgba(120, 170, 255, 0.08);
       }
 
       .position-owner-badge[data-owner="fib"],
@@ -3294,7 +3301,7 @@
       const QUOTE_WS_RETRY_MS = 1500;
       const DASHBOARD_SNAPSHOT_REFRESH_MS = 20000;
       const DASHBOARD_TPSL_RULES_CACHE_MS = 30000;
-      const UI_REVISION = "ui-2026-06-23-copy-multi-account-cancel";
+      const UI_REVISION = "ui-2026-06-26-copy-position-truth";
       const MIN_OPENING_NOTIONAL_USD = 10;
       const FIB_MIN_PER_LEVEL_NOTIONAL_USD = 11;
       const COPY_SUPPORTED_MARKET_IDS = ["xyz_perp", "hl_perp", "cash_perp", "spot"];
@@ -3561,6 +3568,8 @@
           "dashboard.position.owner_fib_residual": "Fib residual",
           "dashboard.position.owner_copy": "Smart Money",
           "dashboard.position.owner_unattributed": "Unassigned",
+          "dashboard.position.owner_dust": "Dust",
+          "dashboard.position.owner_mixed": "Mixed",
           "dashboard.position.spot_min_lot_blocked": "{coin} size {size} is below the exchange size step {step}. Native TP/SL and close are disabled for this spot position.",
           "dashboard.tpsl.result": "Position TP/SL Result",
           "dashboard.tpsl.apply": "Apply TP/SL",
@@ -4032,12 +4041,19 @@
           "copy.overview_title": "Copy Strategy",
           "copy.overview_subtitle": "{leaders} target(s) · current soak {orders} submitted · {approved} approved · {rejected} rejected · {deduped} deduped",
           "copy.my_pnl": "My PnL",
+          "copy.my_copy_pnl": "My Copy PnL",
+          "copy.all_local_pnl": "All Selected Account PnL",
           "copy.target_pnl": "Target PnL",
           "copy.target_raw_pnl": "Target Raw PnL",
           "copy.target_accounts": "Target Copy Accounts",
           "copy.local_copy_accounts": "Local Copy Accounts",
-          "copy.local_detail": "Local account detail",
-          "copy.local_position_detail": "Local position detail",
+          "copy.live_truth_title": "Current copied positions",
+          "copy.copy_owned_detail": "Copy-owned account detail",
+          "copy.copy_owned_position_detail": "Copy-owned position detail",
+          "copy.local_detail": "Selected account live detail",
+          "copy.local_position_detail": "Selected account live positions",
+          "copy.other_local_detail": "Unassigned / other strategy account detail",
+          "copy.other_local_position_detail": "Unassigned / other strategy position detail",
           "copy.trade_count": "Trades",
           "copy.current_run_orders": "Current Soak Orders",
           "copy.history_total_orders": "Current run total",
@@ -4050,15 +4066,21 @@
           "copy.fees": "Fees",
           "copy.notional": "Notional",
           "copy.position_value": "Position Value",
+          "copy.side_size": "Side / Size",
           "copy.last_signal": "Last Signal",
           "copy.advanced_compare": "Advanced: PnL and account detail",
           "copy.leader_detail": "Target copy account detail",
           "copy.position_detail": "Position detail",
           "copy.no_positions": "No open positions",
+          "copy.more_positions": "{count} more position(s) in Advanced",
           "copy.no_leaders": "No target accounts found yet",
           "copy.target_positions_unknown": "Target positions not refreshed",
           "copy.target_positions_partial": "Target positions partially refreshed",
           "copy.target_positions_current": "Target positions current",
+          "copy.target_truth_current": "All target accounts refreshed; {count} target position(s) are open now.",
+          "copy.target_truth_partial": "Only part of the target side refreshed. Unknown is not the same as flat.",
+          "copy.target_truth_unknown": "Target positions are unknown right now. Unknown is not the same as flat.",
+          "copy.truth_reconcile_note": "Copied {copy} + unassigned {other} = total live {total} position(s).",
           "copy.pnl_report": "PnL Report",
           "copy.pnl_report_time": "Report Time",
           "copy.pnl_report_missing": "PnL report not found yet.",
@@ -4265,6 +4287,8 @@
           "dashboard.position.owner_fib_residual": "斐波那契残留",
           "dashboard.position.owner_copy": "聪明钱跟单",
           "dashboard.position.owner_unattributed": "未归属",
+          "dashboard.position.owner_dust": "灰尘仓",
+          "dashboard.position.owner_mixed": "混合归属",
           "dashboard.position.spot_min_lot_blocked": "{coin} 数量 {size} 低于交易所最小数量步进 {step}，这条现货仓位已禁用原生止盈止损和平仓操作。",
           "dashboard.tpsl.result": "持仓止盈止损结果",
           "dashboard.tpsl.apply": "应用止盈止损",
@@ -4736,12 +4760,19 @@
           "copy.overview_title": "跟单策略",
           "copy.overview_subtitle": "{leaders} 个目标 · 当前长测 {orders} 笔下单 · 通过 {approved} · 拦截 {rejected} · 去重 {deduped}",
           "copy.my_pnl": "我的盈亏",
+          "copy.my_copy_pnl": "我的跟单盈亏",
+          "copy.all_local_pnl": "选中账号总盈亏",
           "copy.target_pnl": "目标盈亏",
           "copy.target_raw_pnl": "目标原始盈亏",
           "copy.target_accounts": "目标跟单账户",
           "copy.local_copy_accounts": "本地跟单账号",
-          "copy.local_detail": "本地账号明细",
-          "copy.local_position_detail": "本地持仓明细",
+          "copy.live_truth_title": "当前跟单仓位",
+          "copy.copy_owned_detail": "跟单归属账号明细",
+          "copy.copy_owned_position_detail": "跟单归属持仓明细",
+          "copy.local_detail": "选中账号实时明细",
+          "copy.local_position_detail": "选中账号全部实时持仓",
+          "copy.other_local_detail": "未归属 / 其他策略账号明细",
+          "copy.other_local_position_detail": "未归属 / 其他策略持仓明细",
           "copy.trade_count": "交易次数",
           "copy.current_run_orders": "当前长测订单",
           "copy.history_total_orders": "当前运行累计",
@@ -4754,15 +4785,21 @@
           "copy.fees": "手续费",
           "copy.notional": "成交额",
           "copy.position_value": "持仓价值",
+          "copy.side_size": "方向 / 数量",
           "copy.last_signal": "最近信号",
           "copy.advanced_compare": "高级：盈亏和账号明细",
           "copy.leader_detail": "目标跟单账户明细",
           "copy.position_detail": "持仓明细",
           "copy.no_positions": "暂无持仓",
+          "copy.more_positions": "高级里还有 {count} 条仓位",
           "copy.no_leaders": "还没有识别到目标跟单账号",
           "copy.target_positions_unknown": "目标仓位未刷新",
           "copy.target_positions_partial": "目标仓位部分已刷新",
           "copy.target_positions_current": "目标仓位已刷新",
+          "copy.target_truth_current": "目标侧已全部刷新，当前共有 {count} 条持仓。",
+          "copy.target_truth_partial": "目标侧只刷新到一部分账号，未知不等于空仓。",
+          "copy.target_truth_unknown": "目标侧当前是未知状态，未知不等于空仓。",
+          "copy.truth_reconcile_note": "跟单归属 {copy} 条 + 未归属 {other} 条 = 选中账号实时总仓位 {total} 条。",
           "copy.pnl_report": "盈亏报告",
           "copy.pnl_report_time": "报告时间",
           "copy.pnl_report_missing": "暂未找到盈亏报告。",
@@ -9159,6 +9196,7 @@
           mark_price: meta.markPrice,
           pnl_usd: 0,
           position_value_usd: meta.positionValueUsd,
+          ...positionBackendAttributionFields(balance),
         };
       }
 
@@ -9182,6 +9220,7 @@
           mark_price: mark,
           pnl_usd: pnl,
           position_value_usd: Math.abs(value),
+          ...positionBackendAttributionFields(position),
         };
       }
 
@@ -9228,37 +9267,253 @@
         );
       }
 
+      function copySummaryHasExplicitOwnership(summary) {
+        if (!summary || typeof summary !== "object") return false;
+        return Object.prototype.hasOwnProperty.call(summary, "copy_owned_summaries")
+          || Object.prototype.hasOwnProperty.call(summary, "copy_owned_summary")
+          || Object.prototype.hasOwnProperty.call(summary, "other_local_summaries")
+          || Object.prototype.hasOwnProperty.call(summary, "other_local_summary");
+      }
+
+      function copySummaryOwnedAccounts(summary) {
+        if (Array.isArray(summary?.copy_owned_summaries) && summary.copy_owned_summaries.length > 0) {
+          return summary.copy_owned_summaries;
+        }
+        return summary?.copy_owned_summary ? [summary.copy_owned_summary] : [];
+      }
+
+      function copySummaryLocalAccounts(summary) {
+        if (Array.isArray(summary?.local_summaries) && summary.local_summaries.length > 0) {
+          return summary.local_summaries;
+        }
+        return summary?.local_summary ? [summary.local_summary] : [];
+      }
+
+      function copySummaryOtherAccounts(summary) {
+        if (!copySummaryHasExplicitOwnership(summary)) {
+          return [];
+        }
+        if (Array.isArray(summary?.other_local_summaries) && summary.other_local_summaries.length > 0) {
+          return summary.other_local_summaries;
+        }
+        return summary?.other_local_summary ? [summary.other_local_summary] : [];
+      }
+
       function copySummaryOwnsPosition(summary, position) {
-        const localPositions = Array.isArray(summary?.local_summary?.positions)
-          ? summary.local_summary.positions
-          : [];
+        const positionAccountId = String(position?.account_id || "").trim();
+        const localAccounts = copySummaryOwnedAccounts(summary);
         const positionCoin = normalizedPositionCoinKey(position?.coin);
         const positionSide = dashboardPositionSide(position);
-        return localPositions.some((item) => {
-          const itemCoin = normalizedPositionCoinKey(item?.coin);
-          const itemSide = String(item?.side || "").trim().toLowerCase();
-          return itemCoin && itemCoin === positionCoin
-            && (!positionSide || !itemSide || itemSide === positionSide)
-            && Math.abs(parseNum(item?.size)) > MANUAL_POSITION_DUST_EPS;
+        return localAccounts.some((account) => {
+          if (positionAccountId && account?.id && String(account.id) !== positionAccountId) {
+            return false;
+          }
+          const localPositions = Array.isArray(account?.positions) ? account.positions : [];
+          return localPositions.some((item) => {
+            const itemCoin = normalizedPositionCoinKey(item?.coin);
+            const itemSide = String(item?.side || "").trim().toLowerCase();
+            return itemCoin && itemCoin === positionCoin
+              && (!positionSide || !itemSide || itemSide === positionSide)
+              && Math.abs(parseNum(item?.size)) > MANUAL_POSITION_DUST_EPS;
+          });
         });
       }
 
+      function dashboardPositionAbsSize(position) {
+        return Math.abs(parseNum(position?.size));
+      }
+
+      function dashboardPositionNotionalUsd(position) {
+        const explicitValue = Math.abs(parseNum(position?.position_value_usd));
+        if (explicitValue > MANUAL_POSITION_DUST_EPS) return explicitValue;
+        const size = dashboardPositionAbsSize(position);
+        const mark = Math.abs(parseNum(position?.mark_price));
+        if (size <= MANUAL_POSITION_DUST_EPS || !(mark > 0)) return 0;
+        return size * mark;
+      }
+
+      function positionBackendAttributionFields(source) {
+        const fields = {};
+        const keys = [
+          "owner",
+          "attribution_source",
+          "fib_ratio",
+          "copy_ratio",
+          "unattributed_ratio",
+          "dust_ratio",
+          "fib_position_value_usd",
+          "copy_position_value_usd",
+          "unattributed_position_value_usd",
+          "dust_position_value_usd",
+          "fib_pnl_usd",
+          "copy_pnl_usd",
+          "unattributed_pnl_usd",
+          "dust_pnl_usd",
+        ];
+        for (const key of keys) {
+          if (Object.prototype.hasOwnProperty.call(source || {}, key)) {
+            fields[key] = source[key];
+          }
+        }
+        fields.attribution_parts = Array.isArray(source?.attribution_parts)
+          ? source.attribution_parts.map((part) => ({ ...part }))
+          : [];
+        return fields;
+      }
+
+      function backendAttributionLabelForPart(part) {
+        const key = String(part?.key || "").trim().toLowerCase();
+        const source = String(part?.source || "").trim().toLowerCase();
+        if (key === "fib") {
+          return source.includes("residual")
+            ? t("dashboard.position.owner_fib_residual")
+            : t("dashboard.position.owner_fib");
+        }
+        if (key === "copy") return t("dashboard.position.owner_copy");
+        if (key === "dust") return t("dashboard.position.owner_dust");
+        return t("dashboard.position.owner_unattributed");
+      }
+
+      function dashboardBackendOwnershipBreakdown(position) {
+        const hasBackend = String(position?.attribution_source || "") === "backend_position_truth"
+          || Object.prototype.hasOwnProperty.call(position || {}, "owner")
+          || Object.prototype.hasOwnProperty.call(position || {}, "attribution_parts");
+        if (!hasBackend) return null;
+        const parts = Array.isArray(position?.attribution_parts)
+          ? position.attribution_parts
+            .map((part) => ({
+              key: String(part?.key || "unattributed").trim().toLowerCase() || "unattributed",
+              source: String(part?.source || "").trim(),
+              ratio: Math.max(0, Math.min(parseNum(part?.ratio), 1)),
+            }))
+            .filter((part) => part.ratio > MANUAL_POSITION_DUST_EPS)
+          : [];
+        let owner = String(position?.owner || "").trim().toLowerCase();
+        if (!owner) owner = parts.length === 1 ? parts[0].key : (parts.length > 1 ? "mixed" : "unattributed");
+        if (!["fib", "copy", "unattributed", "dust", "mixed"].includes(owner)) owner = "unattributed";
+        const fibRatio = Math.max(0, Math.min(parseNum(position?.fib_ratio), 1));
+        const copyRatio = Math.max(0, Math.min(parseNum(position?.copy_ratio), 1));
+        const dustRatio = Math.max(0, Math.min(parseNum(position?.dust_ratio), 1));
+        const unattributedRatio = Math.max(0, Math.min(parseNum(position?.unattributed_ratio), 1));
+        const displayParts = parts.length > 0
+          ? parts
+          : [{ key: owner === "mixed" ? "unattributed" : owner, source: "", ratio: 1 }];
+        const labels = displayParts.map((part) => backendAttributionLabelForPart(part));
+        const label = owner === "mixed"
+          ? labels.join(" + ")
+          : backendAttributionLabelForPart(displayParts[0]);
+        const detail = displayParts
+          .map((part) => `${backendAttributionLabelForPart(part)} ${number(part.ratio * 100, 1)}%`)
+          .join(" / ");
+        return {
+          owner,
+          label: label || t("dashboard.position.owner_unattributed"),
+          detail,
+          fib_ratio: fibRatio,
+          copy_ratio: copyRatio,
+          unattributed_ratio: unattributedRatio,
+          dust_ratio: dustRatio,
+        };
+      }
+
+      function copySummaryOwnedExposureForPosition(summary, position) {
+        const positionAccountId = String(position?.account_id || "").trim();
+        const positionCoin = normalizedPositionCoinKey(position?.coin);
+        const positionSide = dashboardPositionSide(position);
+        const totals = {
+          size: 0,
+          position_value_usd: 0,
+          explicit: copySummaryHasExplicitOwnership(summary),
+        };
+        if (!positionCoin) return totals;
+        for (const account of copySummaryOwnedAccounts(summary)) {
+          if (positionAccountId && account?.id && String(account.id) !== positionAccountId) {
+            continue;
+          }
+          for (const item of Array.isArray(account?.positions) ? account.positions : []) {
+            const itemCoin = normalizedPositionCoinKey(item?.coin);
+            const itemSide = String(item?.side || "").trim().toLowerCase();
+            if (!itemCoin || itemCoin !== positionCoin) continue;
+            if (positionSide && itemSide && itemSide !== positionSide) continue;
+            totals.size += Math.abs(parseNum(item?.size));
+            totals.position_value_usd += Math.abs(parseNum(item?.position_value_usd));
+          }
+        }
+        return totals;
+      }
+
+      function fibStrategyPositionSide(instance) {
+        const direction = String(instance?.config?.direction || instance?.plan?.direction || "")
+          .trim()
+          .toLowerCase();
+        if (direction === "short") return "short";
+        if (direction === "long") return "long";
+        return "";
+      }
+
+      function fibOwnedExposureForPosition(position) {
+        const positionAccountId = String(position?.account_id || "").trim();
+        const positionCoin = normalizedPositionCoinKey(position?.coin);
+        const positionSide = dashboardPositionSide(position);
+        const liveNotional = dashboardPositionNotionalUsd(position);
+        const liveSize = dashboardPositionAbsSize(position);
+        const totals = {
+          size: 0,
+          position_value_usd: 0,
+          residual_only: false,
+        };
+        const matchedResidualFlags = [];
+        for (const instance of Array.isArray(state.fibInstances) ? state.fibInstances : []) {
+          const summary = instance?.pnl_summary || {};
+          if (Math.abs(parseNum(summary.open_position_size)) <= MANUAL_POSITION_DUST_EPS) continue;
+          const instanceCoin = normalizedPositionCoinKey(instance?.config?.coin || instance?.plan?.coin);
+          if (!instanceCoin || !positionCoin || instanceCoin !== positionCoin) continue;
+          const fibSide = fibStrategyPositionSide(instance);
+          if (positionSide && fibSide && fibSide !== positionSide) continue;
+          const status = String(instance?.status || "").trim().toLowerCase();
+          const isResidual = status === "killed" || status === "completed";
+          const accounts = Array.isArray(summary.account_summaries) ? summary.account_summaries : [];
+          if (accounts.length === 0) {
+            const openSize = Math.abs(parseNum(summary.open_position_size));
+            if (openSize <= MANUAL_POSITION_DUST_EPS) continue;
+            totals.size += openSize;
+            if (liveSize > MANUAL_POSITION_DUST_EPS && liveNotional > MANUAL_POSITION_DUST_EPS) {
+              totals.position_value_usd += (openSize / liveSize) * liveNotional;
+            }
+            matchedResidualFlags.push(isResidual);
+            continue;
+          }
+          for (const account of accounts) {
+            if (positionAccountId && String(account?.account_id || "") !== positionAccountId) {
+              continue;
+            }
+            const openSize = Math.abs(parseNum(account?.open_position_size));
+            if (openSize <= MANUAL_POSITION_DUST_EPS) continue;
+            totals.size += openSize;
+            if (liveSize > MANUAL_POSITION_DUST_EPS && liveNotional > MANUAL_POSITION_DUST_EPS) {
+              totals.position_value_usd += (openSize / liveSize) * liveNotional;
+            }
+            matchedResidualFlags.push(isResidual);
+          }
+        }
+        totals.residual_only = matchedResidualFlags.length > 0 && matchedResidualFlags.every(Boolean);
+        return totals;
+      }
+
+      function dashboardOwnershipBreakdown(position) {
+        return dashboardBackendOwnershipBreakdown(position) || {
+          owner: "unattributed",
+          label: t("dashboard.position.owner_unattributed"),
+          detail: `${t("dashboard.position.owner_unattributed")} 100.0%`,
+          fib_ratio: 0,
+          copy_ratio: 0,
+          unattributed_ratio: 1,
+          dust_ratio: 0,
+        };
+      }
+
       function dashboardPositionAttribution(position) {
-        const fibMatch = (Array.isArray(state.fibInstances) ? state.fibInstances : [])
-          .find((instance) => fibInstanceOwnsPosition(instance, position));
-        if (fibMatch) {
-          const status = String(fibMatch?.status || "").toLowerCase();
-          return {
-            owner: "fib",
-            label: status === "killed" || status === "completed"
-              ? t("dashboard.position.owner_fib_residual")
-              : t("dashboard.position.owner_fib"),
-          };
-        }
-        if (copySummaryOwnsPosition(state.copySummary, position)) {
-          return { owner: "copy", label: t("dashboard.position.owner_copy") };
-        }
-        return { owner: "unattributed", label: t("dashboard.position.owner_unattributed") };
+        return dashboardOwnershipBreakdown(position);
       }
 
       function dashboardPositionAttributionSummary(positions) {
@@ -9270,15 +9525,17 @@
         };
         for (const position of Array.isArray(positions) ? positions : []) {
           if (Math.abs(parseNum(position?.size)) <= MANUAL_POSITION_DUST_EPS) continue;
-          const attribution = dashboardPositionAttribution(position);
+          const attribution = dashboardOwnershipBreakdown(position);
           const pnl = parseNum(position?.pnl_usd);
-          if (attribution.owner === "unattributed") {
-            summary.unattributed_unrealized_pnl_usd += pnl;
-            summary.unattributed_position_count += 1;
-          } else {
-            summary.attributed_unrealized_pnl_usd += pnl;
-            summary.attributed_position_count += 1;
-          }
+          const attributedRatio = Math.min(attribution.fib_ratio + attribution.copy_ratio, 1);
+          const unattributedRatio = Math.max(
+            0,
+            Math.min(parseNum(attribution.unattributed_ratio) + parseNum(attribution.dust_ratio), 1)
+          );
+          summary.attributed_unrealized_pnl_usd += pnl * attributedRatio;
+          summary.unattributed_unrealized_pnl_usd += pnl * unattributedRatio;
+          if (attributedRatio > MANUAL_POSITION_DUST_EPS) summary.attributed_position_count += 1;
+          if (unattributedRatio > MANUAL_POSITION_DUST_EPS) summary.unattributed_position_count += 1;
         }
         return summary;
       }
@@ -11281,18 +11538,49 @@
         return value == null ? t("copy.waiting_pnl") : signedMoney(value);
       }
 
-      function copyTargetPositionStateText(summary) {
-        const stateText = String(summary?.target_position_state || "").toLowerCase();
+      function copyTruthStateText(stateValue) {
+        const stateText = String(stateValue || "").toLowerCase();
         if (stateText === "current") return t("copy.target_positions_current");
         if (stateText === "partial") return t("copy.target_positions_partial");
         if (stateText === "unconfigured") return "-";
         return t("copy.target_positions_unknown");
       }
 
+      function copyTargetPositionStateText(summary) {
+        return copyTruthStateText(summary?.target_position_state);
+      }
+
       function copyTargetOpenPositionText(summary) {
         const stateText = String(summary?.target_position_state || "").toLowerCase();
         if (stateText !== "current" && stateText !== "partial") return "-";
         return number(summary?.target_open_position_count || 0, 0);
+      }
+
+      function copyAccountTruthState(account) {
+        return String(account?.truth_state || "").trim().toLowerCase();
+      }
+
+      function copyAccountTruthStateText(account) {
+        const stateText = copyAccountTruthState(account);
+        return stateText ? copyTruthStateText(stateText) : "";
+      }
+
+      function copyAccountOpenPositionCountText(account) {
+        const stateText = copyAccountTruthState(account);
+        if (stateText && stateText !== "current" && stateText !== "partial") return "-";
+        return number(account?.open_position_count || 0, 0);
+      }
+
+      function copyAccountsTruthRollup(accounts) {
+        const states = (Array.isArray(accounts) ? accounts : [])
+          .map((account) => copyAccountTruthState(account))
+          .filter(Boolean);
+        if (!states.length) return "";
+        const currentCount = states.filter((stateText) => stateText === "current").length;
+        const partialCount = states.filter((stateText) => stateText === "partial").length;
+        if (currentCount === states.length) return "current";
+        if (currentCount + partialCount > 0) return "partial";
+        return "unavailable";
       }
 
       function copyAccountLabel(account, fallbackIndex = 0) {
@@ -11314,6 +11602,20 @@
         `;
       }
 
+      function copyDirectionLabel(side) {
+        const normalized = String(side || "").trim().toLowerCase();
+        if (normalized === "long") return state.lang === "zh" ? "多" : "Long";
+        if (normalized === "short") return state.lang === "zh" ? "空" : "Short";
+        return "-";
+      }
+
+      function copyPositionSideSizeText(position) {
+        const direction = copyDirectionLabel(position?.side);
+        const size = parseNum(position?.size);
+        if (!(size > 0)) return direction;
+        return `${direction} · ${number(size, size >= 1 ? 4 : 6)}`;
+      }
+
       function copyPnlReportStatusText(summary) {
         if (!summary?.pnl_report_path) return t("copy.pnl_report_missing");
         const minutes = summary.pnl_report_age_minutes == null
@@ -11328,6 +11630,8 @@
         accountLabel = t("copy.target_accounts"),
         pnlLabel = t("copy.target_raw_pnl"),
         emptyText = t("copy.no_leaders"),
+        countLabel = t("copy.open_positions"),
+        countValue = (account) => copyAccountOpenPositionCountText(account),
       } = {}) {
         if (!accounts.length) {
           return `<div class="quote-meta">${emptyText}</div>`;
@@ -11339,19 +11643,21 @@
               : Number(account?.realized_pnl_usd || 0) + Number(account?.unrealized_pnl_usd || 0)
           );
           const lastSignal = account?.last_signal_at_ms ? formatDateTime(account.last_signal_at_ms) : "-";
+          const truthStateText = copyAccountTruthStateText(account);
           return `
             <div class="copy-account-row">
               <div class="copy-account-cell">
                 <span>${escapeHtml(accountLabel)}</span>
                 <strong title="${escapeHtml(account?.address || "")}">${escapeHtml(copyAccountLabel(account, index))}${account?.address ? ` · ${escapeHtml(shortAddress(account.address))}` : ""}</strong>
+                ${truthStateText ? `<small>${escapeHtml(truthStateText)}</small>` : ""}
               </div>
               <div class="copy-account-cell">
                 <span>${escapeHtml(pnlLabel)}</span>
                 <strong class="${escapeHtml(pnlClass(total))}">${escapeHtml(nullableMoney(total))}</strong>
               </div>
               <div class="copy-account-cell">
-                <span>${t("copy.trade_count")}</span>
-                <strong>${escapeHtml(number(account?.fill_count || 0, 0))}</strong>
+                <span>${escapeHtml(countLabel)}</span>
+                <strong>${escapeHtml(countValue(account))}</strong>
               </div>
               <div class="copy-account-cell">
                 <span>${t("copy.last_signal")}</span>
@@ -11365,6 +11671,9 @@
       function copyPositionsHtml(accounts, {
         accountLabel = t("copy.target_accounts"),
         emptyText = t("copy.no_positions"),
+        unknownText = emptyText,
+        partialText = emptyText,
+        limit = 0,
       } = {}) {
         const positions = [];
         accounts.forEach((account, accountIndex) => {
@@ -11373,9 +11682,18 @@
           });
         });
         if (!positions.length) {
+          const truthRollup = copyAccountsTruthRollup(accounts);
+          if (truthRollup === "unavailable") {
+            return `<div class="quote-meta">${unknownText}</div>`;
+          }
+          if (truthRollup === "partial") {
+            return `<div class="quote-meta">${partialText}</div>`;
+          }
           return `<div class="quote-meta">${emptyText}</div>`;
         }
-        return positions.map(({ account, accountIndex, position }) => `
+        const visible = limit > 0 ? positions.slice(0, limit) : positions;
+        const moreCount = Math.max(positions.length - visible.length, 0);
+        const rows = visible.map(({ account, accountIndex, position }) => `
           <div class="copy-position-row">
             <div class="copy-position-cell">
               <span>${escapeHtml(accountLabel)}</span>
@@ -11384,6 +11702,10 @@
             <div class="copy-position-cell">
               <span>${t("table.coin")}</span>
               <strong class="mono">${escapeHtml(coinDisplayPair(position?.coin) || position?.coin || "-")}</strong>
+            </div>
+            <div class="copy-position-cell">
+              <span>${t("copy.side_size")}</span>
+              <strong>${escapeHtml(copyPositionSideSizeText(position))}</strong>
             </div>
             <div class="copy-position-cell">
               <span>${t("copy.position_value")}</span>
@@ -11395,6 +11717,9 @@
             </div>
           </div>
         `).join("");
+        return rows + (moreCount > 0
+          ? `<div class="quote-meta">${escapeHtml(t("copy.more_positions", { count: number(moreCount, 0) }))}</div>`
+          : "");
       }
 
       function copyRealtimeDashboardAttribution() {
@@ -11406,9 +11731,10 @@
         for (const position of Array.isArray(state.dashboardPositions) ? state.dashboardPositions : []) {
           if (Math.abs(parseNum(position?.size)) <= MANUAL_POSITION_DUST_EPS) continue;
           const attribution = dashboardPositionAttribution(position);
-          if (attribution.owner !== "copy") continue;
-          summary.pnl_usd += parseNum(position?.pnl_usd);
-          summary.position_value_usd += parseNum(position?.position_value_usd);
+          const copyRatio = Math.max(0, Math.min(parseNum(attribution.copy_ratio), 1));
+          if (copyRatio <= MANUAL_POSITION_DUST_EPS) continue;
+          summary.pnl_usd += parseNum(position?.pnl_usd) * copyRatio;
+          summary.position_value_usd += parseNum(position?.position_value_usd) * copyRatio;
           summary.position_count += 1;
         }
         return summary;
@@ -11418,40 +11744,52 @@
         const root = $("copySummary");
         if (!root) return;
         const summary = state.copySummary || {};
-        const existingAdvanced = root.querySelector(".copy-advanced-details");
-        if (existingAdvanced) {
-          state.copySummaryAdvancedOpen = existingAdvanced.open;
-        }
         const local = summary.local_summary || {};
-        const myTotal = local.total_pnl_usd ?? (
+        const copyOwnedSummary = summary.copy_owned_summary || {};
+        const otherLocalSummary = summary.other_local_summary || {};
+        const myTotal = copyOwnedSummary.total_pnl_usd ?? (
           summary.realized_pnl_usd == null && summary.unrealized_pnl_usd == null
             ? null
             : Number(summary.realized_pnl_usd || 0) + Number(summary.unrealized_pnl_usd || 0)
         );
-        const myRealized = local.realized_pnl_usd ?? summary.realized_pnl_usd;
+        const myRealized = summary.realized_pnl_usd ?? copyOwnedSummary.realized_pnl_usd;
         const ledgerRealtime = copyRealtimeDashboardAttribution();
         const hasRealtimeCopyPnl = ledgerRealtime.position_count > 0;
-        const myUnrealized = local.unrealized_pnl_usd ?? summary.unrealized_pnl_usd ?? (
+        const myUnrealized = copyOwnedSummary.unrealized_pnl_usd ?? summary.unrealized_pnl_usd ?? (
           hasRealtimeCopyPnl ? ledgerRealtime.pnl_usd : null
         );
         const myDisplayTotal = myRealized == null && myUnrealized == null
           ? myTotal
           : Number(myRealized || 0) + Number(myUnrealized || 0);
-        const myFees = local.fees_usd ?? summary.total_fees_usd;
+        const myFees = summary.total_fees_usd ?? copyOwnedSummary.fees_usd;
         const targetTotal = summary.target_total_pnl_usd;
         const targetRealized = summary.target_realized_pnl_usd;
         const targetUnrealized = summary.target_unrealized_pnl_usd;
         const dashboardPnl = state.dashboardPnl || {};
-        const unattributedPnl = dashboardPnl.unattributed_unrealized_pnl_usd;
-        const unattributedCount = Number(dashboardPnl.unattributed_position_count || 0);
+        const localSummaries = copySummaryLocalAccounts(summary);
+        const copyOwnedSummaries = copySummaryOwnedAccounts(summary);
+        const otherLocalSummaries = copySummaryOtherAccounts(summary)
+          .filter((account) => Number(account?.open_position_count || 0) > 0);
+        const localDisplayTotal = local.total_pnl_usd ?? (
+          local.realized_pnl_usd == null && local.unrealized_pnl_usd == null
+            ? null
+            : Number(local.realized_pnl_usd || 0) + Number(local.unrealized_pnl_usd || 0)
+        );
+        const copyOwnedCount = Number(copyOwnedSummary.open_position_count || 0);
+        const localCount = Number(local.open_position_count || 0);
+        const otherCount = Number(otherLocalSummary.open_position_count || dashboardPnl.unattributed_position_count || 0);
+        const unattributedPnl = otherLocalSummary.unrealized_pnl_usd ?? dashboardPnl.unattributed_unrealized_pnl_usd ?? 0;
+        const unattributedCount = otherCount;
+        const truthReconcileText = t("copy.truth_reconcile_note", {
+          copy: number(copyOwnedCount, 0),
+          other: number(otherCount, 0),
+          total: number(localCount, 0),
+        });
         const runningText = summary.live_running
           ? t("copy.live_soak_running")
           : t("copy.live_soak_stopped");
         const tone = summary.live_running ? "live" : "waiting";
         const leaders = Array.isArray(summary.leader_summaries) ? summary.leader_summaries : [];
-        const localSummaries = Array.isArray(summary.local_summaries) && summary.local_summaries.length > 0
-          ? summary.local_summaries
-          : (summary.local_summary ? [summary.local_summary] : []);
         const addressFallback = Array.isArray(summary.leader_addresses) ? summary.leader_addresses : [];
         const summaryMarkets = Array.isArray(summary.markets) && summary.markets.length > 0
           ? summary.markets
@@ -11511,6 +11849,22 @@
         const reportText = summary.pnl_report_path
           ? `${t("copy.pnl_report")}: ${summary.pnl_report_path}`
           : (summary.pnl_status || "-");
+        const targetStateRaw = String(summary?.target_position_state || "").toLowerCase();
+        const targetTruthText = targetStateRaw === "current"
+          ? t("copy.target_truth_current", { count: number(summary?.target_open_position_count || 0, 0) })
+          : targetStateRaw === "partial"
+            ? t("copy.target_truth_partial")
+            : t("copy.target_truth_unknown");
+        const otherPositionsSections = otherLocalSummaries.length > 0 ? `
+                <div class="fib-instance-section-title">${t("copy.other_local_detail")}</div>
+                ${copyAccountRowsHtml(otherLocalSummaries, {
+                  accountLabel: t("copy.local_copy_accounts"),
+                  pnlLabel: t("copy.unattributed_pnl"),
+                  emptyText: t("copy.no_positions"),
+                })}
+                <div class="fib-instance-section-title">${t("copy.other_local_position_detail")}</div>
+                ${copyPositionsHtml(otherLocalSummaries, { accountLabel: t("copy.local_copy_accounts") })}
+        ` : "";
         root.innerHTML = `
           <div class="fib-instance-card copy-overview-card">
             <div class="copy-overview-top">
@@ -11521,7 +11875,7 @@
               <span class="status-badge" data-status="${escapeHtml(tone)}">${escapeHtml(runningText)}</span>
             </div>
             <div class="copy-metric-grid">
-              ${copyMetricHtml(t("copy.my_pnl"), nullableMoney(myDisplayTotal), mySub, myDisplayTotal)}
+              ${copyMetricHtml(t("copy.my_copy_pnl"), nullableMoney(myDisplayTotal), mySub, myDisplayTotal)}
               ${copyMetricHtml(t("copy.target_raw_pnl"), nullableMoney(targetTotal), targetSub, targetTotal)}
               ${copyMetricHtml(t("copy.unattributed_pnl"), money(unattributedPnl || 0), t("copy.unattributed_positions", { count: number(unattributedCount, 0) }), unattributedPnl || 0)}
               ${copyMetricHtml(t("copy.target_accounts"), number(summary.leader_count || 0, 0), `${t("copy.open_positions")} ${copyTargetOpenPositionText(summary)} · ${copyTargetPositionStateText(summary)}`)}
@@ -11536,6 +11890,20 @@
             <div class="copy-address-list">
               ${addressHtml || `<span class="quote-meta">${t("copy.no_leaders")}</span>`}
             </div>
+            <div class="fib-instance-section-title">${t("copy.live_truth_title")}</div>
+            ${copyPositionsHtml(copyOwnedSummaries, {
+              accountLabel: t("copy.local_copy_accounts"),
+              limit: 6,
+              emptyText: t("copy.no_positions"),
+            })}
+            <div class="strategy-status-note">
+              <strong>${t("copy.my_copy_pnl")}</strong>
+              <span>${escapeHtml(truthReconcileText)}</span>
+            </div>
+            <div class="strategy-status-note">
+              <strong>${t("copy.target_accounts")}</strong>
+              <span>${escapeHtml(targetTruthText)}</span>
+            </div>
             <details class="copy-advanced-details" ${state.copySummaryAdvancedOpen ? "open" : ""}>
               <summary>
                 <span>${t("copy.advanced_compare")}</span>
@@ -11543,7 +11911,8 @@
               </summary>
               <div class="copy-advanced-body">
                 <div class="fib-instance-kv">
-                  <div><span>${t("copy.my_pnl")}</span><strong class="${escapeHtml(pnlClass(myDisplayTotal))}">${escapeHtml(nullableMoney(myDisplayTotal))}</strong></div>
+                  <div><span>${t("copy.my_copy_pnl")}</span><strong class="${escapeHtml(pnlClass(myDisplayTotal))}">${escapeHtml(nullableMoney(myDisplayTotal))}</strong></div>
+                  <div><span>${t("copy.all_local_pnl")}</span><strong class="${escapeHtml(pnlClass(localDisplayTotal))}">${escapeHtml(nullableMoney(localDisplayTotal))}</strong></div>
                   <div><span>${t("copy.target_raw_pnl")}</span><strong class="${escapeHtml(pnlClass(targetTotal))}">${escapeHtml(nullableMoney(targetTotal))}</strong></div>
                   <div><span>${t("copy.unattributed_pnl")}</span><strong class="${escapeHtml(pnlClass(unattributedPnl || 0))}">${escapeHtml(money(unattributedPnl || 0))}</strong></div>
                   <div><span>${t("copy.fees")}</span><strong>${escapeHtml(myFees == null ? "-" : money(myFees))}</strong></div>
@@ -11561,14 +11930,30 @@
                   ${hasRealtimeCopyPnl && local.unrealized_pnl_usd == null && summary.unrealized_pnl_usd == null ? `<span>${escapeHtml(t("copy.realtime_attribution_note"))}</span>` : ""}
                   ${unattributedCount > 0 ? `<span>${escapeHtml(t("copy.unattributed_warning", { count: number(unattributedCount, 0), pnl: money(unattributedPnl || 0) }))}</span>` : ""}
                 </div>
+                <div class="fib-instance-section-title">${t("copy.copy_owned_detail")}</div>
+                ${copyAccountRowsHtml(copyOwnedSummaries, {
+                  accountLabel: t("copy.local_copy_accounts"),
+                  pnlLabel: t("copy.my_copy_pnl"),
+                  emptyText: t("copy.no_positions"),
+                })}
+                <div class="fib-instance-section-title">${t("copy.copy_owned_position_detail")}</div>
+                ${copyPositionsHtml(copyOwnedSummaries, { accountLabel: t("copy.local_copy_accounts") })}
+                ${otherPositionsSections}
                 <div class="fib-instance-section-title">${t("copy.local_detail")}</div>
-                ${copyAccountRowsHtml(localSummaries, { accountLabel: t("copy.local_copy_accounts"), pnlLabel: t("copy.my_pnl"), emptyText: t("copy.error_requires_local_account") })}
+                ${copyAccountRowsHtml(localSummaries, {
+                  accountLabel: t("copy.local_copy_accounts"),
+                  pnlLabel: t("copy.all_local_pnl"),
+                  emptyText: t("copy.error_requires_local_account"),
+                })}
                 <div class="fib-instance-section-title">${t("copy.local_position_detail")}</div>
                 ${copyPositionsHtml(localSummaries, { accountLabel: t("copy.local_copy_accounts") })}
                 <div class="fib-instance-section-title">${t("copy.leader_detail")}</div>
                 ${copyAccountRowsHtml(leaders)}
                 <div class="fib-instance-section-title">${t("copy.position_detail")}</div>
-                ${copyPositionsHtml(leaders)}
+                ${copyPositionsHtml(leaders, {
+                  unknownText: t("copy.target_positions_unknown"),
+                  partialText: t("copy.target_positions_partial"),
+                })}
                 <div class="fib-instance-section-title">${t("copy.summary_recent")}</div>
                 ${latestHtml}
               </div>

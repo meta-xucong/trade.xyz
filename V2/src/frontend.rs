@@ -108,6 +108,8 @@ const FIB_COMPLETION_RESIDUAL_POSITION_DUST_USD: f64 = 0.50;
 const FIB_COMPLETION_RESIDUAL_POSITION_EPSILON: f64 = 0.000_000_01;
 const FIB_CLEANUP_POSITION_EPSILON: f64 = 0.000_000_000_001;
 const DISPLAY_USD_EPSILON: f64 = 0.005;
+const POSITION_TRUTH_DUST_USD: f64 = 1.0;
+const POSITION_TRUTH_RATIO_EPSILON: f64 = 0.000_001;
 const FIB_INSTANCES_PATH: &str = "logs/fib_instances.json";
 const FIB_INSTANCE_HISTORY_PATH: &str = "logs/fib_instance_history.jsonl";
 const COPY_SHADOW_HISTORY_PATH: &str = "logs/copy_shadow_history.jsonl";
@@ -2650,7 +2652,14 @@ async fn account_funding(
     let audit_details = json!({ "account_id": payload.account_id.clone() });
     let result = async {
         let config = state.config_snapshot()?;
-        build_account_funding(&config, &payload.account_id, Some(&state.realtime)).await
+        let position_truth = build_position_truth_snapshot(&state, &config);
+        build_account_funding(
+            &config,
+            &payload.account_id,
+            Some(&state.realtime),
+            Some(&position_truth),
+        )
+        .await
     }
     .await;
     let response = ApiResult::from_result(result);
@@ -2676,6 +2685,7 @@ async fn account_funding_batch(
         let config = state.config_snapshot()?;
         let account_ids = selected_enabled_account_ids(&config, &payload.account_ids);
         validate_batch_account_count("funding batch", &config, &account_ids)?;
+        let position_truth = build_position_truth_snapshot(&state, &config);
         let cache_key = snapshot_cache_key(
             &config.app.environment,
             "account_funding",
@@ -2692,12 +2702,14 @@ async fn account_funding_batch(
         let funding_futures = account_ids.iter().cloned().map(|account_id| {
             let config = config.clone();
             let realtime = state.realtime.clone();
+            let position_truth = position_truth.clone();
             async move {
                 ApiResult::from_result(
                     build_account_funding(
                         &config,
                         &account_id,
                         (!force_fresh).then_some(&realtime),
+                        Some(&position_truth),
                     )
                     .await,
                 )
@@ -4243,6 +4255,7 @@ struct FrontendStateResponse {
     accounts: Vec<AccountResponse>,
     workers: Vec<WorkerResponse>,
     positions: Vec<PositionResponse>,
+    position_truth: PositionTruthSummaryResponse,
     pnl: PnlResponse,
     strategies: Vec<StrategyResponse>,
     recent_events: Vec<EventResponse>,
@@ -4258,6 +4271,7 @@ impl FrontendStateResponse {
         let mut recent_events = Vec::new();
         let mut accounts = Vec::new();
         let mut positions = Vec::new();
+        let position_truth = build_position_truth_snapshot(state, &config);
 
         for account in config.enabled_worker_accounts() {
             let state_market_id = frontend_perp_market_id_for_dex(&config.hyperliquid.dex);
@@ -4284,8 +4298,13 @@ impl FrontendStateResponse {
                         .as_deref()
                         .map(parse_decimal)
                         .unwrap_or_default();
-                    let account_positions =
-                        positions_from_clearinghouse(account, &config, &account_state);
+                    let account_positions = positions_from_clearinghouse(
+                        account,
+                        state_market_id,
+                        &config,
+                        &account_state,
+                        Some(&position_truth),
+                    );
                     let unrealized_pnl_usd = account_positions
                         .iter()
                         .map(|position| position.pnl_usd)
@@ -4395,6 +4414,7 @@ impl FrontendStateResponse {
                 last_signal_latency_ms: 0,
             })
             .collect::<Vec<_>>();
+        let position_truth_summary = PositionTruthSummaryResponse::from_positions(&positions);
 
         Self {
             app: AppStatusResponse {
@@ -4415,6 +4435,7 @@ impl FrontendStateResponse {
             accounts,
             workers,
             positions,
+            position_truth: position_truth_summary,
             pnl: PnlResponse {
                 total_equity_usd,
                 total_available_usdc,
@@ -4443,11 +4464,381 @@ impl FrontendStateResponse {
     }
 }
 
+#[derive(Debug, Clone, Default, Eq, Hash, PartialEq)]
+struct PositionTruthKey {
+    account_id: String,
+    coin: String,
+    side: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PositionTruthEvidence {
+    copy_position_value_usd: f64,
+    fib_open_size: f64,
+    fib_position_value_usd: f64,
+    fib_residual: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PositionTruthSnapshot {
+    by_key: HashMap<PositionTruthKey, PositionTruthEvidence>,
+}
+
+impl PositionTruthSnapshot {
+    fn add_copy_position(&mut self, account_id: &str, position: &CopyPnlPositionSummary) {
+        let value = copy_pnl_position_value_usd(position);
+        if value <= DISPLAY_USD_EPSILON {
+            return;
+        }
+        let key = position_truth_key(account_id, &position.coin, &position.side);
+        self.by_key.entry(key).or_default().copy_position_value_usd += value;
+    }
+
+    fn add_fib_position(
+        &mut self,
+        account_id: &str,
+        coin: &str,
+        side: &str,
+        open_size: f64,
+        position_value_usd: f64,
+        residual: bool,
+    ) {
+        if open_size <= FIB_COMPLETION_RESIDUAL_POSITION_EPSILON {
+            return;
+        }
+        let key = position_truth_key(account_id, coin, side);
+        let evidence = self.by_key.entry(key).or_default();
+        evidence.fib_open_size += open_size;
+        evidence.fib_position_value_usd += position_value_usd.max(0.0);
+        evidence.fib_residual |= residual;
+    }
+
+    fn attribution_for_live_position(
+        &self,
+        account_id: &str,
+        coin: &str,
+        size: f64,
+        position_value_usd: f64,
+        pnl_usd: f64,
+    ) -> PositionAttributionResponse {
+        let side = position_truth_side_from_size(size);
+        let key = position_truth_key(account_id, coin, side);
+        let evidence = self.by_key.get(&key).cloned().unwrap_or_default();
+        let live_size = size.abs();
+        let live_value = position_value_usd.abs();
+        let mut fib_ratio = if live_size > FIB_COMPLETION_RESIDUAL_POSITION_EPSILON
+            && evidence.fib_open_size > FIB_COMPLETION_RESIDUAL_POSITION_EPSILON
+        {
+            evidence.fib_open_size / live_size
+        } else if live_value > DISPLAY_USD_EPSILON
+            && evidence.fib_position_value_usd > DISPLAY_USD_EPSILON
+        {
+            evidence.fib_position_value_usd / live_value
+        } else {
+            0.0
+        }
+        .clamp(0.0, 1.0);
+        let mut copy_ratio = if live_value > DISPLAY_USD_EPSILON
+            && evidence.copy_position_value_usd > DISPLAY_USD_EPSILON
+        {
+            evidence.copy_position_value_usd / live_value
+        } else {
+            0.0
+        }
+        .clamp(0.0, 1.0);
+        if fib_ratio <= POSITION_TRUTH_RATIO_EPSILON
+            && copy_ratio > POSITION_TRUTH_RATIO_EPSILON
+            && copy_ratio < 1.0
+            && live_value >= evidence.copy_position_value_usd
+            && live_value - evidence.copy_position_value_usd <= pnl_usd.abs() + DISPLAY_USD_EPSILON
+        {
+            copy_ratio = 1.0;
+        }
+        let combined = fib_ratio + copy_ratio;
+        if combined > 1.0 && combined > POSITION_TRUTH_RATIO_EPSILON {
+            fib_ratio /= combined;
+            copy_ratio /= combined;
+        }
+        fib_ratio = fib_ratio.clamp(0.0, 1.0);
+        copy_ratio = copy_ratio.clamp(0.0, 1.0 - fib_ratio);
+        let residual_ratio = (1.0 - fib_ratio - copy_ratio).max(0.0);
+        let dust_ratio = if fib_ratio <= POSITION_TRUTH_RATIO_EPSILON
+            && copy_ratio <= POSITION_TRUTH_RATIO_EPSILON
+            && live_value > DISPLAY_USD_EPSILON
+            && live_value <= POSITION_TRUTH_DUST_USD
+        {
+            1.0
+        } else {
+            0.0
+        };
+        let unattributed_ratio = if dust_ratio > POSITION_TRUTH_RATIO_EPSILON {
+            0.0
+        } else {
+            residual_ratio
+        };
+        let mut parts = Vec::new();
+        if fib_ratio > POSITION_TRUTH_RATIO_EPSILON {
+            parts.push(position_attribution_part(
+                "fib",
+                if evidence.fib_residual {
+                    "fib_strategy_residual_order_oids"
+                } else {
+                    "fib_strategy_order_oids"
+                },
+                fib_ratio,
+                live_value,
+                pnl_usd,
+            ));
+        }
+        if copy_ratio > POSITION_TRUTH_RATIO_EPSILON {
+            parts.push(position_attribution_part(
+                "copy",
+                "copy_ledger_live_position",
+                copy_ratio,
+                live_value,
+                pnl_usd,
+            ));
+        }
+        if dust_ratio > POSITION_TRUTH_RATIO_EPSILON {
+            parts.push(position_attribution_part(
+                "dust",
+                "backend_dust_threshold",
+                dust_ratio,
+                live_value,
+                pnl_usd,
+            ));
+        } else if unattributed_ratio > POSITION_TRUTH_RATIO_EPSILON || parts.is_empty() {
+            parts.push(position_attribution_part(
+                "unattributed",
+                "live_position_without_strategy_evidence",
+                if parts.is_empty() {
+                    1.0
+                } else {
+                    unattributed_ratio
+                },
+                live_value,
+                pnl_usd,
+            ));
+        }
+        PositionAttributionResponse::from_parts(parts)
+    }
+}
+
+impl PositionAttributionResponse {
+    fn from_parts(parts: Vec<PositionAttributionPartResponse>) -> Self {
+        let mut response = Self {
+            owner: if parts.len() == 1 {
+                parts[0].key.clone()
+            } else {
+                "mixed".to_string()
+            },
+            attribution_source: "backend_position_truth".to_string(),
+            attribution_parts: parts,
+            ..Self::default()
+        };
+        for part in &response.attribution_parts {
+            match part.key.as_str() {
+                "fib" => {
+                    response.fib_ratio += part.ratio;
+                    response.fib_position_value_usd += part.position_value_usd;
+                    response.fib_pnl_usd += part.pnl_usd;
+                }
+                "copy" => {
+                    response.copy_ratio += part.ratio;
+                    response.copy_position_value_usd += part.position_value_usd;
+                    response.copy_pnl_usd += part.pnl_usd;
+                }
+                "dust" => {
+                    response.dust_ratio += part.ratio;
+                    response.dust_position_value_usd += part.position_value_usd;
+                    response.dust_pnl_usd += part.pnl_usd;
+                }
+                _ => {
+                    response.unattributed_ratio += part.ratio;
+                    response.unattributed_position_value_usd += part.position_value_usd;
+                    response.unattributed_pnl_usd += part.pnl_usd;
+                }
+            }
+        }
+        response.fib_ratio = response.fib_ratio.clamp(0.0, 1.0);
+        response.copy_ratio = response.copy_ratio.clamp(0.0, 1.0);
+        response.unattributed_ratio = response.unattributed_ratio.clamp(0.0, 1.0);
+        response.dust_ratio = response.dust_ratio.clamp(0.0, 1.0);
+        response
+    }
+}
+
+impl PositionTruthSummaryResponse {
+    fn from_positions(positions: &[PositionResponse]) -> Self {
+        let mut summary = Self {
+            source: "backend_position_truth".to_string(),
+            position_count: positions.len(),
+            ..Self::default()
+        };
+        for position in positions {
+            let attribution = &position.attribution;
+            if attribution.owner == "mixed" {
+                summary.mixed_position_count += 1;
+            }
+            if attribution.fib_ratio > POSITION_TRUTH_RATIO_EPSILON {
+                summary.fib_position_count += 1;
+            }
+            if attribution.copy_ratio > POSITION_TRUTH_RATIO_EPSILON {
+                summary.copy_position_count += 1;
+            }
+            if attribution.unattributed_ratio > POSITION_TRUTH_RATIO_EPSILON {
+                summary.unattributed_position_count += 1;
+            }
+            if attribution.dust_ratio > POSITION_TRUTH_RATIO_EPSILON {
+                summary.dust_position_count += 1;
+            }
+            summary.fib_position_value_usd += attribution.fib_position_value_usd;
+            summary.copy_position_value_usd += attribution.copy_position_value_usd;
+            summary.unattributed_position_value_usd += attribution.unattributed_position_value_usd;
+            summary.dust_position_value_usd += attribution.dust_position_value_usd;
+            summary.fib_unrealized_pnl_usd += attribution.fib_pnl_usd;
+            summary.copy_unrealized_pnl_usd += attribution.copy_pnl_usd;
+            summary.unattributed_unrealized_pnl_usd += attribution.unattributed_pnl_usd;
+            summary.dust_unrealized_pnl_usd += attribution.dust_pnl_usd;
+        }
+        summary.fib_position_value_usd = normalize_display_usd(summary.fib_position_value_usd);
+        summary.copy_position_value_usd = normalize_display_usd(summary.copy_position_value_usd);
+        summary.unattributed_position_value_usd =
+            normalize_display_usd(summary.unattributed_position_value_usd);
+        summary.dust_position_value_usd = normalize_display_usd(summary.dust_position_value_usd);
+        summary.fib_unrealized_pnl_usd = normalize_display_usd(summary.fib_unrealized_pnl_usd);
+        summary.copy_unrealized_pnl_usd = normalize_display_usd(summary.copy_unrealized_pnl_usd);
+        summary.unattributed_unrealized_pnl_usd =
+            normalize_display_usd(summary.unattributed_unrealized_pnl_usd);
+        summary.dust_unrealized_pnl_usd = normalize_display_usd(summary.dust_unrealized_pnl_usd);
+        summary
+    }
+}
+
+fn build_position_truth_snapshot(
+    state: &FrontendAppState,
+    config: &AppConfig,
+) -> PositionTruthSnapshot {
+    let mut snapshot = PositionTruthSnapshot::default();
+    let copy_settings = read_copy_ui_settings().ok();
+    if let Ok(persistence) =
+        load_copy_persistence_snapshot(&copy_live_soak_dir().join(COPY_LIVE_SOAK_CURRENT_SNAPSHOT))
+    {
+        for account in copy_ledger_local_account_summaries(
+            config,
+            copy_settings.as_ref(),
+            &persistence.ledger_entries,
+        ) {
+            for position in &account.positions {
+                snapshot.add_copy_position(&account.id, position);
+            }
+        }
+    }
+    let fib_instances = state
+        .fib_instances
+        .read()
+        .map(|guard| guard.values().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let fib_history = read_fib_instance_history_entries(FIB_HISTORY_RECOVERY_SCAN_LIMIT)
+        .unwrap_or_else(|error| {
+            tracing::warn!(
+                %error,
+                "failed to read Fib history while building position truth"
+            );
+            Vec::new()
+        });
+    for record in fib_instances {
+        let Ok(market) = resolve_market_profile(Some(&record.config.market), config) else {
+            continue;
+        };
+        let summary =
+            build_fib_strategy_pnl_summary(config, &state.realtime, &record, &fib_history);
+        if !summary.precise || summary.matched_order_count == 0 {
+            continue;
+        }
+        let raw_coin = if record.config.coin.trim().is_empty() {
+            record.plan.coin.as_str()
+        } else {
+            record.config.coin.as_str()
+        };
+        let coin = normalize_coin_for_market(&market, raw_coin);
+        let side = fib_strategy_truth_side(&record);
+        let residual = matches!(
+            record.status,
+            FibInstanceStatus::Completed | FibInstanceStatus::Killed
+        );
+        for account in &summary.account_summaries {
+            let open_size = account.open_position_size.abs();
+            if open_size <= FIB_COMPLETION_RESIDUAL_POSITION_EPSILON {
+                continue;
+            }
+            let position_value_usd = summary
+                .current_price
+                .or(account.open_avg_entry_price)
+                .filter(|price| price.is_finite() && *price > 0.0)
+                .map(|price| price * open_size)
+                .unwrap_or_default();
+            snapshot.add_fib_position(
+                &account.account_id,
+                &coin,
+                side,
+                open_size,
+                position_value_usd,
+                residual,
+            );
+        }
+    }
+    snapshot
+}
+
+fn fib_strategy_truth_side(record: &FibInstanceRecord) -> &'static str {
+    match record.config.direction {
+        FibTradeDirection::Short => "short",
+        FibTradeDirection::Long => "long",
+    }
+}
+
+fn position_truth_key(account_id: &str, coin: &str, side: &str) -> PositionTruthKey {
+    PositionTruthKey {
+        account_id: account_id.trim().to_string(),
+        coin: coin.trim().to_ascii_lowercase(),
+        side: side.trim().to_ascii_lowercase(),
+    }
+}
+
+fn position_truth_side_from_size(size: f64) -> &'static str {
+    if size < -FIB_COMPLETION_RESIDUAL_POSITION_EPSILON {
+        "short"
+    } else {
+        "long"
+    }
+}
+
+fn position_attribution_part(
+    key: &str,
+    source: &str,
+    ratio: f64,
+    live_value_usd: f64,
+    pnl_usd: f64,
+) -> PositionAttributionPartResponse {
+    let ratio = ratio.clamp(0.0, 1.0);
+    PositionAttributionPartResponse {
+        key: key.to_string(),
+        source: source.to_string(),
+        ratio,
+        position_value_usd: normalize_display_usd(live_value_usd * ratio),
+        pnl_usd: normalize_display_usd(pnl_usd * ratio),
+    }
+}
+
 fn positions_from_clearinghouse(
     account: &AccountConfig,
+    market_id: &str,
     config: &AppConfig,
     state: &ClearinghouseState,
+    position_truth: Option<&PositionTruthSnapshot>,
 ) -> Vec<PositionResponse> {
+    let market = resolve_market_profile(Some(market_id), config).ok();
     state
         .asset_positions
         .iter()
@@ -4477,13 +4868,39 @@ fn positions_from_clearinghouse(
             } else {
                 0.0
             };
+            let coin = market
+                .as_ref()
+                .map(|market| normalize_coin_for_market(market, &position.coin))
+                .unwrap_or_else(|| normalize_dex_coin(&config.hyperliquid.dex, &position.coin));
+            let position_value_usd = position_value.abs();
+            let attribution = position_truth
+                .map(|truth| {
+                    truth.attribution_for_live_position(
+                        &account.account_id,
+                        &coin,
+                        size,
+                        position_value_usd,
+                        pnl_usd,
+                    )
+                })
+                .unwrap_or_else(|| {
+                    PositionTruthSnapshot::default().attribution_for_live_position(
+                        &account.account_id,
+                        &coin,
+                        size,
+                        position_value_usd,
+                        pnl_usd,
+                    )
+                });
             Some(PositionResponse {
                 account_id: account.account_id.clone(),
-                coin: normalize_dex_coin(&config.hyperliquid.dex, &position.coin),
+                coin,
                 size,
                 entry_price,
                 mark_price,
+                position_value_usd,
                 pnl_usd,
+                attribution,
             })
         })
         .collect::<Vec<_>>()
@@ -7598,21 +8015,16 @@ async fn build_copy_summary_response(state: &FrontendAppState) -> Result<CopySum
             )
         })
         .unwrap_or_default();
-    let mut live_accounts = tokio::time::timeout(
-        Duration::from_secs(5),
-        read_copy_live_account_summaries(state, copy_settings.as_ref()),
-    )
-    .await
-    .ok()
-    .and_then(Result::ok)
-    .unwrap_or_default();
-    merge_copy_live_account_fallback_rows(&mut live_accounts, ledger_local_summaries);
+    let live_accounts = read_copy_live_account_summaries(state, copy_settings.as_ref())
+        .await
+        .unwrap_or_default();
     Ok(build_copy_summary_response_from_entries(
         entries,
         live_soak,
         now_ms(),
         pnl_report,
         copy_settings.as_ref(),
+        ledger_local_summaries,
         ledger_positions,
         live_accounts,
     ))
@@ -8305,6 +8717,7 @@ fn build_copy_summary_response_from_entries(
     fetched_at_ms: u64,
     pnl_report: CopyPnlReportSummary,
     copy_settings: Option<&CopyUiSettings>,
+    ledger_local_summaries: Vec<CopyPnlAccountSummary>,
     ledger_positions: Vec<CopyPnlPositionSummary>,
     live_accounts: CopyLiveAccountSummaries,
 ) -> CopySummaryResponse {
@@ -8403,11 +8816,22 @@ fn build_copy_summary_response_from_entries(
         read_copy_live_soak_pnl_summary(&copy_live_soak_dir(), active_run_id).unwrap_or_default();
     let submitted_reports = submitted_reports.max(pnl_summary.submitted_reports);
     let order_evidence = order_evidence.max(pnl_summary.order_evidence);
+    let copy_owned_summaries =
+        build_copy_owned_local_account_summaries(&live_accounts.locals, &ledger_local_summaries);
+    let copy_owned_summary = aggregate_copy_local_account_summaries(&copy_owned_summaries);
+    let other_local_summaries =
+        build_other_local_account_summaries(&live_accounts.locals, &copy_owned_summaries);
+    let other_local_summary = aggregate_copy_local_account_summaries(&other_local_summaries);
     let live_realized_pnl_usd = pnl_summary.realized_pnl_usd();
-    let live_unrealized_pnl_usd = live_accounts
-        .local
+    let live_unrealized_pnl_usd = copy_owned_summary
         .as_ref()
-        .and_then(|account| account.unrealized_pnl_usd);
+        .and_then(|account| account.unrealized_pnl_usd)
+        .or_else(|| {
+            live_accounts
+                .local
+                .as_ref()
+                .and_then(|account| account.unrealized_pnl_usd)
+        });
     let live_total_fees_usd = pnl_summary.total_fees_usd();
     let mut local_summary = live_accounts
         .local
@@ -8438,9 +8862,6 @@ fn build_copy_summary_response_from_entries(
         }
         if live_total_fees_usd.is_some() {
             local.fees_usd = live_total_fees_usd;
-        }
-        if !copy_pnl_account_summary_is_live_local(&local.kind) {
-            merge_copy_ledger_positions_into_local_summary(local, &ledger_positions);
         }
         local.total_pnl_usd = copy_sum_optional([local.realized_pnl_usd, local.unrealized_pnl_usd]);
     } else if !ledger_positions.is_empty() {
@@ -8511,8 +8932,10 @@ fn build_copy_summary_response_from_entries(
                 .map(|meta| meta.leader_id.clone())
                 .filter(|id| !id.trim().is_empty())
                 .unwrap_or_else(|| format!("leader_{}", index + 1)),
-            kind: "target_current".to_string(),
+            kind: "target_unavailable".to_string(),
             address: key,
+            truth_state: "unavailable".to_string(),
+            missing_markets: configured_markets.clone(),
             signal_count: meta.map(|meta| meta.signal_count).unwrap_or_default(),
             last_signal_at_ms: meta.and_then(|meta| meta.last_signal_at_ms),
             ..CopyPnlAccountSummary::default()
@@ -8568,15 +8991,19 @@ fn build_copy_summary_response_from_entries(
         .map(|leader| leader.open_position_count as u64)
         .sum();
     let configured_leader_count = configured_addresses.len();
-    let live_target_count = leader_summaries
+    let current_target_count = leader_summaries
         .iter()
-        .filter(|leader| leader.kind.eq_ignore_ascii_case("target_live"))
+        .filter(|leader| leader.truth_state.eq_ignore_ascii_case("current"))
+        .count();
+    let partial_target_count = leader_summaries
+        .iter()
+        .filter(|leader| leader.truth_state.eq_ignore_ascii_case("partial"))
         .count();
     let target_position_state = if configured_leader_count == 0 {
         "unconfigured"
-    } else if live_target_count == configured_leader_count {
+    } else if current_target_count == configured_leader_count {
         "current"
-    } else if live_target_count > 0 {
+    } else if current_target_count + partial_target_count > 0 {
         "partial"
     } else {
         "unavailable"
@@ -8608,6 +9035,10 @@ fn build_copy_summary_response_from_entries(
         pnl_report_status,
         local_summary,
         local_summaries: live_accounts.locals,
+        copy_owned_summary,
+        copy_owned_summaries,
+        other_local_summary,
+        other_local_summaries,
         leader_summaries,
         target_realized_pnl_usd,
         target_unrealized_pnl_usd,
@@ -8634,12 +9065,11 @@ async fn read_copy_live_account_summaries(
     let markets = settings
         .map(|settings| settings.markets.clone())
         .unwrap_or_else(default_copy_markets);
-    let perp_markets = markets
+    let normalized_markets = markets
         .iter()
         .filter_map(|market| normalize_market_id(market))
-        .filter(|market| *market != MARKET_SPOT)
         .collect::<Vec<_>>();
-    if perp_markets.is_empty() {
+    if normalized_markets.is_empty() {
         return Ok(CopyLiveAccountSummaries::default());
     }
 
@@ -8651,65 +9081,106 @@ async fn read_copy_live_account_summaries(
                 .map(|settings| vec![settings.account_id.clone()])
                 .unwrap_or_else(|| vec!["addr_a".to_string()])
         });
-    let mut local_summaries = Vec::new();
-    for account_id in local_account_ids {
-        let Some(account) = config.account(&account_id) else {
-            continue;
-        };
-        let summary = match copy_live_account_summary_for_address(
-            &config,
-            &state.realtime,
-            account.account_id.clone(),
-            "local_live".to_string(),
-            account.address.clone(),
-            &perp_markets,
-            true,
-        )
-        .await
-        {
-            Ok(summary) => summary,
-            Err(_) => CopyPnlAccountSummary {
-                id: account.account_id.clone(),
-                kind: "local_unavailable".to_string(),
-                address: account.address.to_ascii_lowercase(),
-                ..CopyPnlAccountSummary::default()
-            },
-        };
-        local_summaries.push(summary);
-    }
-    let local_summary = aggregate_copy_local_account_summaries(&local_summaries);
-
     let leader_addresses = settings
         .map(|settings| settings.leaders.clone())
         .unwrap_or_default();
-    let mut targets = Vec::new();
-    for (index, address) in leader_addresses.iter().enumerate() {
-        if index > 0 {
-            tokio::time::sleep(Duration::from_millis(150)).await;
-        }
-        let Ok(summary) = copy_live_account_summary_for_address(
+
+    let local_summaries = tokio::time::timeout(
+        Duration::from_secs(5),
+        read_copy_live_local_account_rows(
             &config,
             &state.realtime,
-            format!("leader_{}", index + 1),
-            "target_live".to_string(),
-            address.clone(),
-            &perp_markets,
-            false,
-        )
-        .await
-        else {
-            continue;
-        };
-        if copy_pnl_account_summary_has_current_state(&summary) {
-            targets.push(summary);
-        }
-    }
+            &local_account_ids,
+            &normalized_markets,
+        ),
+    )
+    .await
+    .ok()
+    .unwrap_or_default();
+    let local_summary = aggregate_copy_local_account_summaries(&local_summaries);
+
+    let targets = tokio::time::timeout(
+        Duration::from_secs(5),
+        read_copy_live_target_account_rows(
+            &config,
+            &state.realtime,
+            &leader_addresses,
+            &normalized_markets,
+        ),
+    )
+    .await
+    .ok()
+    .unwrap_or_default();
 
     Ok(CopyLiveAccountSummaries {
         local: local_summary,
         locals: local_summaries,
         targets,
     })
+}
+
+async fn read_copy_live_local_account_rows(
+    config: &AppConfig,
+    realtime: &RealtimeState,
+    account_ids: &[String],
+    markets: &[&'static str],
+) -> Vec<CopyPnlAccountSummary> {
+    let accounts = account_ids
+        .iter()
+        .filter_map(|account_id| config.account(account_id))
+        .map(|account| (account.account_id.clone(), account.address.clone()))
+        .collect::<Vec<_>>();
+    let summary_futures = accounts.iter().map(|(account_id, address)| async move {
+        match copy_live_account_summary_for_address(
+            config,
+            realtime,
+            account_id.clone(),
+            "local_live".to_string(),
+            address.clone(),
+            markets,
+            true,
+        )
+        .await
+        {
+            Ok(summary) => summary,
+            Err(_) => CopyPnlAccountSummary {
+                id: account_id.clone(),
+                kind: "local_unavailable".to_string(),
+                address: address.to_ascii_lowercase(),
+                ..CopyPnlAccountSummary::default()
+            },
+        }
+    });
+    join_all(summary_futures).await
+}
+
+async fn read_copy_live_target_account_rows(
+    config: &AppConfig,
+    realtime: &RealtimeState,
+    leader_addresses: &[String],
+    markets: &[&'static str],
+) -> Vec<CopyPnlAccountSummary> {
+    let summary_futures = leader_addresses
+        .iter()
+        .enumerate()
+        .map(|(index, address)| async move {
+            copy_live_account_summary_for_address(
+                config,
+                realtime,
+                format!("leader_{}", index + 1),
+                "target_live".to_string(),
+                address.clone(),
+                markets,
+                true,
+            )
+            .await
+            .ok()
+        });
+    join_all(summary_futures)
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
 }
 
 fn aggregate_copy_local_account_summaries(
@@ -8730,9 +9201,44 @@ fn aggregate_copy_local_account_summaries(
     let notional_usd = copy_sum_optional(accounts.iter().map(|account| account.notional_usd));
     let position_value_usd =
         copy_sum_optional(accounts.iter().map(|account| account.position_value_usd));
+    let mut observed_markets = accounts
+        .iter()
+        .flat_map(|account| account.observed_markets.iter().cloned())
+        .collect::<Vec<_>>();
+    observed_markets.sort();
+    observed_markets.dedup();
+    let mut missing_markets = accounts
+        .iter()
+        .flat_map(|account| account.missing_markets.iter().cloned())
+        .collect::<Vec<_>>();
+    missing_markets.sort();
+    missing_markets.dedup();
+    let truth_states = accounts
+        .iter()
+        .map(|account| account.truth_state.trim().to_ascii_lowercase())
+        .filter(|truth_state| !truth_state.is_empty())
+        .collect::<Vec<_>>();
+    let current_count = truth_states
+        .iter()
+        .filter(|truth_state| truth_state.as_str() == "current")
+        .count();
+    let partial_count = truth_states
+        .iter()
+        .filter(|truth_state| truth_state.as_str() == "partial")
+        .count();
+    let truth_state = if !truth_states.is_empty() && current_count == truth_states.len() {
+        "current".to_string()
+    } else if current_count + partial_count > 0 {
+        "partial".to_string()
+    } else {
+        "unavailable".to_string()
+    };
     Some(CopyPnlAccountSummary {
         id: "local_all".to_string(),
         kind: "local_live_aggregate".to_string(),
+        truth_state,
+        observed_markets,
+        missing_markets,
         fill_count: accounts.iter().map(|account| account.fill_count).sum(),
         realized_pnl_usd,
         closed_pnl_usd: copy_sum_optional(accounts.iter().map(|account| account.closed_pnl_usd)),
@@ -8752,6 +9258,12 @@ fn aggregate_copy_local_account_summaries(
     })
 }
 
+struct CopyLiveAccountMarketObservation {
+    market_id: String,
+    observed: bool,
+    positions: Vec<CopyPnlPositionSummary>,
+}
+
 async fn copy_live_account_summary_for_address(
     config: &AppConfig,
     realtime: &RealtimeState,
@@ -8761,38 +9273,128 @@ async fn copy_live_account_summary_for_address(
     markets: &[&'static str],
     allow_rest_fallback: bool,
 ) -> Result<CopyPnlAccountSummary> {
+    let configured_markets = markets
+        .iter()
+        .map(|market| (*market).to_string())
+        .collect::<Vec<_>>();
     let mut positions = Vec::new();
-    let mut observed_market_count = 0usize;
-    for market_id in markets {
-        let market = resolve_market_profile(Some(market_id), config)?;
-        let state = if let Some(cached) = realtime.clearinghouse_state(market.id, &address) {
-            cached
-        } else if !allow_rest_fallback {
-            continue;
-        } else if market.id == MARKET_HL_PERP {
-            tokio::time::timeout(
-                Duration::from_secs(3),
-                fetch_default_clearinghouse_state(&config.app.environment, &address),
+    let mut observed_markets = Vec::new();
+    let mut missing_markets = Vec::new();
+    let market_futures = markets.iter().copied().map(|market_id| {
+        let account_address = address.clone();
+        async move {
+            copy_live_account_market_observation(
+                config,
+                realtime,
+                account_address.as_str(),
+                market_id,
+                allow_rest_fallback,
             )
             .await
-            .context("timed out fetching default clearinghouseState for copy summary")??
+        }
+    });
+    for observation in join_all(market_futures).await {
+        let observation = observation?;
+        if observation.observed {
+            observed_markets.push(observation.market_id);
+            positions.extend(observation.positions);
+        } else {
+            missing_markets.push(observation.market_id);
+        }
+    }
+    observed_markets.sort();
+    observed_markets.dedup();
+    missing_markets.sort();
+    missing_markets.dedup();
+    if observed_markets.is_empty() {
+        return Ok(CopyPnlAccountSummary {
+            id,
+            kind,
+            address: address.to_ascii_lowercase(),
+            truth_state: "unavailable".to_string(),
+            missing_markets: configured_markets,
+            ..CopyPnlAccountSummary::default()
+        });
+    }
+    Ok(copy_pnl_account_summary_from_live_positions(
+        id,
+        kind,
+        address,
+        positions,
+        observed_markets,
+        missing_markets,
+    ))
+}
+
+async fn copy_live_account_market_observation(
+    config: &AppConfig,
+    realtime: &RealtimeState,
+    address: &str,
+    market_id: &'static str,
+    allow_rest_fallback: bool,
+) -> Result<CopyLiveAccountMarketObservation> {
+    let market = resolve_market_profile(Some(market_id), config)?;
+    let market_name = market.id.to_string();
+    if market.is_spot() {
+        let state = if let Some(cached) = realtime.spot_state(address) {
+            Some(cached)
+        } else if !allow_rest_fallback {
+            None
         } else {
             tokio::time::timeout(
                 Duration::from_secs(3),
-                fetch_clearinghouse_state(&config.app.environment, &market.dex, &address),
+                fetch_spot_clearinghouse_state(&config.app.environment, address),
             )
             .await
-            .context("timed out fetching dex clearinghouseState for copy summary")??
+            .ok()
+            .and_then(Result::ok)
         };
-        observed_market_count += 1;
-        positions.extend(copy_pnl_positions_from_clearinghouse(&market, &state));
+        let observed = state.is_some();
+        let positions = if let Some(ref state) = state {
+            let spot_snapshot = fetch_spot_market_snapshot_cached(&config.app.environment, 15_000)
+                .await
+                .ok();
+            copy_pnl_positions_from_spot(state, spot_snapshot.as_ref())
+        } else {
+            Vec::new()
+        };
+        return Ok(CopyLiveAccountMarketObservation {
+            market_id: market_name,
+            observed,
+            positions,
+        });
     }
-    if observed_market_count == 0 {
-        anyhow::bail!("no current clearinghouse snapshot available for copy summary account {id}");
-    }
-    Ok(copy_pnl_account_summary_from_live_positions(
-        id, kind, address, positions,
-    ))
+
+    let state = if let Some(cached) = realtime.clearinghouse_state(market.id, address) {
+        Some(cached)
+    } else if !allow_rest_fallback {
+        None
+    } else if market.id == MARKET_HL_PERP {
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            fetch_default_clearinghouse_state(&config.app.environment, address),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+    } else {
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            fetch_clearinghouse_state(&config.app.environment, &market.dex, address),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+    };
+    let positions = state
+        .as_ref()
+        .map(|state| copy_pnl_positions_from_clearinghouse(&market, state))
+        .unwrap_or_default();
+    Ok(CopyLiveAccountMarketObservation {
+        market_id: market_name,
+        observed: state.is_some(),
+        positions,
+    })
 }
 
 fn copy_pnl_positions_from_clearinghouse(
@@ -8833,20 +9435,76 @@ fn copy_pnl_positions_from_clearinghouse(
         .collect()
 }
 
+fn copy_pnl_positions_from_spot(
+    state: &SpotClearinghouseState,
+    snapshot: Option<&SpotMarketSnapshot>,
+) -> Vec<CopyPnlPositionSummary> {
+    state
+        .balances
+        .iter()
+        .filter_map(|balance| {
+            let available =
+                (parse_state_decimal(&balance.total) - parse_state_decimal(&balance.hold)).max(0.0);
+            let token = balance.coin.trim().to_ascii_uppercase();
+            if token.is_empty() || token == "USDC" || available <= 1e-12 {
+                return None;
+            }
+            let coin = normalize_spot_coin(&format!("{token}/USDC"));
+            let (position_value_usd, entry_px) = snapshot
+                .and_then(|snapshot| snapshot.asset(&coin).ok())
+                .and_then(|asset| {
+                    asset
+                        .context
+                        .mid_px
+                        .as_deref()
+                        .and_then(|value| value.parse::<f64>().ok())
+                        .or_else(|| asset.context.mark_px.parse::<f64>().ok())
+                        .or_else(|| asset.context.prev_day_px.parse::<f64>().ok())
+                        .filter(|price| price.is_finite() && *price > 0.0)
+                        .map(|price| (Some(normalize_display_usd(available * price)), Some(price)))
+                })
+                .unwrap_or((None, None));
+            Some(CopyPnlPositionSummary {
+                coin,
+                side: "long".to_string(),
+                size: available,
+                position_value_usd,
+                unrealized_pnl_usd: Some(0.0),
+                entry_px,
+            })
+        })
+        .collect()
+}
+
 fn copy_pnl_account_summary_from_live_positions(
     id: String,
     kind: String,
     address: String,
     positions: Vec<CopyPnlPositionSummary>,
+    observed_markets: Vec<String>,
+    missing_markets: Vec<String>,
 ) -> CopyPnlAccountSummary {
+    let observed_market_count = observed_markets.len();
     let position_value_usd =
-        copy_sum_optional(positions.iter().map(|position| position.position_value_usd));
+        copy_sum_optional(positions.iter().map(|position| position.position_value_usd))
+            .or_else(|| (observed_market_count > 0).then_some(0.0));
     let unrealized_pnl_usd =
-        copy_sum_optional(positions.iter().map(|position| position.unrealized_pnl_usd));
+        copy_sum_optional(positions.iter().map(|position| position.unrealized_pnl_usd))
+            .or_else(|| (observed_market_count > 0).then_some(0.0));
+    let truth_state = if observed_market_count == 0 {
+        "unavailable"
+    } else if missing_markets.is_empty() {
+        "current"
+    } else {
+        "partial"
+    };
     CopyPnlAccountSummary {
         id,
         kind,
         address: address.to_ascii_lowercase(),
+        truth_state: truth_state.to_string(),
+        observed_markets,
+        missing_markets,
         unrealized_pnl_usd,
         total_pnl_usd: unrealized_pnl_usd,
         position_value_usd,
@@ -8860,11 +9518,6 @@ fn copy_pnl_account_summary_has_current_state(summary: &CopyPnlAccountSummary) -
     summary.open_position_count > 0
         || summary.position_value_usd.is_some()
         || summary.unrealized_pnl_usd.is_some()
-}
-
-fn copy_pnl_account_summary_is_live_local(kind: &str) -> bool {
-    let normalized = kind.trim().to_ascii_lowercase();
-    normalized == "local_live" || normalized == "local_live_aggregate"
 }
 
 #[derive(Debug, Default)]
@@ -9146,6 +9799,36 @@ fn copy_pnl_account_summary_from_json(value: &Value) -> Option<CopyPnlAccountSum
         id,
         kind,
         address,
+        truth_state: value
+            .get("truthState")
+            .or_else(|| value.get("truth_state"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        observed_markets: value
+            .get("observedMarkets")
+            .or_else(|| value.get("observed_markets"))
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
+        missing_markets: value
+            .get("missingMarkets")
+            .or_else(|| value.get("missing_markets"))
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
         fill_count: fill_summary
             .and_then(|summary| {
                 summary
@@ -9402,31 +10085,6 @@ fn copy_ledger_local_account_summaries(
     summaries
 }
 
-fn merge_copy_live_account_fallback_rows(
-    live_accounts: &mut CopyLiveAccountSummaries,
-    fallback_rows: Vec<CopyPnlAccountSummary>,
-) {
-    if fallback_rows.is_empty() {
-        return;
-    }
-    for fallback in fallback_rows {
-        if let Some(existing) = live_accounts
-            .locals
-            .iter_mut()
-            .find(|account| account.id == fallback.id)
-        {
-            if !copy_pnl_account_summary_has_current_state(existing) {
-                *existing = fallback;
-            }
-            continue;
-        }
-        live_accounts.locals.push(fallback);
-    }
-    if live_accounts.local.is_none() {
-        live_accounts.local = aggregate_copy_local_account_summaries(&live_accounts.locals);
-    }
-}
-
 fn copy_ledger_position_summaries(entries: &[CopyLedgerEntry]) -> Vec<CopyPnlPositionSummary> {
     let mut notional_by_coin_side = HashMap::<(String, String), f64>::new();
     for entry in entries {
@@ -9502,35 +10160,212 @@ fn copy_ledger_display_side(side: OrderSide) -> &'static str {
     }
 }
 
-fn merge_copy_ledger_positions_into_local_summary(
-    local: &mut CopyPnlAccountSummary,
-    ledger_positions: &[CopyPnlPositionSummary],
-) {
-    for ledger_position in ledger_positions {
-        let ledger_coin = ledger_position.coin.to_ascii_lowercase();
-        let ledger_side = ledger_position.side.to_ascii_lowercase();
-        let already_present = local.positions.iter().any(|position| {
-            position.coin.eq_ignore_ascii_case(&ledger_coin)
-                && (position.side.trim().is_empty()
-                    || ledger_side.is_empty()
-                    || position.side.eq_ignore_ascii_case(&ledger_side))
-                && (position.size.abs() > 1e-12
-                    || position.position_value_usd.unwrap_or_default() > DISPLAY_USD_EPSILON)
-        });
-        if !already_present {
-            local.positions.push(ledger_position.clone());
-        }
+fn copy_pnl_position_identity(position: &CopyPnlPositionSummary) -> (String, String) {
+    (
+        position.coin.trim().to_ascii_lowercase(),
+        position.side.trim().to_ascii_lowercase(),
+    )
+}
+
+fn copy_pnl_position_value_usd(position: &CopyPnlPositionSummary) -> f64 {
+    position.position_value_usd.unwrap_or_default().max(0.0)
+}
+
+fn copy_pnl_position_scaled(
+    position: &CopyPnlPositionSummary,
+    ratio: f64,
+) -> Option<CopyPnlPositionSummary> {
+    let ratio = ratio.clamp(0.0, 1.0);
+    if ratio <= DISPLAY_USD_EPSILON {
+        return None;
     }
-    local.open_position_count = local.positions.len();
-    let ledger_position_value = copy_sum_optional(
-        local
+    Some(CopyPnlPositionSummary {
+        coin: position.coin.clone(),
+        side: position.side.clone(),
+        size: position.size * ratio,
+        position_value_usd: position
+            .position_value_usd
+            .map(|value| normalize_display_usd(value * ratio)),
+        unrealized_pnl_usd: position
+            .unrealized_pnl_usd
+            .map(|value| normalize_display_usd(value * ratio)),
+        entry_px: position.entry_px,
+    })
+}
+
+fn copy_pnl_position_value_map(account: &CopyPnlAccountSummary) -> HashMap<(String, String), f64> {
+    let mut values = HashMap::new();
+    for position in &account.positions {
+        *values
+            .entry(copy_pnl_position_identity(position))
+            .or_insert(0.0) += copy_pnl_position_value_usd(position);
+    }
+    values
+}
+
+fn copy_pnl_position_owned_ratio(
+    position: &CopyPnlPositionSummary,
+    owned_position_value_usd: f64,
+    key_is_owned: bool,
+) -> f64 {
+    let owned_position_value_usd = owned_position_value_usd.max(0.0);
+    if owned_position_value_usd <= DISPLAY_USD_EPSILON {
+        return 0.0;
+    }
+    let live_position_value_usd = copy_pnl_position_value_usd(position);
+    if live_position_value_usd > DISPLAY_USD_EPSILON {
+        return (owned_position_value_usd / live_position_value_usd).clamp(0.0, 1.0);
+    }
+    if key_is_owned && position.size.abs() > 1e-12 {
+        return 1.0;
+    }
+    0.0
+}
+
+fn copy_pnl_zero_when_current(summary: &CopyPnlAccountSummary) -> Option<f64> {
+    summary
+        .truth_state
+        .eq_ignore_ascii_case("current")
+        .then_some(0.0)
+}
+
+fn build_copy_owned_local_account_summaries(
+    live_accounts: &[CopyPnlAccountSummary],
+    ledger_accounts: &[CopyPnlAccountSummary],
+) -> Vec<CopyPnlAccountSummary> {
+    let ledger_by_id = ledger_accounts
+        .iter()
+        .map(|account| (account.id.clone(), account))
+        .collect::<HashMap<_, _>>();
+    let mut seen_ids = HashSet::new();
+    let mut summaries = Vec::new();
+
+    for live in live_accounts {
+        seen_ids.insert(live.id.clone());
+        let ledger = ledger_by_id.get(&live.id);
+        let owned_position_values = ledger
+            .map(|account| copy_pnl_position_value_map(account))
+            .unwrap_or_default();
+        let mut positions = live
             .positions
             .iter()
-            .map(|position| position.position_value_usd),
-    );
-    if ledger_position_value.is_some() {
-        local.position_value_usd = ledger_position_value;
+            .filter_map(|position| {
+                let key = copy_pnl_position_identity(position);
+                let owned_ratio = copy_pnl_position_owned_ratio(
+                    position,
+                    owned_position_values.get(&key).copied().unwrap_or_default(),
+                    owned_position_values.contains_key(&key),
+                );
+                copy_pnl_position_scaled(position, owned_ratio)
+            })
+            .collect::<Vec<_>>();
+        if positions.is_empty() && !copy_pnl_account_summary_has_current_state(live) {
+            if let Some(ledger) = ledger {
+                positions = ledger.positions.clone();
+            }
+        }
+        let position_value_usd =
+            copy_sum_optional(positions.iter().map(|position| position.position_value_usd))
+                .or_else(|| copy_pnl_zero_when_current(live));
+        let unrealized_pnl_usd =
+            copy_sum_optional(positions.iter().map(|position| position.unrealized_pnl_usd))
+                .or_else(|| copy_pnl_zero_when_current(live));
+        summaries.push(CopyPnlAccountSummary {
+            id: live.id.clone(),
+            kind: if positions.is_empty() {
+                "local_copy_owned".to_string()
+            } else {
+                "local_copy_owned_live".to_string()
+            },
+            address: live.address.clone(),
+            truth_state: live.truth_state.clone(),
+            observed_markets: live.observed_markets.clone(),
+            missing_markets: live.missing_markets.clone(),
+            realized_pnl_usd: live.realized_pnl_usd,
+            closed_pnl_usd: live.closed_pnl_usd,
+            unrealized_pnl_usd,
+            total_pnl_usd: copy_sum_optional([live.realized_pnl_usd, unrealized_pnl_usd]),
+            fees_usd: live.fees_usd,
+            position_value_usd,
+            open_position_count: positions.len(),
+            positions,
+            signal_count: live.signal_count,
+            last_signal_at_ms: live.last_signal_at_ms,
+            ..CopyPnlAccountSummary::default()
+        });
     }
+
+    for ledger in ledger_accounts {
+        if seen_ids.contains(&ledger.id) {
+            continue;
+        }
+        summaries.push(CopyPnlAccountSummary {
+            id: ledger.id.clone(),
+            kind: "local_copy_owned_ledger".to_string(),
+            address: ledger.address.clone(),
+            truth_state: "unavailable".to_string(),
+            positions: ledger.positions.clone(),
+            position_value_usd: ledger.position_value_usd,
+            open_position_count: ledger.open_position_count,
+            ..CopyPnlAccountSummary::default()
+        });
+    }
+
+    summaries
+}
+
+fn build_other_local_account_summaries(
+    live_accounts: &[CopyPnlAccountSummary],
+    copy_owned_accounts: &[CopyPnlAccountSummary],
+) -> Vec<CopyPnlAccountSummary> {
+    let owned_position_values_by_account = copy_owned_accounts
+        .iter()
+        .map(|account| (account.id.clone(), copy_pnl_position_value_map(account)))
+        .collect::<HashMap<_, _>>();
+    let mut summaries = Vec::new();
+    for live in live_accounts {
+        let owned_position_values = owned_position_values_by_account
+            .get(&live.id)
+            .cloned()
+            .unwrap_or_default();
+        let positions = live
+            .positions
+            .iter()
+            .filter_map(|position| {
+                let key = copy_pnl_position_identity(position);
+                let owned_ratio = copy_pnl_position_owned_ratio(
+                    position,
+                    owned_position_values.get(&key).copied().unwrap_or_default(),
+                    owned_position_values.contains_key(&key),
+                );
+                copy_pnl_position_scaled(position, 1.0 - owned_ratio)
+            })
+            .collect::<Vec<_>>();
+        if positions.is_empty() {
+            continue;
+        }
+        let unrealized_pnl_usd =
+            copy_sum_optional(positions.iter().map(|position| position.unrealized_pnl_usd));
+        summaries.push(CopyPnlAccountSummary {
+            id: live.id.clone(),
+            kind: "local_non_copy_live".to_string(),
+            address: live.address.clone(),
+            truth_state: live.truth_state.clone(),
+            observed_markets: live.observed_markets.clone(),
+            missing_markets: live.missing_markets.clone(),
+            unrealized_pnl_usd,
+            total_pnl_usd: unrealized_pnl_usd,
+            position_value_usd: copy_sum_optional(
+                positions.iter().map(|position| position.position_value_usd),
+            ),
+            open_position_count: positions.len(),
+            positions,
+            signal_count: live.signal_count,
+            last_signal_at_ms: live.last_signal_at_ms,
+            ..CopyPnlAccountSummary::default()
+        });
+    }
+    summaries
 }
 
 fn build_copy_live_soak_status_response_from_dir(
@@ -10590,7 +11425,57 @@ struct PositionResponse {
     size: f64,
     entry_price: f64,
     mark_price: f64,
+    position_value_usd: f64,
     pnl_usd: f64,
+    #[serde(flatten)]
+    attribution: PositionAttributionResponse,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+struct PositionAttributionPartResponse {
+    key: String,
+    source: String,
+    ratio: f64,
+    position_value_usd: f64,
+    pnl_usd: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+struct PositionAttributionResponse {
+    owner: String,
+    attribution_source: String,
+    attribution_parts: Vec<PositionAttributionPartResponse>,
+    fib_ratio: f64,
+    copy_ratio: f64,
+    unattributed_ratio: f64,
+    dust_ratio: f64,
+    fib_position_value_usd: f64,
+    copy_position_value_usd: f64,
+    unattributed_position_value_usd: f64,
+    dust_position_value_usd: f64,
+    fib_pnl_usd: f64,
+    copy_pnl_usd: f64,
+    unattributed_pnl_usd: f64,
+    dust_pnl_usd: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+struct PositionTruthSummaryResponse {
+    source: String,
+    position_count: usize,
+    fib_position_count: usize,
+    copy_position_count: usize,
+    unattributed_position_count: usize,
+    dust_position_count: usize,
+    mixed_position_count: usize,
+    fib_position_value_usd: f64,
+    copy_position_value_usd: f64,
+    unattributed_position_value_usd: f64,
+    dust_position_value_usd: f64,
+    fib_unrealized_pnl_usd: f64,
+    copy_unrealized_pnl_usd: f64,
+    unattributed_unrealized_pnl_usd: f64,
+    dust_unrealized_pnl_usd: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -13480,9 +14365,28 @@ struct PerpFundingLayer {
 }
 
 impl PerpFundingLayer {
-    fn from_result(name: &str, result: Result<ClearinghouseState>) -> Self {
+    #[cfg(test)]
+    fn from_state(name: &str, state: &ClearinghouseState) -> Self {
+        Self::from_state_for_account(name, None, "", None, state, None)
+    }
+
+    fn from_result_for_account(
+        name: &str,
+        market_id: &str,
+        account_id: &str,
+        config: &AppConfig,
+        result: Result<ClearinghouseState>,
+        position_truth: Option<&PositionTruthSnapshot>,
+    ) -> Self {
         match result {
-            Ok(state) => Self::from_state(name, &state),
+            Ok(state) => Self::from_state_for_account(
+                name,
+                Some(market_id),
+                account_id,
+                Some(config),
+                &state,
+                position_truth,
+            ),
             Err(error) => Self {
                 name: name.to_string(),
                 query_ok: false,
@@ -13497,30 +14401,73 @@ impl PerpFundingLayer {
         }
     }
 
-    fn from_state(name: &str, state: &ClearinghouseState) -> Self {
+    fn from_state_for_account(
+        name: &str,
+        market_id: Option<&str>,
+        account_id: &str,
+        config: Option<&AppConfig>,
+        state: &ClearinghouseState,
+        position_truth: Option<&PositionTruthSnapshot>,
+    ) -> Self {
+        let market = market_id.and_then(|market_id| {
+            config.and_then(|config| resolve_market_profile(Some(market_id), config).ok())
+        });
         let positions = state
             .asset_positions
             .iter()
             .map(|asset_position| {
                 let position = &asset_position.position;
+                let size = parse_frontend_decimal(&position.szi);
+                let position_value_usd = position
+                    .position_value
+                    .as_deref()
+                    .map(parse_frontend_decimal)
+                    .unwrap_or_default()
+                    .abs();
+                let unrealized_pnl_usd = position
+                    .unrealized_pnl
+                    .as_deref()
+                    .map(parse_frontend_decimal)
+                    .unwrap_or_default();
+                let coin = market
+                    .as_ref()
+                    .map(|market| normalize_coin_for_market(market, &position.coin))
+                    .or_else(|| {
+                        config.map(|config| {
+                            normalize_dex_coin(&config.hyperliquid.dex, &position.coin)
+                        })
+                    })
+                    .unwrap_or_else(|| position.coin.clone());
+                let attribution = position_truth
+                    .map(|truth| {
+                        truth.attribution_for_live_position(
+                            account_id,
+                            &coin,
+                            size,
+                            position_value_usd,
+                            unrealized_pnl_usd,
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        PositionTruthSnapshot::default().attribution_for_live_position(
+                            account_id,
+                            &coin,
+                            size,
+                            position_value_usd,
+                            unrealized_pnl_usd,
+                        )
+                    });
                 PerpFundingPosition {
-                    coin: position.coin.clone(),
-                    size: parse_frontend_decimal(&position.szi),
+                    coin,
+                    size,
                     entry_price: position
                         .entry_px
                         .as_deref()
                         .map(parse_frontend_decimal)
                         .unwrap_or_default(),
-                    position_value_usd: position
-                        .position_value
-                        .as_deref()
-                        .map(parse_frontend_decimal)
-                        .unwrap_or_default(),
-                    unrealized_pnl_usd: position
-                        .unrealized_pnl
-                        .as_deref()
-                        .map(parse_frontend_decimal)
-                        .unwrap_or_default(),
+                    position_value_usd,
+                    unrealized_pnl_usd,
+                    attribution,
                 }
             })
             .collect::<Vec<_>>();
@@ -13555,6 +14502,8 @@ struct PerpFundingPosition {
     entry_price: f64,
     position_value_usd: f64,
     unrealized_pnl_usd: f64,
+    #[serde(flatten)]
+    attribution: PositionAttributionResponse,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -13568,9 +14517,14 @@ struct SpotFundingLayer {
 }
 
 impl SpotFundingLayer {
-    fn from_result(result: Result<SpotClearinghouseState>) -> Self {
+    fn from_result_for_account(
+        result: Result<SpotClearinghouseState>,
+        account_id: &str,
+        snapshot: Option<&SpotMarketSnapshot>,
+        position_truth: Option<&PositionTruthSnapshot>,
+    ) -> Self {
         match result {
-            Ok(state) => Self::from_state(&state),
+            Ok(state) => Self::from_state_for_account(&state, account_id, snapshot, position_truth),
             Err(error) => Self {
                 query_ok: false,
                 error: Some(error.to_string()),
@@ -13582,14 +14536,65 @@ impl SpotFundingLayer {
         }
     }
 
+    #[cfg(test)]
     fn from_state(state: &SpotClearinghouseState) -> Self {
+        Self::from_state_for_account(state, "", None, None)
+    }
+
+    fn from_state_for_account(
+        state: &SpotClearinghouseState,
+        account_id: &str,
+        snapshot: Option<&SpotMarketSnapshot>,
+        position_truth: Option<&PositionTruthSnapshot>,
+    ) -> Self {
         let balances = state
             .balances
             .iter()
-            .map(|balance| SpotFundingBalance {
-                coin: balance.coin.clone(),
-                total: parse_frontend_decimal(&balance.total),
-                hold: parse_frontend_decimal(&balance.hold),
+            .map(|balance| {
+                let total = parse_frontend_decimal(&balance.total);
+                let hold = parse_frontend_decimal(&balance.hold);
+                let available = (total - hold).max(0.0);
+                let position_coin = spot_balance_position_coin(&balance.coin);
+                let position_value_usd = position_coin
+                    .as_deref()
+                    .and_then(|coin| spot_balance_position_value_usd(available, coin, snapshot))
+                    .unwrap_or_default();
+                let attribution = if let Some(coin) = position_coin.as_deref() {
+                    position_truth
+                        .map(|truth| {
+                            truth.attribution_for_live_position(
+                                account_id,
+                                coin,
+                                available,
+                                position_value_usd,
+                                0.0,
+                            )
+                        })
+                        .unwrap_or_else(|| {
+                            PositionTruthSnapshot::default().attribution_for_live_position(
+                                account_id,
+                                coin,
+                                available,
+                                position_value_usd,
+                                0.0,
+                            )
+                        })
+                } else {
+                    PositionTruthSnapshot::default().attribution_for_live_position(
+                        account_id,
+                        &balance.coin,
+                        available,
+                        0.0,
+                        0.0,
+                    )
+                };
+                SpotFundingBalance {
+                    coin: balance.coin.clone(),
+                    total,
+                    hold,
+                    position_value_usd,
+                    attribution,
+                }
             })
             .collect::<Vec<_>>();
         let total_usdc = balances
@@ -13622,12 +14627,47 @@ struct SpotFundingBalance {
     coin: String,
     total: f64,
     hold: f64,
+    position_value_usd: f64,
+    #[serde(flatten)]
+    attribution: PositionAttributionResponse,
+}
+
+fn spot_balance_position_coin(token: &str) -> Option<String> {
+    let token = token.trim().to_ascii_uppercase();
+    if token.is_empty() || token == "USDC" {
+        return None;
+    }
+    Some(normalize_spot_coin(&format!("{token}/USDC")))
+}
+
+fn spot_balance_position_value_usd(
+    available: f64,
+    coin: &str,
+    snapshot: Option<&SpotMarketSnapshot>,
+) -> Option<f64> {
+    if available <= 0.0 {
+        return Some(0.0);
+    }
+    let price = snapshot
+        .and_then(|snapshot| snapshot.asset(coin).ok())
+        .and_then(|asset| {
+            asset
+                .context
+                .mid_px
+                .as_deref()
+                .and_then(|value| value.parse::<f64>().ok())
+                .or_else(|| asset.context.mark_px.parse::<f64>().ok())
+                .or_else(|| asset.context.prev_day_px.parse::<f64>().ok())
+        })
+        .filter(|price| price.is_finite() && *price > 0.0)?;
+    Some(normalize_display_usd(available * price))
 }
 
 async fn build_account_funding(
     config: &AppConfig,
     account_id: &str,
     realtime: Option<&RealtimeState>,
+    position_truth: Option<&PositionTruthSnapshot>,
 ) -> Result<AccountFundingResponse> {
     let account = config
         .account(account_id)
@@ -13644,33 +14684,69 @@ async fn build_account_funding(
     let xyz_ws =
         realtime.and_then(|state| state.clearinghouse_state(MARKET_XYZ_PERP, &account.address));
     let spot_ws = realtime.and_then(|state| state.spot_state(&account.address));
+    let spot_snapshot = fetch_spot_market_snapshot_cached(
+        &config.app.environment,
+        MARKET_SNAPSHOT_QUOTE_CACHE_TTL_MS,
+    )
+    .await
+    .ok();
 
     let default_perp = if let Some(state) = default_ws {
-        PerpFundingLayer::from_state("default_perp", &state)
-    } else {
-        PerpFundingLayer::from_result(
+        PerpFundingLayer::from_state_for_account(
             "default_perp",
+            Some(MARKET_HL_PERP),
+            &account.account_id,
+            Some(config),
+            &state,
+            position_truth,
+        )
+    } else {
+        PerpFundingLayer::from_result_for_account(
+            "default_perp",
+            MARKET_HL_PERP,
+            &account.account_id,
+            config,
             fetch_default_clearinghouse_state(&config.app.environment, &account.address).await,
+            position_truth,
         )
     };
     let xyz_perp = if let Some(state) = xyz_ws {
-        PerpFundingLayer::from_state("xyz_perp", &state)
-    } else {
-        PerpFundingLayer::from_result(
+        PerpFundingLayer::from_state_for_account(
             "xyz_perp",
+            Some(MARKET_XYZ_PERP),
+            &account.account_id,
+            Some(config),
+            &state,
+            position_truth,
+        )
+    } else {
+        PerpFundingLayer::from_result_for_account(
+            "xyz_perp",
+            MARKET_XYZ_PERP,
+            &account.account_id,
+            config,
             fetch_clearinghouse_state(
                 &config.app.environment,
                 &config.hyperliquid.dex,
                 &account.address,
             )
             .await,
+            position_truth,
         )
     };
     let spot = if let Some(state) = spot_ws {
-        SpotFundingLayer::from_state(&state)
+        SpotFundingLayer::from_state_for_account(
+            &state,
+            &account.account_id,
+            spot_snapshot.as_ref(),
+            position_truth,
+        )
     } else {
-        SpotFundingLayer::from_result(
+        SpotFundingLayer::from_result_for_account(
             fetch_spot_clearinghouse_state(&config.app.environment, &account.address).await,
+            &account.account_id,
+            spot_snapshot.as_ref(),
+            position_truth,
         )
     };
     let next_actions = account_funding_next_actions(
@@ -15462,6 +16538,9 @@ struct CopyPnlAccountSummary {
     id: String,
     kind: String,
     address: String,
+    truth_state: String,
+    observed_markets: Vec<String>,
+    missing_markets: Vec<String>,
     fill_count: u64,
     realized_pnl_usd: Option<f64>,
     closed_pnl_usd: Option<f64>,
@@ -15503,6 +16582,10 @@ struct CopySummaryResponse {
     pnl_report_status: String,
     local_summary: Option<CopyPnlAccountSummary>,
     local_summaries: Vec<CopyPnlAccountSummary>,
+    copy_owned_summary: Option<CopyPnlAccountSummary>,
+    copy_owned_summaries: Vec<CopyPnlAccountSummary>,
+    other_local_summary: Option<CopyPnlAccountSummary>,
+    other_local_summaries: Vec<CopyPnlAccountSummary>,
     leader_summaries: Vec<CopyPnlAccountSummary>,
     target_realized_pnl_usd: Option<f64>,
     target_unrealized_pnl_usd: Option<f64>,
@@ -16513,7 +17596,10 @@ mod tests {
         audit::AuditEvent,
         config::{AppConfig, MARKET_CASH_PERP, MARKET_HL_PERP, MARKET_SPOT, MARKET_XYZ_PERP},
         domain::{ExecutionMode, OrderSide, WorkerReport},
-        hyperliquid::UserFill,
+        hyperliquid::{
+            SpotAssetContext, SpotMarketSnapshot, SpotMetaAsset, SpotMetaResponse, SpotTokenInfo,
+            UserFill,
+        },
         realtime::RealtimeState,
         secrets::{SecretUpsert, VaultEntrySummary, VaultSummary},
     };
@@ -16526,12 +17612,14 @@ mod tests {
         FibPositionSnapshot, FibProfitLossMode, FibTradeDirection, FrontendAppState,
         ManualSettingsPayload, NotificationSettings, NotificationSettingsPayload,
         NotificationSettingsResponse, OrderStatusPayload, OrderStatusQuery, PerpFundingLayer,
-        ReadinessCheckResponse, SecretUsage, SpotFundingLayer, VAULT_SESSION_TTL_MS,
-        account_funding_next_actions, account_funding_summary,
+        PositionTruthSnapshot, ReadinessCheckResponse, SecretUsage, SpotFundingLayer,
+        VAULT_SESSION_TTL_MS, account_funding_next_actions, account_funding_summary,
         aggregate_copy_local_account_summaries, apply_notification_settings_payload,
         build_basic_plan, build_copy_live_soak_status_response_from_dir,
         build_copy_shadow_history_response_from_path, build_copy_summary_response_from_entries,
-        build_fib_strategy_pnl_summary, copy_ledger_position_summaries,
+        build_fib_strategy_pnl_summary, build_position_truth_snapshot,
+        copy_ledger_position_summaries, copy_pnl_account_summary_from_live_positions,
+        copy_pnl_account_summary_has_current_state,
         dashboard_cancel_stopped_without_open_orders_count, dashboard_cancel_strategy_ids,
         dashboard_order_is_cancelable_fib_entry, default_copy_leaders, default_copy_markets,
         ensure_fib_pair_available, failed_readiness_blockers, feishu_test_response_ok,
@@ -16542,11 +17630,11 @@ mod tests {
         fill_event_type, live_readiness_next_actions, live_readiness_summary,
         mark_fib_record_auto_loop_retry_wait, mark_fib_record_incomplete_entry_submission,
         normalize_recovered_fib_instance, persist_vault_session_cache_to_path,
-        read_cached_vault_password_from_path, read_copy_live_soak_pnl_summary,
-        read_recent_copy_shadow_history_entries_from_paths, selected_enabled_account_ids,
-        serverchan_test_response_ok, trade_record_event_type, transfer_amount_label,
-        usdc_transfer_readiness_next_actions, usdc_transfer_readiness_summary,
-        validate_batch_account_count,
+        positions_from_clearinghouse, read_cached_vault_password_from_path,
+        read_copy_live_soak_pnl_summary, read_recent_copy_shadow_history_entries_from_paths,
+        selected_enabled_account_ids, serverchan_test_response_ok, trade_record_event_type,
+        transfer_amount_label, usdc_transfer_readiness_next_actions,
+        usdc_transfer_readiness_summary, validate_batch_account_count,
     };
 
     #[test]
@@ -16835,6 +17923,7 @@ mod tests {
             CopyPnlReportSummary::default(),
             None,
             Vec::new(),
+            Vec::new(),
             CopyLiveAccountSummaries::default(),
         );
 
@@ -16902,6 +17991,7 @@ mod tests {
             pnl_report,
             None,
             Vec::new(),
+            Vec::new(),
             CopyLiveAccountSummaries::default(),
         );
 
@@ -16961,6 +18051,7 @@ mod tests {
             pnl_report,
             None,
             Vec::new(),
+            Vec::new(),
             CopyLiveAccountSummaries::default(),
         );
 
@@ -17015,6 +18106,7 @@ mod tests {
             400,
             pnl_report,
             Some(&configured),
+            Vec::new(),
             Vec::new(),
             CopyLiveAccountSummaries::default(),
         );
@@ -17077,6 +18169,7 @@ mod tests {
             300,
             CopyPnlReportSummary::default(),
             Some(&configured),
+            Vec::new(),
             Vec::new(),
             CopyLiveAccountSummaries::default(),
         );
@@ -17315,6 +18408,7 @@ mod tests {
             pnl_report,
             None,
             Vec::new(),
+            Vec::new(),
             CopyLiveAccountSummaries::default(),
         );
 
@@ -17369,6 +18463,7 @@ mod tests {
             400,
             CopyPnlReportSummary::default(),
             None,
+            Vec::new(),
             ledger_positions,
             CopyLiveAccountSummaries::default(),
         );
@@ -17421,6 +18516,7 @@ mod tests {
             400,
             CopyPnlReportSummary::default(),
             None,
+            Vec::new(),
             ledger_positions,
             live_accounts,
         );
@@ -17470,6 +18566,7 @@ mod tests {
             400,
             CopyPnlReportSummary::default(),
             None,
+            Vec::new(),
             ledger_positions,
             live_accounts,
         );
@@ -17535,6 +18632,7 @@ mod tests {
             pnl_report,
             Some(&configured),
             Vec::new(),
+            Vec::new(),
             live_accounts,
         );
 
@@ -17553,6 +18651,102 @@ mod tests {
         assert_eq!(summary.target_unrealized_pnl_usd, Some(2.5));
         assert_eq!(summary.target_position_value_usd, Some(700.0));
         assert_eq!(summary.target_open_position_count, 1);
+    }
+
+    #[test]
+    fn copy_live_account_summary_marks_flat_refreshed_account_as_current_zero() {
+        let summary = copy_pnl_account_summary_from_live_positions(
+            "leader_1".to_string(),
+            "target_live".to_string(),
+            "0x9dead8fffcbf130e7658f672d2c081d91178d617".to_string(),
+            Vec::new(),
+            vec![MARKET_XYZ_PERP.to_string()],
+            Vec::new(),
+        );
+
+        assert_eq!(summary.position_value_usd, Some(0.0));
+        assert_eq!(summary.unrealized_pnl_usd, Some(0.0));
+        assert_eq!(summary.truth_state, "current");
+        assert!(copy_pnl_account_summary_has_current_state(&summary));
+    }
+
+    #[test]
+    fn copy_live_account_summary_marks_partial_when_some_markets_missing() {
+        let summary = copy_pnl_account_summary_from_live_positions(
+            "leader_1".to_string(),
+            "target_live".to_string(),
+            "0x9dead8fffcbf130e7658f672d2c081d91178d617".to_string(),
+            Vec::new(),
+            vec![MARKET_XYZ_PERP.to_string()],
+            vec![MARKET_SPOT.to_string()],
+        );
+
+        assert_eq!(summary.position_value_usd, Some(0.0));
+        assert_eq!(summary.unrealized_pnl_usd, Some(0.0));
+        assert_eq!(summary.truth_state, "partial");
+        assert_eq!(summary.observed_markets, vec![MARKET_XYZ_PERP.to_string()]);
+        assert_eq!(summary.missing_markets, vec![MARKET_SPOT.to_string()]);
+    }
+
+    #[test]
+    fn copy_summary_treats_flat_live_targets_as_current() {
+        let leader_a = "0x9dead8fffcbf130e7658f672d2c081d91178d617".to_string();
+        let leader_b = "0xd8c5228c515db3043dfa0c8cd6f22450ee9a99b0".to_string();
+        let configured = CopyUiSettings {
+            leaders: vec![leader_a.clone(), leader_b.clone()],
+            markets: default_copy_markets(),
+            copy_ratio: 0.2,
+            principal_cap_usd: 35.0,
+            leverage: crate::strategies::smart_money::COPY_MAX_LEVERAGE,
+            account_id: "addr_a".to_string(),
+            account_ids: vec!["addr_a".to_string()],
+            updated_at_ms: 123,
+        };
+        let live_accounts = CopyLiveAccountSummaries {
+            local: None,
+            locals: Vec::new(),
+            targets: vec![
+                copy_pnl_account_summary_from_live_positions(
+                    "leader_1".to_string(),
+                    "target_live".to_string(),
+                    leader_a,
+                    Vec::new(),
+                    vec![MARKET_XYZ_PERP.to_string()],
+                    Vec::new(),
+                ),
+                copy_pnl_account_summary_from_live_positions(
+                    "leader_2".to_string(),
+                    "target_live".to_string(),
+                    leader_b,
+                    Vec::new(),
+                    vec![MARKET_XYZ_PERP.to_string()],
+                    Vec::new(),
+                ),
+            ],
+        };
+
+        let summary = build_copy_summary_response_from_entries(
+            Vec::new(),
+            None,
+            3_000_000,
+            CopyPnlReportSummary::default(),
+            Some(&configured),
+            Vec::new(),
+            Vec::new(),
+            live_accounts,
+        );
+
+        assert_eq!(summary.target_position_state, "current");
+        assert_eq!(summary.target_open_position_count, 0);
+        assert_eq!(summary.target_position_value_usd, Some(0.0));
+        assert_eq!(summary.target_unrealized_pnl_usd, Some(0.0));
+        assert_eq!(summary.leader_summaries.len(), 2);
+        assert!(
+            summary
+                .leader_summaries
+                .iter()
+                .all(|leader| leader.kind == "target_live")
+        );
     }
 
     #[test]
@@ -17614,6 +18808,7 @@ mod tests {
             CopyPnlReportSummary::default(),
             Some(&configured),
             Vec::new(),
+            Vec::new(),
             live_accounts,
         );
 
@@ -17633,6 +18828,84 @@ mod tests {
                 .map(|item| item.open_position_count),
             Some(2)
         );
+    }
+
+    #[test]
+    fn copy_summary_splits_copy_owned_and_other_local_truth_for_same_position_key() {
+        let configured = CopyUiSettings {
+            leaders: default_copy_leaders(),
+            markets: default_copy_markets(),
+            copy_ratio: 0.2,
+            principal_cap_usd: 35.0,
+            leverage: crate::strategies::smart_money::COPY_MAX_LEVERAGE,
+            account_id: "addr_a".to_string(),
+            account_ids: vec!["addr_a".to_string()],
+            updated_at_ms: 123,
+        };
+        let local_a = CopyPnlAccountSummary {
+            id: "addr_a".to_string(),
+            kind: "local_live".to_string(),
+            truth_state: "current".to_string(),
+            unrealized_pnl_usd: Some(20.0),
+            total_pnl_usd: Some(20.0),
+            position_value_usd: Some(200.0),
+            open_position_count: 1,
+            positions: vec![CopyPnlPositionSummary {
+                coin: "xyz:GOLD".to_string(),
+                side: "long".to_string(),
+                size: 0.02,
+                position_value_usd: Some(200.0),
+                unrealized_pnl_usd: Some(20.0),
+                entry_px: Some(4000.0),
+            }],
+            ..CopyPnlAccountSummary::default()
+        };
+        let ledger_local_summaries = vec![CopyPnlAccountSummary {
+            id: "addr_a".to_string(),
+            kind: "local_ledger".to_string(),
+            position_value_usd: Some(125.0),
+            open_position_count: 1,
+            positions: vec![CopyPnlPositionSummary {
+                coin: "xyz:GOLD".to_string(),
+                side: "long".to_string(),
+                size: 125.0,
+                position_value_usd: Some(125.0),
+                unrealized_pnl_usd: None,
+                entry_px: None,
+            }],
+            ..CopyPnlAccountSummary::default()
+        }];
+        let live_accounts = CopyLiveAccountSummaries {
+            local: aggregate_copy_local_account_summaries(&[local_a.clone()]),
+            locals: vec![local_a],
+            targets: Vec::new(),
+        };
+
+        let summary = build_copy_summary_response_from_entries(
+            Vec::new(),
+            None,
+            3_000_000,
+            CopyPnlReportSummary::default(),
+            Some(&configured),
+            ledger_local_summaries,
+            Vec::new(),
+            live_accounts,
+        );
+
+        let copy_owned = summary.copy_owned_summary.expect("copy owned summary");
+        assert_eq!(copy_owned.open_position_count, 1);
+        assert_eq!(copy_owned.position_value_usd, Some(125.0));
+        assert_eq!(copy_owned.unrealized_pnl_usd, Some(12.5));
+
+        let other = summary.other_local_summary.expect("other local summary");
+        assert_eq!(other.open_position_count, 1);
+        assert_eq!(other.position_value_usd, Some(75.0));
+        assert_eq!(other.unrealized_pnl_usd, Some(7.5));
+
+        let local = summary.local_summary.expect("local summary");
+        assert_eq!(local.position_value_usd, Some(200.0));
+        assert_eq!(local.unrealized_pnl_usd, Some(20.0));
+        assert_eq!(summary.unrealized_pnl_usd, Some(12.5));
     }
 
     #[test]
@@ -17682,6 +18955,7 @@ mod tests {
             3_000_000,
             CopyPnlReportSummary::default(),
             Some(&configured),
+            Vec::new(),
             Vec::new(),
             live_accounts,
         );
@@ -19063,13 +20337,32 @@ mod tests {
         }
     }
 
+    fn test_app_config_with_addr_a() -> AppConfig {
+        let mut config = AppConfig::default();
+        config.hyperliquid.dex = "xyz".to_string();
+        config.accounts = vec![crate::config::AccountConfig {
+            account_id: "addr_a".to_string(),
+            address: "0x0000000000000000000000000000000000000001".to_string(),
+            secret_id: "addr_a_api_wallet".to_string(),
+            api_wallet_env: String::new(),
+            transfer_secret_id: String::new(),
+            transfer_wallet_env: String::new(),
+            enabled: true,
+            worker_enabled: true,
+            copy_ratio: 0.1,
+            max_order_notional_usd: 100.0,
+            blocked_markets: Vec::new(),
+        }];
+        config
+    }
+
     fn test_frontend_state_with_fib_records(records: Vec<FibInstanceRecord>) -> FrontendAppState {
         let instances = records
             .into_iter()
             .map(|record| (record.strategy_id.clone(), record))
             .collect::<std::collections::HashMap<_, _>>();
         FrontendAppState {
-            config: Arc::new(std::sync::RwLock::new(AppConfig::default())),
+            config: Arc::new(std::sync::RwLock::new(test_app_config_with_addr_a())),
             config_path: std::env::temp_dir().join("trade_xyz_fib_conflict_test.toml"),
             dry_run: true,
             started_at_ms: crate::domain::now_ms(),
@@ -19114,6 +20407,234 @@ mod tests {
             crossed: true,
             fee: fee.to_string(),
         }
+    }
+
+    #[test]
+    fn position_truth_splits_copy_fib_unattributed_and_dust() {
+        let mut truth = PositionTruthSnapshot::default();
+        truth.add_copy_position(
+            "addr_a",
+            &CopyPnlPositionSummary {
+                coin: "xyz:GOLD".to_string(),
+                side: "long".to_string(),
+                size: 0.4,
+                position_value_usd: Some(40.0),
+                unrealized_pnl_usd: None,
+                entry_px: None,
+            },
+        );
+        truth.add_fib_position("addr_a", "xyz:GOLD", "long", 0.3, 30.0, false);
+
+        let attribution =
+            truth.attribution_for_live_position("addr_a", "xyz:GOLD", 1.0, 100.0, 10.0);
+
+        assert_eq!(attribution.owner, "mixed");
+        assert!((attribution.copy_ratio - 0.4).abs() < 0.000001);
+        assert!((attribution.fib_ratio - 0.3).abs() < 0.000001);
+        assert!((attribution.unattributed_ratio - 0.3).abs() < 0.000001);
+        assert!((attribution.copy_pnl_usd - 4.0).abs() < 0.000001);
+        assert!((attribution.fib_pnl_usd - 3.0).abs() < 0.000001);
+        assert!((attribution.unattributed_pnl_usd - 3.0).abs() < 0.000001);
+
+        let dust = PositionTruthSnapshot::default().attribution_for_live_position(
+            "addr_a",
+            "xyz:SILVER",
+            0.001,
+            0.56,
+            -0.02,
+        );
+        assert_eq!(dust.owner, "dust");
+        assert!((dust.dust_ratio - 1.0).abs() < 0.000001);
+
+        let unattributed = PositionTruthSnapshot::default()
+            .attribution_for_live_position("addr_a", "xyz:OIL", 1.0, 12.0, 1.5);
+        assert_eq!(unattributed.owner, "unattributed");
+        assert!((unattributed.unattributed_ratio - 1.0).abs() < 0.000001);
+    }
+
+    #[test]
+    fn position_truth_treats_copy_mark_to_market_drift_as_copy_owned() {
+        let mut truth = PositionTruthSnapshot::default();
+        truth.add_copy_position(
+            "addr_b",
+            &CopyPnlPositionSummary {
+                coin: "xyz:XYZ100".to_string(),
+                side: "long".to_string(),
+                size: 678.7088,
+                position_value_usd: Some(678.7088),
+                unrealized_pnl_usd: None,
+                entry_px: None,
+            },
+        );
+
+        let attribution =
+            truth.attribution_for_live_position("addr_b", "xyz:XYZ100", 0.0232, 680.9896, 2.2808);
+
+        assert_eq!(attribution.owner, "copy");
+        assert!((attribution.copy_ratio - 1.0).abs() < 0.000001);
+        assert!(attribution.unattributed_ratio.abs() < 0.000001);
+        assert!((attribution.copy_pnl_usd - 2.2808).abs() < 0.000001);
+        assert!(attribution.unattributed_pnl_usd.abs() < 0.000001);
+    }
+
+    #[test]
+    fn positions_from_clearinghouse_emit_backend_position_truth_fields() {
+        let config = test_app_config_with_addr_a();
+        let account = config.account("addr_a").expect("addr_a account").clone();
+        let state: crate::hyperliquid::ClearinghouseState = serde_json::from_value(json!({
+            "marginSummary": {
+                "accountValue": "1000",
+                "totalNtlPos": "100",
+                "totalRawUsd": "1000",
+                "totalMarginUsed": "10"
+            },
+            "withdrawable": "900",
+            "assetPositions": [{
+                "position": {
+                    "coin": "GOLD",
+                    "szi": "2",
+                    "entryPx": "45",
+                    "positionValue": "100",
+                    "unrealizedPnl": "12"
+                }
+            }]
+        }))
+        .expect("clearinghouse state");
+        let mut truth = PositionTruthSnapshot::default();
+        truth.add_copy_position(
+            "addr_a",
+            &CopyPnlPositionSummary {
+                coin: "xyz:GOLD".to_string(),
+                side: "long".to_string(),
+                size: 1.2,
+                position_value_usd: Some(60.0),
+                unrealized_pnl_usd: None,
+                entry_px: None,
+            },
+        );
+
+        let positions =
+            positions_from_clearinghouse(&account, MARKET_XYZ_PERP, &config, &state, Some(&truth));
+
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].coin, "xyz:GOLD");
+        assert_eq!(positions[0].attribution.owner, "mixed");
+        assert!((positions[0].position_value_usd - 100.0).abs() < 0.000001);
+        assert!((positions[0].attribution.copy_ratio - 0.6).abs() < 0.000001);
+        assert!((positions[0].attribution.unattributed_ratio - 0.4).abs() < 0.000001);
+        assert_eq!(
+            positions[0].attribution.attribution_source,
+            "backend_position_truth"
+        );
+    }
+
+    #[test]
+    fn spot_funding_balance_emits_copy_owner_from_backend_position_truth() {
+        let state: crate::hyperliquid::SpotClearinghouseState = serde_json::from_value(json!({
+            "balances": [{
+                "coin": "HYPE",
+                "total": "2",
+                "hold": "0.5"
+            }]
+        }))
+        .expect("spot state");
+        let snapshot = SpotMarketSnapshot {
+            meta: SpotMetaResponse {
+                universe: vec![SpotMetaAsset {
+                    name: "HYPE/USDC".to_string(),
+                    tokens: vec![0, 1],
+                    index: 0,
+                }],
+                tokens: vec![
+                    SpotTokenInfo {
+                        name: "HYPE".to_string(),
+                        sz_decimals: 4,
+                        index: 0,
+                    },
+                    SpotTokenInfo {
+                        name: "USDC".to_string(),
+                        sz_decimals: 6,
+                        index: 1,
+                    },
+                ],
+            },
+            asset_contexts: vec![SpotAssetContext {
+                day_ntl_vlm: "0".to_string(),
+                mark_px: "20".to_string(),
+                mid_px: Some("20".to_string()),
+                prev_day_px: "19".to_string(),
+                circulating_supply: None,
+                coin: "HYPE/USDC".to_string(),
+            }],
+        };
+        let mut truth = PositionTruthSnapshot::default();
+        truth.add_copy_position(
+            "addr_a",
+            &CopyPnlPositionSummary {
+                coin: "HYPE/USDC".to_string(),
+                side: "long".to_string(),
+                size: 1.5,
+                position_value_usd: Some(30.0),
+                unrealized_pnl_usd: None,
+                entry_px: None,
+            },
+        );
+
+        let layer = SpotFundingLayer::from_state_for_account(
+            &state,
+            "addr_a",
+            Some(&snapshot),
+            Some(&truth),
+        );
+
+        assert_eq!(layer.balances.len(), 1);
+        assert_eq!(layer.balances[0].coin, "HYPE");
+        assert!((layer.balances[0].position_value_usd - 30.0).abs() < 0.000001);
+        assert_eq!(layer.balances[0].attribution.owner, "copy");
+        assert!((layer.balances[0].attribution.copy_ratio - 1.0).abs() < 0.000001);
+    }
+
+    #[test]
+    fn position_truth_uses_precise_fib_order_oids_for_fib_ownership() {
+        let mut record = test_fib_record(
+            "fib_position_truth_unique",
+            MARKET_HL_PERP,
+            "ZZZTEST",
+            FibInstanceStatus::Protected,
+            false,
+        );
+        record.entry_order_refs = vec![FibOrderRef {
+            account_id: "addr_a".to_string(),
+            coin: "ZZZTEST".to_string(),
+            cloid: "entry".to_string(),
+            oid: Some(7001),
+            level: Some(0.5),
+            role: Some("entry".to_string()),
+            dry_run: false,
+            submitted_at_ms: 10,
+        }];
+        let state = test_frontend_state_with_fib_records(vec![record]);
+        let config = test_app_config_with_addr_a();
+        state.realtime.update_fills(
+            &config.accounts[0].address,
+            MARKET_HL_PERP,
+            vec![
+                test_user_fill(7001, "ZZZTEST", "B", 100.0, 0.2, 20, 0.0, 0.01),
+                test_user_fill(9999, "ZZZTEST", "B", 100.0, 0.7, 21, 0.0, 0.01),
+            ],
+            true,
+        );
+
+        let truth = build_position_truth_snapshot(&state, &config);
+        let attribution = truth.attribution_for_live_position("addr_a", "ZZZTEST", 0.5, 50.0, 5.0);
+
+        assert_eq!(attribution.owner, "mixed");
+        assert!((attribution.fib_ratio - 0.4).abs() < 0.000001);
+        assert!((attribution.unattributed_ratio - 0.6).abs() < 0.000001);
+        assert_eq!(
+            attribution.attribution_parts[0].source,
+            "fib_strategy_order_oids"
+        );
     }
 
     #[test]

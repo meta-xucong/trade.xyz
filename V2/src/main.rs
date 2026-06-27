@@ -2336,6 +2336,34 @@ mod tests {
     }
 
     #[test]
+    fn copy_live_daemon_reduce_only_effective_notional_flattens_sub_min_residual() {
+        assert_eq!(
+            super::copy_live_daemon_reduce_only_effective_notional_usd(678.7088, 680.5952),
+            680.5952
+        );
+        assert_eq!(
+            super::copy_live_daemon_reduce_only_effective_notional_usd(70.0, 100.0),
+            70.0
+        );
+        assert_eq!(
+            super::copy_live_daemon_reduce_only_effective_notional_usd(150.0, 100.0),
+            100.0
+        );
+        assert_eq!(
+            super::copy_live_daemon_reduce_only_effective_notional_usd(8.0, 12.0),
+            12.0
+        );
+        assert_eq!(
+            super::copy_live_daemon_reduce_only_effective_notional_usd(7.0, 8.0),
+            8.0
+        );
+        assert_eq!(
+            super::copy_live_daemon_reduce_only_effective_notional_usd(0.0, 8.0),
+            0.0
+        );
+    }
+
+    #[test]
     fn copy_live_daemon_submit_plan_contract_allows_only_executable_refs() {
         let options = CopyLiveDaemonSupervisorOptions {
             leaders: Vec::new(),
@@ -4334,6 +4362,119 @@ mod tests {
     }
 
     #[test]
+    fn copy_live_daemon_market_state_prune_keeps_non_default_perp_pending_reduce() {
+        let entry = crate::strategies::smart_money::CopyLedgerEntry {
+            local_account_id: "addr_a".to_string(),
+            leader_id: "leader_hl".to_string(),
+            leader_group: "leader_hl".to_string(),
+            signal_id: "sig-hl-reduce".to_string(),
+            coin: "hl:BTC".to_string(),
+            local_side: crate::domain::OrderSide::Buy,
+            order_cloid: None,
+            order_oid: None,
+            submitted_at_ms: None,
+            filled_at_ms: None,
+            planned_notional_usd: 6.8,
+            pending_notional_usd: 6.8,
+            filled_notional_usd: 0.0,
+            remaining_notional_usd: 6.8,
+            status: crate::strategies::smart_money::CopyLedgerStatus::PendingReduce,
+        };
+        let snapshot = crate::strategies::smart_money::CopyPersistenceSnapshot {
+            schema_version: 1,
+            saved_at_ms: now_ms(),
+            seen_event_keys: vec!["seen-hl".to_string()],
+            ledger_entries: vec![entry],
+        };
+        let mut config = crate::config::AppConfig::default();
+        config.hyperliquid.dex = "xyz".to_string();
+        let readable_accounts = HashSet::from(["addr_a".to_string()]);
+        let mut perp_state_by_scope = std::collections::HashMap::new();
+        perp_state_by_scope.insert(
+            ("addr_a".to_string(), "hl".to_string()),
+            Ok(crate::hyperliquid::ClearinghouseState {
+                margin_summary: crate::hyperliquid::MarginSummary::default(),
+                cross_margin_summary: None,
+                cross_maintenance_margin_used: None,
+                withdrawable: None,
+                asset_positions: vec![crate::hyperliquid::AssetPosition {
+                    position: crate::hyperliquid::PerpPosition {
+                        coin: "hl:BTC".to_string(),
+                        szi: "0.15".to_string(),
+                        ..Default::default()
+                    },
+                    position_type: None,
+                }],
+                time: None,
+            }),
+        );
+
+        let pruned = super::copy_live_daemon_prune_snapshot_against_market_state_maps(
+            &config,
+            snapshot,
+            &readable_accounts,
+            &perp_state_by_scope,
+            &std::collections::HashMap::new(),
+        );
+
+        assert_eq!(pruned.seen_event_keys, vec!["seen-hl"]);
+        assert_eq!(pruned.ledger_entries.len(), 1);
+        assert_eq!(pruned.ledger_entries[0].signal_id, "sig-hl-reduce");
+    }
+
+    #[test]
+    fn copy_live_daemon_market_state_prune_keeps_spot_pending_reduce_with_inventory() {
+        let entry = crate::strategies::smart_money::CopyLedgerEntry {
+            local_account_id: "addr_a".to_string(),
+            leader_id: "leader_spot".to_string(),
+            leader_group: "leader_spot".to_string(),
+            signal_id: "sig-spot-reduce".to_string(),
+            coin: "BTC/USDC".to_string(),
+            local_side: crate::domain::OrderSide::Buy,
+            order_cloid: None,
+            order_oid: None,
+            submitted_at_ms: None,
+            filled_at_ms: None,
+            planned_notional_usd: 4.2,
+            pending_notional_usd: 4.2,
+            filled_notional_usd: 0.0,
+            remaining_notional_usd: 4.2,
+            status: crate::strategies::smart_money::CopyLedgerStatus::PendingReduce,
+        };
+        let snapshot = crate::strategies::smart_money::CopyPersistenceSnapshot {
+            schema_version: 1,
+            saved_at_ms: now_ms(),
+            seen_event_keys: vec!["seen-spot".to_string()],
+            ledger_entries: vec![entry],
+        };
+        let readable_accounts = HashSet::from(["addr_a".to_string()]);
+        let mut spot_state_by_account = std::collections::HashMap::new();
+        spot_state_by_account.insert(
+            "addr_a".to_string(),
+            Ok(crate::hyperliquid::SpotClearinghouseState {
+                balances: vec![crate::hyperliquid::SpotBalance {
+                    coin: "BTC".to_string(),
+                    total: "0.025".to_string(),
+                    hold: "0.0001".to_string(),
+                    ..Default::default()
+                }],
+            }),
+        );
+
+        let pruned = super::copy_live_daemon_prune_snapshot_against_market_state_maps(
+            &crate::config::AppConfig::default(),
+            snapshot,
+            &readable_accounts,
+            &std::collections::HashMap::new(),
+            &spot_state_by_account,
+        );
+
+        assert_eq!(pruned.seen_event_keys, vec!["seen-spot"]);
+        assert_eq!(pruned.ledger_entries.len(), 1);
+        assert_eq!(pruned.ledger_entries[0].signal_id, "sig-spot-reduce");
+    }
+
+    #[test]
     fn copy_live_daemon_recovers_open_ledger_from_live_position_and_shadow() {
         let temp = std::env::temp_dir().join(format!("trade_xyz_copy_recover_ledger_{}", now_ms()));
         std::fs::create_dir_all(&temp).expect("test dir");
@@ -5551,6 +5692,7 @@ mod tests {
             0.05,
             &flat,
         );
+        let base_snapshot = crate::strategies::smart_money::CopyPersistenceSnapshot::empty();
 
         let live_submit =
             tokio::runtime::Runtime::new()?.block_on(copy_live_daemon_persistent_live_submit(
@@ -5559,6 +5701,7 @@ mod tests {
                 &contract,
                 &executable_refs,
                 &[],
+                &base_snapshot,
                 &[],
             ));
 
@@ -5619,10 +5762,18 @@ mod tests {
             error: None,
         }];
         let contract = copy_live_daemon_submit_plan_contract(&options, &[], &[], 0.0, 0.0, &flat);
+        let base_snapshot = crate::strategies::smart_money::CopyPersistenceSnapshot::empty();
 
-        let live_submit = tokio::runtime::Runtime::new()?.block_on(
-            copy_live_daemon_persistent_live_submit(&config, &options, &contract, &[], &[], &[]),
-        );
+        let live_submit =
+            tokio::runtime::Runtime::new()?.block_on(copy_live_daemon_persistent_live_submit(
+                &config,
+                &options,
+                &contract,
+                &[],
+                &[],
+                &base_snapshot,
+                &[],
+            ));
 
         assert!(live_submit.ok);
         assert!(live_submit.submitted_reports.is_empty());
@@ -5785,6 +5936,7 @@ mod tests {
         }];
         let plan_contract =
             copy_live_daemon_submit_plan_contract(&options, &[], &[], 0.0, 0.0, &flat);
+        let base_snapshot = crate::strategies::smart_money::CopyPersistenceSnapshot::empty();
         let live_submit =
             tokio::runtime::Runtime::new()?.block_on(copy_live_daemon_persistent_live_submit(
                 &config,
@@ -5792,6 +5944,7 @@ mod tests {
                 &plan_contract,
                 &[],
                 &[],
+                &base_snapshot,
                 &[],
             ));
 
@@ -9872,6 +10025,7 @@ async fn run_copy_live_daemon_supervisor(
                                     &immediate_contract,
                                     &pending_executable_refs,
                                     &candidate_suppressed_refs,
+                                    &immediate_snapshot,
                                     &approved_records,
                                 )
                                 .await;
@@ -9979,8 +10133,12 @@ async fn run_copy_live_daemon_supervisor(
     let saved = strategies::smart_money::load_copy_persistence_snapshot(&options.persistence_path)?;
     let pre_submit_reconciliations =
         reconcile_copy_bounded_window_accounts(config, &target_accounts).await;
-    let saved =
-        copy_live_daemon_prune_snapshot_against_reconciliations(saved, &pre_submit_reconciliations);
+    let saved = copy_live_daemon_prune_snapshot_against_live_markets(
+        config,
+        saved,
+        &pre_submit_reconciliations,
+    )
+    .await;
     let saved = copy_live_daemon_recover_open_ledger_from_live_positions(
         saved,
         &pre_submit_reconciliations,
@@ -10068,6 +10226,7 @@ async fn run_copy_live_daemon_supervisor(
             &submit_plan_contract,
             &pending_final_executable_refs,
             &suppressed_submit_plan_refs,
+            &saved,
             &approved_records,
         )
         .await;
@@ -10083,6 +10242,7 @@ async fn run_copy_live_daemon_supervisor(
                 &submit_plan_contract,
                 &pending_final_executable_refs,
                 &suppressed_submit_plan_refs,
+                &saved,
                 &approved_records,
             )
             .await,
@@ -10095,6 +10255,7 @@ async fn run_copy_live_daemon_supervisor(
                 &submit_plan_contract,
                 &[],
                 &suppressed_submit_plan_refs,
+                &saved,
                 &approved_records,
             )
             .await,
@@ -11378,6 +11539,113 @@ fn copy_live_daemon_reduce_only_matching_position_notional_usd(
         .max_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))
 }
 
+fn copy_live_daemon_reduce_only_effective_notional_usd(
+    requested_notional_usd: f64,
+    local_position_notional_usd: f64,
+) -> f64 {
+    let local_position_notional_usd = local_position_notional_usd.max(0.0);
+    if local_position_notional_usd <= 0.0 {
+        return 0.0;
+    }
+    let requested_notional_usd = requested_notional_usd.max(0.0);
+    if requested_notional_usd <= 1e-9 {
+        return 0.0;
+    }
+    let capped_notional = requested_notional_usd.min(local_position_notional_usd);
+    let residual_notional = (local_position_notional_usd - capped_notional).max(0.0);
+    if residual_notional > 1e-9 && residual_notional < trading::HYPERLIQUID_MIN_ORDER_NOTIONAL_USD {
+        return local_position_notional_usd;
+    }
+    capped_notional
+}
+
+fn copy_live_daemon_spot_available_balance(
+    state: &hyperliquid::SpotClearinghouseState,
+    token: &str,
+) -> f64 {
+    state
+        .balances
+        .iter()
+        .filter(|balance| balance.coin.eq_ignore_ascii_case(token))
+        .map(|balance| {
+            let total = balance.total.parse::<f64>().unwrap_or_default();
+            let hold = balance.hold.parse::<f64>().unwrap_or_default();
+            (total - hold).max(0.0)
+        })
+        .sum::<f64>()
+}
+
+fn copy_live_daemon_spot_base_available_for_coin(
+    state: &hyperliquid::SpotClearinghouseState,
+    coin: &str,
+) -> f64 {
+    let normalized = hyperliquid::normalize_spot_coin(coin);
+    let Some((base, _quote)) = normalized.split_once('/') else {
+        return 0.0;
+    };
+    copy_live_daemon_spot_available_balance(state, base)
+}
+
+fn copy_live_daemon_spot_entry_has_matching_position(
+    state: &hyperliquid::SpotClearinghouseState,
+    coin: &str,
+    local_side: domain::OrderSide,
+) -> bool {
+    matches!(local_side, domain::OrderSide::Buy)
+        && copy_live_daemon_spot_base_available_for_coin(state, coin) > 1e-12
+}
+
+fn copy_live_daemon_reduce_only_matching_spot_position_notional_usd(
+    state: &hyperliquid::SpotClearinghouseState,
+    snapshot: &hyperliquid::SpotMarketSnapshot,
+    plan: &CopyLiveDaemonWouldSubmitRef,
+) -> Result<Option<f64>> {
+    if !plan.order.reduce_only {
+        return Ok(Some(plan.order.notional_usd.max(0.0)));
+    }
+    if !matches!(plan.order.side, domain::OrderSide::Sell) {
+        return Ok(None);
+    }
+
+    let base_available = copy_live_daemon_spot_base_available_for_coin(state, &plan.order.coin);
+    if base_available <= 1e-12 {
+        return Ok(None);
+    }
+
+    let asset = snapshot.asset(&plan.order.coin)?;
+    let reference_price = asset
+        .context
+        .mid_px
+        .as_deref()
+        .or(Some(asset.context.mark_px.as_str()))
+        .or(Some(asset.context.prev_day_px.as_str()))
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .with_context(|| {
+            format!(
+                "failed to derive spot reference price for reduce-only verification on {}",
+                plan.order.coin
+            )
+        })?;
+    Ok(Some(base_available * reference_price))
+}
+
+fn copy_live_daemon_perp_entry_has_matching_position(
+    state: &hyperliquid::ClearinghouseState,
+    coin: &str,
+    local_side: domain::OrderSide,
+) -> bool {
+    state.asset_positions.iter().any(|asset| {
+        if !asset.position.coin.eq_ignore_ascii_case(coin) {
+            return false;
+        }
+        let Some(side) = copy_live_daemon_local_side_from_position_szi(&asset.position.szi) else {
+            return false;
+        };
+        side == local_side
+    })
+}
+
 async fn copy_live_daemon_filter_submit_refs_for_live_reduce_exposure(
     config: &config::AppConfig,
     executable_refs: &[CopyLiveDaemonWouldSubmitRef],
@@ -11397,18 +11665,54 @@ async fn copy_live_daemon_filter_submit_refs_for_live_reduce_exposure(
         );
     }
 
-    let mut state_by_account: HashMap<
-        String,
+    let mut perp_state_by_scope: HashMap<
+        (String, String),
         std::result::Result<hyperliquid::ClearinghouseState, String>,
     > = HashMap::new();
+    let mut spot_state_by_account: HashMap<
+        String,
+        std::result::Result<hyperliquid::SpotClearinghouseState, String>,
+    > = HashMap::new();
+    let mut spot_snapshot: Option<std::result::Result<hyperliquid::SpotMarketSnapshot, String>> =
+        None;
     for plan in executable_refs.iter().filter(|plan| plan.order.reduce_only) {
-        if state_by_account.contains_key(&plan.order.account_id) {
+        let (_, dex) = copy_daemon_market_dex_for_coin(&plan.order.coin);
+        if dex.as_deref() == Some("spot") {
+            if !spot_state_by_account.contains_key(&plan.order.account_id) {
+                let state = if let Some(account) = config.account(&plan.order.account_id) {
+                    hyperliquid::fetch_spot_clearinghouse_state(
+                        &config.app.environment,
+                        &account.address,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())
+                } else {
+                    Err(format!(
+                        "account {} not found for reduce-only spot exposure verification",
+                        plan.order.account_id
+                    ))
+                };
+                spot_state_by_account.insert(plan.order.account_id.clone(), state);
+            }
+            if spot_snapshot.is_none() {
+                spot_snapshot = Some(
+                    hyperliquid::fetch_spot_market_snapshot_cached(&config.app.environment, 15_000)
+                        .await
+                        .map_err(|error| error.to_string()),
+                );
+            }
+            continue;
+        }
+
+        let dex_key = dex.unwrap_or_else(|| config.hyperliquid.dex.clone());
+        let scope = (plan.order.account_id.clone(), dex_key.clone());
+        if perp_state_by_scope.contains_key(&scope) {
             continue;
         }
         let state = if let Some(account) = config.account(&plan.order.account_id) {
             hyperliquid::fetch_clearinghouse_state(
                 &config.app.environment,
-                &config.hyperliquid.dex,
+                dex_key.as_str(),
                 &account.address,
             )
             .await
@@ -11419,12 +11723,13 @@ async fn copy_live_daemon_filter_submit_refs_for_live_reduce_exposure(
                 plan.order.account_id
             ))
         };
-        state_by_account.insert(plan.order.account_id.clone(), state);
+        perp_state_by_scope.insert(scope, state);
     }
 
     let mut eligible_refs = Vec::new();
     let mut verified_reduce_only_count = 0usize;
     let mut resized_reduce_only_count = 0usize;
+    let mut dust_flattened_reduce_only_count = 0usize;
     let mut skipped_no_exposure_count = 0usize;
     let mut verification_error_count = 0usize;
     for plan in executable_refs {
@@ -11432,29 +11737,79 @@ async fn copy_live_daemon_filter_submit_refs_for_live_reduce_exposure(
             eligible_refs.push(plan.clone());
             continue;
         }
-        match state_by_account.get(&plan.order.account_id) {
-            Some(Ok(state)) => {
-                let Some(local_position_notional) =
-                    copy_live_daemon_reduce_only_matching_position_notional_usd(state, plan)
-                else {
-                    skipped_no_exposure_count += 1;
-                    continue;
-                };
-                if local_position_notional <= 0.0 {
-                    skipped_no_exposure_count += 1;
-                    continue;
+        let (_, dex) = copy_daemon_market_dex_for_coin(&plan.order.coin);
+        match dex.as_deref() {
+            Some("spot") => match (
+                spot_state_by_account.get(&plan.order.account_id),
+                spot_snapshot.as_ref(),
+            ) {
+                (Some(Ok(state)), Some(Ok(snapshot))) => {
+                    let Some(local_position_notional) =
+                        copy_live_daemon_reduce_only_matching_spot_position_notional_usd(
+                            state, snapshot, plan,
+                        )
+                        .ok()
+                        .flatten()
+                    else {
+                        skipped_no_exposure_count += 1;
+                        continue;
+                    };
+                    verified_reduce_only_count += 1;
+                    let mut prepared = plan.clone();
+                    let requested_notional = prepared.order.notional_usd;
+                    let capped_notional = copy_live_daemon_reduce_only_effective_notional_usd(
+                        requested_notional,
+                        local_position_notional,
+                    );
+                    if capped_notional > requested_notional.max(0.0) + 1e-9 {
+                        dust_flattened_reduce_only_count += 1;
+                    }
+                    if (requested_notional - capped_notional).abs() > 1e-9 {
+                        resized_reduce_only_count += 1;
+                        prepared.order.notional_usd = capped_notional;
+                    }
+                    eligible_refs.push(prepared);
                 }
-                verified_reduce_only_count += 1;
-                let mut prepared = plan.clone();
-                let capped_notional = prepared.order.notional_usd.min(local_position_notional);
-                if (prepared.order.notional_usd - capped_notional).abs() > 1e-9 {
-                    resized_reduce_only_count += 1;
-                    prepared.order.notional_usd = capped_notional;
+                (Some(Err(_)), _) | (_, Some(Err(_))) | (_, None) | (None, _) => {
+                    verification_error_count += 1;
                 }
-                eligible_refs.push(prepared);
-            }
-            Some(Err(_)) | None => {
-                verification_error_count += 1;
+            },
+            _ => {
+                let dex_key = dex.unwrap_or_else(|| config.hyperliquid.dex.clone());
+                match perp_state_by_scope.get(&(plan.order.account_id.clone(), dex_key)) {
+                    Some(Ok(state)) => {
+                        let Some(local_position_notional) =
+                            copy_live_daemon_reduce_only_matching_position_notional_usd(
+                                state, plan,
+                            )
+                        else {
+                            skipped_no_exposure_count += 1;
+                            continue;
+                        };
+                        if local_position_notional <= 0.0 {
+                            skipped_no_exposure_count += 1;
+                            continue;
+                        }
+                        verified_reduce_only_count += 1;
+                        let mut prepared = plan.clone();
+                        let requested_notional = prepared.order.notional_usd;
+                        let capped_notional = copy_live_daemon_reduce_only_effective_notional_usd(
+                            requested_notional,
+                            local_position_notional,
+                        );
+                        if capped_notional > requested_notional.max(0.0) + 1e-9 {
+                            dust_flattened_reduce_only_count += 1;
+                        }
+                        if (requested_notional - capped_notional).abs() > 1e-9 {
+                            resized_reduce_only_count += 1;
+                            prepared.order.notional_usd = capped_notional;
+                        }
+                        eligible_refs.push(prepared);
+                    }
+                    Some(Err(_)) | None => {
+                        verification_error_count += 1;
+                    }
+                }
             }
         }
     }
@@ -11465,7 +11820,7 @@ async fn copy_live_daemon_filter_submit_refs_for_live_reduce_exposure(
             "reduce_only_local_exposure_filter",
             verification_error_count == 0,
             format!(
-                "{verified_reduce_only_count}/{reduce_only_count} reduce-only ref(s) matched live local exposure; {resized_reduce_only_count} resized to local position notional; {skipped_no_exposure_count} skipped as no-op; {verification_error_count} verification error(s)"
+                "{verified_reduce_only_count}/{reduce_only_count} reduce-only ref(s) matched live local exposure; {resized_reduce_only_count} resized to local position notional; {dust_flattened_reduce_only_count} expanded to flatten sub-min residuals; {skipped_no_exposure_count} skipped as no-op; {verification_error_count} verification error(s)"
             ),
         )],
     )
@@ -11493,6 +11848,7 @@ async fn copy_live_daemon_persistent_live_submit(
     submit_plan_contract: &CopyLiveDaemonSubmitPlanContract,
     executable_refs: &[CopyLiveDaemonWouldSubmitRef],
     suppressed_refs: &[CopyLiveDaemonSuppressedWouldSubmitRef],
+    base_snapshot: &strategies::smart_money::CopyPersistenceSnapshot,
     approved_records: &[strategies::smart_money::CopyDryRunShadowRecord],
 ) -> CopyLiveDaemonPersistentLiveSubmitReport {
     let mut checks = vec![
@@ -11688,8 +12044,12 @@ async fn copy_live_daemon_persistent_live_submit(
         };
         execute_copy_canary_cleanup_runbooks(config, &cleanup_options, &cleanup_targets).await
     };
-    let (ledger_reconciliations, ledger_reconciliation_snapshot) =
-        reconcile_copy_canary_ledger(approved_records, &submitted_reports, &order_evidence);
+    let (ledger_reconciliations, ledger_reconciliation_snapshot) = reconcile_copy_canary_ledger(
+        Some(base_snapshot),
+        approved_records,
+        &submitted_reports,
+        &order_evidence,
+    );
 
     let pre_submit_skipped_count = submitted_reports
         .iter()
@@ -13829,6 +14189,7 @@ fn copy_live_daemon_persistence_snapshot_for_save(
     snapshot
 }
 
+#[cfg(test)]
 fn copy_live_daemon_prune_snapshot_against_reconciliations(
     mut snapshot: strategies::smart_money::CopyPersistenceSnapshot,
     reconciliations: &[CopyBoundedLiveWindowReconcile],
@@ -13879,6 +14240,168 @@ fn copy_live_daemon_prune_snapshot_against_reconciliations(
         live_position_keys.contains(&key)
     });
     snapshot
+}
+
+fn copy_live_daemon_snapshot_entry_matches_live_market_state(
+    config: &config::AppConfig,
+    entry: &strategies::smart_money::CopyLedgerEntry,
+    perp_state_by_scope: &HashMap<
+        (String, String),
+        std::result::Result<hyperliquid::ClearinghouseState, String>,
+    >,
+    spot_state_by_account: &HashMap<
+        String,
+        std::result::Result<hyperliquid::SpotClearinghouseState, String>,
+    >,
+) -> bool {
+    let (_, dex) = copy_daemon_market_dex_for_coin(&entry.coin);
+    match dex.as_deref() {
+        Some("spot") => match spot_state_by_account.get(&entry.local_account_id) {
+            Some(Ok(state)) => copy_live_daemon_spot_entry_has_matching_position(
+                state,
+                &entry.coin,
+                entry.local_side,
+            ),
+            Some(Err(_)) | None => true,
+        },
+        _ => {
+            let dex_key = dex.unwrap_or_else(|| config.hyperliquid.dex.clone());
+            match perp_state_by_scope.get(&(entry.local_account_id.clone(), dex_key)) {
+                Some(Ok(state)) => copy_live_daemon_perp_entry_has_matching_position(
+                    state,
+                    &entry.coin,
+                    entry.local_side,
+                ),
+                Some(Err(_)) | None => true,
+            }
+        }
+    }
+}
+
+fn copy_live_daemon_prune_snapshot_against_market_state_maps(
+    config: &config::AppConfig,
+    snapshot: strategies::smart_money::CopyPersistenceSnapshot,
+    readable_accounts: &HashSet<String>,
+    perp_state_by_scope: &HashMap<
+        (String, String),
+        std::result::Result<hyperliquid::ClearinghouseState, String>,
+    >,
+    spot_state_by_account: &HashMap<
+        String,
+        std::result::Result<hyperliquid::SpotClearinghouseState, String>,
+    >,
+) -> strategies::smart_money::CopyPersistenceSnapshot {
+    let mut ledger_entries = Vec::with_capacity(snapshot.ledger_entries.len());
+    for entry in snapshot.ledger_entries {
+        if !readable_accounts.contains(&entry.local_account_id)
+            || !matches!(
+                entry.status,
+                strategies::smart_money::CopyLedgerStatus::Open
+                    | strategies::smart_money::CopyLedgerStatus::PendingReduce
+                    | strategies::smart_money::CopyLedgerStatus::PendingClose
+            )
+        {
+            ledger_entries.push(entry);
+            continue;
+        }
+
+        if copy_live_daemon_snapshot_entry_matches_live_market_state(
+            config,
+            &entry,
+            perp_state_by_scope,
+            spot_state_by_account,
+        ) {
+            ledger_entries.push(entry);
+        }
+    }
+
+    strategies::smart_money::CopyPersistenceSnapshot {
+        ledger_entries,
+        ..snapshot
+    }
+}
+
+async fn copy_live_daemon_prune_snapshot_against_live_markets(
+    config: &config::AppConfig,
+    snapshot: strategies::smart_money::CopyPersistenceSnapshot,
+    reconciliations: &[CopyBoundedLiveWindowReconcile],
+) -> strategies::smart_money::CopyPersistenceSnapshot {
+    let readable_accounts = reconciliations
+        .iter()
+        .filter(|reconcile| reconcile.error.is_none())
+        .map(|reconcile| reconcile.account_id.clone())
+        .collect::<HashSet<_>>();
+    if readable_accounts.is_empty() {
+        return snapshot;
+    }
+
+    let mut required_perp_scopes = HashSet::<(String, String)>::new();
+    let mut required_spot_accounts = HashSet::<String>::new();
+    for entry in snapshot.ledger_entries.iter().filter(|entry| {
+        readable_accounts.contains(&entry.local_account_id)
+            && matches!(
+                entry.status,
+                strategies::smart_money::CopyLedgerStatus::Open
+                    | strategies::smart_money::CopyLedgerStatus::PendingReduce
+                    | strategies::smart_money::CopyLedgerStatus::PendingClose
+            )
+    }) {
+        let (_, dex) = copy_daemon_market_dex_for_coin(&entry.coin);
+        if dex.as_deref() == Some("spot") {
+            required_spot_accounts.insert(entry.local_account_id.clone());
+        } else {
+            required_perp_scopes.insert((
+                entry.local_account_id.clone(),
+                dex.unwrap_or_else(|| config.hyperliquid.dex.clone()),
+            ));
+        }
+    }
+
+    let mut perp_state_by_scope = HashMap::<
+        (String, String),
+        std::result::Result<hyperliquid::ClearinghouseState, String>,
+    >::new();
+    for (account_id, dex) in required_perp_scopes {
+        let state = if let Some(account) = config.account(&account_id) {
+            hyperliquid::fetch_clearinghouse_state(
+                &config.app.environment,
+                dex.as_str(),
+                &account.address,
+            )
+            .await
+            .map_err(|error| error.to_string())
+        } else {
+            Err(format!(
+                "account {} not found for multi-market copy prune",
+                account_id
+            ))
+        };
+        perp_state_by_scope.insert((account_id, dex), state);
+    }
+
+    let mut spot_state_by_account =
+        HashMap::<String, std::result::Result<hyperliquid::SpotClearinghouseState, String>>::new();
+    for account_id in required_spot_accounts {
+        let state = if let Some(account) = config.account(&account_id) {
+            hyperliquid::fetch_spot_clearinghouse_state(&config.app.environment, &account.address)
+                .await
+                .map_err(|error| error.to_string())
+        } else {
+            Err(format!(
+                "account {} not found for spot copy prune",
+                account_id
+            ))
+        };
+        spot_state_by_account.insert(account_id, state);
+    }
+
+    copy_live_daemon_prune_snapshot_against_market_state_maps(
+        config,
+        snapshot,
+        &readable_accounts,
+        &perp_state_by_scope,
+        &spot_state_by_account,
+    )
 }
 
 fn copy_live_daemon_recover_open_ledger_from_live_positions(
@@ -14542,7 +15065,7 @@ fn copy_execution_canary_report(
     cleanup_errors: Vec<String>,
 ) -> CopyExecutionCanaryReport {
     let (ledger_reconciliations, ledger_reconciliation_snapshot) =
-        reconcile_copy_canary_ledger(&records, &submitted_reports, &order_evidence);
+        reconcile_copy_canary_ledger(None, &records, &submitted_reports, &order_evidence);
     let approved_shadow_records = records
         .iter()
         .filter(|record| {
@@ -14708,6 +15231,7 @@ fn copy_execution_canary_order_status_is_filled(status: &hyperliquid::OrderStatu
 }
 
 fn reconcile_copy_canary_ledger(
+    base_snapshot: Option<&strategies::smart_money::CopyPersistenceSnapshot>,
     records: &[strategies::smart_money::CopyDryRunShadowRecord],
     submitted_reports: &[domain::WorkerReport],
     order_evidence: &[CopyExecutionCanaryOrderEvidence],
@@ -14715,12 +15239,30 @@ fn reconcile_copy_canary_ledger(
     Vec<strategies::smart_money::CopyLedgerReconcileResult>,
     strategies::smart_money::CopyPersistenceSnapshot,
 ) {
-    let mut ledger = strategies::smart_money::CopyLedger::from_entries(
-        records
-            .iter()
-            .filter_map(|record| record.ledger_entry.clone())
-            .collect(),
-    );
+    let mut seen_event_keys = base_snapshot
+        .map(|snapshot| snapshot.seen_event_keys.clone())
+        .unwrap_or_default();
+    let mut entries_by_key = base_snapshot
+        .map(|snapshot| {
+            snapshot
+                .ledger_entries
+                .iter()
+                .cloned()
+                .map(|entry| (copy_live_daemon_ledger_entry_identity(&entry), entry))
+                .collect::<HashMap<_, _>>()
+        })
+        .unwrap_or_default();
+    for record in records {
+        if let Some(entry) = record.ledger_entry.clone() {
+            entries_by_key.insert(copy_live_daemon_ledger_entry_identity(&entry), entry);
+        }
+        seen_event_keys.extend(record.persistence_snapshot.seen_event_keys.iter().cloned());
+    }
+    seen_event_keys.sort();
+    seen_event_keys.dedup();
+
+    let mut ledger =
+        strategies::smart_money::CopyLedger::from_entries(entries_by_key.into_values().collect());
     let mut reconciliations = Vec::new();
     for report in submitted_reports {
         if let domain::WorkerReport::Submitted(submitted) = report {
@@ -14737,10 +15279,6 @@ fn reconcile_copy_canary_ledger(
             ));
         }
     }
-    let seen_event_keys = records
-        .last()
-        .map(|record| record.persistence_snapshot.seen_event_keys.clone())
-        .unwrap_or_default();
     let snapshot = strategies::smart_money::CopyPersistenceSnapshot::new(
         domain::now_ms(),
         seen_event_keys,
