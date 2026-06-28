@@ -549,9 +549,20 @@ while ($true) {
         -and (@($failedCheckNames | Where-Object { $_ -notin @("exchange_submit_mode", "final_reconcile_health") }).Count -eq 0) `
         -and ((As-NonNullArray $report.final_reconciliations).Count -gt 0) `
         -and (@(As-NonNullArray $report.final_reconciliations | Where-Object { -not $_.error }).Count -eq 0)
+    $readOnlyDegraded = (-not [bool]$report.ok) `
+        -and ($submittedCount -eq 0) `
+        -and ($evidenceCount -eq 0) `
+        -and ($cleanupErrors -eq 0) `
+        -and ($failedCheckNames.Count -gt 0) `
+        -and ($failedCheckNames -contains "final_reconcile_health") `
+        -and (@($failedCheckNames | Where-Object { $_ -notin @("watcher_runtime", "watcher_progress", "exchange_submit_mode", "final_reconcile_health") }).Count -eq 0) `
+        -and ((As-NonNullArray $report.final_reconciliations).Count -gt 0) `
+        -and (@(As-NonNullArray $report.final_reconciliations | Where-Object { -not $_.error }).Count -eq 0)
     if ($watcherOnlyDegraded) {
         $consecutiveDegradedWatcherRounds += 1
     } elseif ($reconcileOnlyDegraded) {
+        $consecutiveDegradedWatcherRounds += 1
+    } elseif ($readOnlyDegraded) {
         $consecutiveDegradedWatcherRounds += 1
     } else {
         $consecutiveDegradedWatcherRounds = 0
@@ -576,6 +587,7 @@ while ($true) {
         hold_positions_after_submit = [bool]$report.hold_positions_after_submit
         watcher_only_degraded = [bool]$watcherOnlyDegraded
         reconcile_only_degraded = [bool]$reconcileOnlyDegraded
+        read_only_degraded = [bool]$readOnlyDegraded
         consecutive_degraded_watcher_rounds = [int]$consecutiveDegradedWatcherRounds
         failed_checks = $failedChecks
         report_path = $reportPath
@@ -596,6 +608,12 @@ while ($true) {
 
     if ($reconcileOnlyDegraded) {
         Write-SoakLog "round=$round reconcile degraded after read-only final check; keeping soak alive after ${DegradedSleepSecs}s backoff consecutive_degraded_rounds=$consecutiveDegradedWatcherRounds"
+        Start-Sleep -Seconds $DegradedSleepSecs
+        continue
+    }
+
+    if ($readOnlyDegraded) {
+        Write-SoakLog "round=$round watcher/final reconcile degraded without submit evidence; keeping soak alive after ${DegradedSleepSecs}s backoff consecutive_degraded_rounds=$consecutiveDegradedWatcherRounds"
         Start-Sleep -Seconds $DegradedSleepSecs
         continue
     }
