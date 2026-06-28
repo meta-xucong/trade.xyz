@@ -2986,6 +2986,104 @@ mod tests {
     }
 
     #[test]
+    fn copy_live_daemon_submit_plan_contract_scopes_reduce_only_reconcile_to_submit_accounts() {
+        let mut options = follow_position_options();
+        options.account_ids = vec!["addr_a".to_string(), "addr_b".to_string()];
+        options.max_total_notional_usd = 700.0;
+        let reduce_ref = CopyLiveDaemonWouldSubmitRef {
+            record_index: 0,
+            signal_id: "sig-close-bot".to_string(),
+            leader_id: "leader_a".to_string(),
+            leader_address: "0x00000000000000000000000000000000000000aa".to_string(),
+            order: CopyExecutionCanaryWouldSubmit {
+                account_id: "addr_a".to_string(),
+                worker_id: "worker-addr_a".to_string(),
+                coin: "xyz:BOT".to_string(),
+                side: crate::domain::OrderSide::Buy,
+                notional_usd: 29.6,
+                reduce_only: true,
+                cloid: "00000000-0000-0000-0000-000000000122".to_string(),
+            },
+        };
+        let reconciliations = vec![
+            CopyBoundedLiveWindowReconcile {
+                account_id: "addr_a".to_string(),
+                ok: false,
+                open_order_count: Some(0),
+                asset_positions: Some(1),
+                position_summaries: Vec::new(),
+                account_value: Some("78.0".to_string()),
+                withdrawable: Some("73.0".to_string()),
+                total_ntl_pos: Some("50.0".to_string()),
+                total_margin_used: Some("5.0".to_string()),
+                error: None,
+            },
+            CopyBoundedLiveWindowReconcile {
+                account_id: "addr_b".to_string(),
+                ok: false,
+                open_order_count: None,
+                asset_positions: None,
+                position_summaries: Vec::new(),
+                account_value: None,
+                withdrawable: None,
+                total_ntl_pos: None,
+                total_margin_used: None,
+                error: Some("temporary read timeout".to_string()),
+            },
+        ];
+
+        let contract = copy_live_daemon_submit_plan_contract(
+            &options,
+            std::slice::from_ref(&reduce_ref),
+            &[],
+            0.0,
+            0.0,
+            &reconciliations,
+        );
+
+        assert!(contract.ok, "{contract:#?}");
+        assert!(
+            contract
+                .checks
+                .iter()
+                .any(|check| check.name == "pre_submit_reconcile_health"
+                    && check.ok
+                    && check.detail.contains("scoped_accounts=addr_a")),
+            "{contract:#?}"
+        );
+
+        let blocked_reconciliations = vec![CopyBoundedLiveWindowReconcile {
+            account_id: "addr_a".to_string(),
+            ok: false,
+            open_order_count: Some(1),
+            asset_positions: Some(1),
+            position_summaries: Vec::new(),
+            account_value: Some("78.0".to_string()),
+            withdrawable: Some("73.0".to_string()),
+            total_ntl_pos: Some("50.0".to_string()),
+            total_margin_used: Some("5.0".to_string()),
+            error: None,
+        }];
+        let blocked = copy_live_daemon_submit_plan_contract(
+            &options,
+            &[reduce_ref],
+            &[],
+            0.0,
+            0.0,
+            &blocked_reconciliations,
+        );
+
+        assert!(!blocked.ok, "{blocked:#?}");
+        assert!(
+            blocked
+                .checks
+                .iter()
+                .any(|check| check.name == "pre_submit_reconcile_health" && !check.ok),
+            "{blocked:#?}"
+        );
+    }
+
+    #[test]
     fn copy_live_daemon_submit_plan_contract_does_not_cap_reduce_only_notional_or_fees() {
         let options = CopyLiveDaemonSupervisorOptions {
             leaders: Vec::new(),
@@ -12050,29 +12148,58 @@ fn copy_live_daemon_reconcile_health_detail_for_snapshot_with_account_caps(
 }
 
 fn copy_live_daemon_reconciliations_ready_for_reduce_only(
+    executable_refs: &[CopyLiveDaemonWouldSubmitRef],
     reconciliations: &[CopyBoundedLiveWindowReconcile],
 ) -> bool {
-    !reconciliations.is_empty()
-        && reconciliations
-            .iter()
-            .all(|reconcile| reconcile.error.is_none() && reconcile.open_order_count == Some(0))
+    let accounts = executable_refs
+        .iter()
+        .filter(|plan| plan.order.reduce_only)
+        .map(|plan| plan.order.account_id.as_str())
+        .collect::<HashSet<_>>();
+    !accounts.is_empty()
+        && accounts.iter().all(|account_id| {
+            reconciliations
+                .iter()
+                .find(|reconcile| reconcile.account_id == *account_id)
+                .is_some_and(|reconcile| {
+                    reconcile.error.is_none() && reconcile.open_order_count == Some(0)
+                })
+        })
 }
 
 fn copy_live_daemon_reduce_only_reconcile_health_detail(
+    executable_refs: &[CopyLiveDaemonWouldSubmitRef],
     reconciliations: &[CopyBoundedLiveWindowReconcile],
 ) -> String {
-    let readable_count = reconciliations
+    let accounts = executable_refs
         .iter()
-        .filter(|reconcile| reconcile.error.is_none())
-        .count();
-    let no_open_orders = reconciliations
+        .filter(|plan| plan.order.reduce_only)
+        .map(|plan| plan.order.account_id.as_str())
+        .collect::<HashSet<_>>();
+    let required_count = accounts.len();
+    let readable_count = accounts
         .iter()
-        .filter(|reconcile| reconcile.open_order_count == Some(0))
+        .filter(|account_id| {
+            reconciliations
+                .iter()
+                .find(|reconcile| reconcile.account_id == **account_id)
+                .is_some_and(|reconcile| reconcile.error.is_none())
+        })
         .count();
+    let no_open_orders = accounts
+        .iter()
+        .filter(|account_id| {
+            reconciliations
+                .iter()
+                .find(|reconcile| reconcile.account_id == **account_id)
+                .is_some_and(|reconcile| reconcile.open_order_count == Some(0))
+        })
+        .count();
+    let mut scoped_accounts = accounts.into_iter().collect::<Vec<_>>();
+    scoped_accounts.sort_unstable();
     format!(
-        "reduce-only submit precheck: {readable_count}/{} account(s) readable, {no_open_orders}/{} account(s) have no open orders; total exposure cap is intentionally not applied to risk-reducing closes",
-        reconciliations.len(),
-        reconciliations.len()
+        "reduce-only submit precheck: {readable_count}/{required_count} submit account(s) readable, {no_open_orders}/{required_count} submit account(s) have no open orders; scoped_accounts={}; total exposure cap and unrelated account read errors are intentionally not applied to risk-reducing closes",
+        scoped_accounts.join(",")
     )
 }
 
@@ -12482,7 +12609,10 @@ fn copy_live_daemon_submit_plan_contract_with_account_caps(
                 "pre_submit_reconcile_flat"
             },
             if reduce_only_only_plan {
-                copy_live_daemon_reconciliations_ready_for_reduce_only(final_reconciliations)
+                copy_live_daemon_reconciliations_ready_for_reduce_only(
+                    executable_refs,
+                    final_reconciliations,
+                )
             } else {
                 copy_live_daemon_reconciliations_healthy_for_mode_with_account_caps(
                     options,
@@ -12491,7 +12621,10 @@ fn copy_live_daemon_submit_plan_contract_with_account_caps(
                 )
             },
             if reduce_only_only_plan {
-                copy_live_daemon_reduce_only_reconcile_health_detail(final_reconciliations)
+                copy_live_daemon_reduce_only_reconcile_health_detail(
+                    executable_refs,
+                    final_reconciliations,
+                )
             } else {
                 copy_live_daemon_reconcile_health_detail_with_account_caps(
                     options,
