@@ -312,19 +312,25 @@ function Invoke-BotRound {
     if (Test-Path -LiteralPath $StdoutPath) {
         Remove-Item -LiteralPath $StdoutPath -Force
     }
+    $stdoutLogPath = "$StdoutPath.out.log"
+    if (Test-Path -LiteralPath $stdoutLogPath) {
+        Remove-Item -LiteralPath $stdoutLogPath -Force
+    }
     if (Test-Path -LiteralPath $StderrPath) {
         Remove-Item -LiteralPath $StderrPath -Force
     }
 
     $previousNoColor = [Environment]::GetEnvironmentVariable("NO_COLOR", "Process")
     $previousRustLog = [Environment]::GetEnvironmentVariable("RUST_LOG", "Process")
+    $previousReportPath = [Environment]::GetEnvironmentVariable("TRADE_XYZ_JSON_REPORT_PATH", "Process")
     [Environment]::SetEnvironmentVariable("NO_COLOR", "1", "Process")
     [Environment]::SetEnvironmentVariable("RUST_LOG", "error", "Process")
+    [Environment]::SetEnvironmentVariable("TRADE_XYZ_JSON_REPORT_PATH", $StdoutPath, "Process")
     $process = Start-Process `
         -FilePath $ExePath `
         -ArgumentList $Arguments `
         -WorkingDirectory (Get-Location) `
-        -RedirectStandardOutput $StdoutPath `
+        -RedirectStandardOutput $stdoutLogPath `
         -RedirectStandardError $StderrPath `
         -WindowStyle Hidden `
         -PassThru
@@ -337,6 +343,11 @@ function Invoke-BotRound {
         [Environment]::SetEnvironmentVariable("RUST_LOG", $null, "Process")
     } else {
         [Environment]::SetEnvironmentVariable("RUST_LOG", $previousRustLog, "Process")
+    }
+    if ($null -eq $previousReportPath) {
+        [Environment]::SetEnvironmentVariable("TRADE_XYZ_JSON_REPORT_PATH", $null, "Process")
+    } else {
+        [Environment]::SetEnvironmentVariable("TRADE_XYZ_JSON_REPORT_PATH", $previousReportPath, "Process")
     }
 
     if (-not $process.WaitForExit($TimeoutSecs * 1000)) {
@@ -488,7 +499,12 @@ while ($true) {
     $preSubmitSkippedCount = @($submittedReports | Where-Object {
         $kind = [string]$_.kind
         $message = [string]$_.message
-        $kind -eq "error" -and $message.ToLowerInvariant().Contains("copy submit skipped before exchange")
+        $normalizedMessage = $message.ToLowerInvariant()
+        $kind -eq "error" -and (
+            $normalizedMessage.Contains("copy submit skipped before exchange") -or
+            $normalizedMessage.Contains("copy_live_max_leverage_timeout") -or
+            $normalizedMessage.Contains("copy_live_leverage_update_timeout")
+        )
     }).Count
     $evidenceCount = (As-NonNullArray $report.persistent_live_submit.order_evidence).Count
     $cleanupCount = (As-NonNullArray $report.persistent_live_submit.cleanup_runbooks).Count

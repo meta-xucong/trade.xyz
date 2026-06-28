@@ -18,7 +18,7 @@ pub mod ws_post;
 
 use std::{
     collections::{HashMap, HashSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -35,6 +35,13 @@ const COPY_DAEMON_MIN_SIGNAL_DELAY_MS: u64 = 30_000;
 const COPY_CANARY_FILL_LOOKAHEAD_MS: u64 = 180_000;
 const COPY_RECONCILE_RETRIES: usize = 3;
 const COPY_RECONCILE_RETRY_DELAY_MS: u64 = 1_500;
+const COPY_DAEMON_SUBMIT_REF_TIMEOUT_SECS: u64 = 120;
+const COPY_DAEMON_ORDER_EVIDENCE_TIMEOUT_SECS: u64 = 120;
+const COPY_DAEMON_RECONCILE_BATCH_TIMEOUT_SECS: u64 = 120;
+const COPY_DAEMON_EFFECTIVE_MIN_CHECK_TIMEOUT_SECS: u64 = 45;
+const COPY_DAEMON_MAX_LEVERAGE_TIMEOUT_SECS: u64 = 30;
+const COPY_DAEMON_LEVERAGE_UPDATE_TIMEOUT_SECS: u64 = 45;
+const COPY_DAEMON_ORDER_SUBMIT_TIMEOUT_SECS: u64 = 60;
 const COPY_DAEMON_MARGIN_BUFFER_RATIO: f64 = 0.10;
 const COPY_DAEMON_FEE_BUFFER_RATIO: f64 = 0.001;
 
@@ -4173,6 +4180,58 @@ mod tests {
     }
 
     #[test]
+    fn copy_live_daemon_recovers_persisted_pending_reduce_refs_for_retry() {
+        let pending_entry = crate::strategies::smart_money::CopyLedgerEntry {
+            local_account_id: "addr_a".to_string(),
+            leader_id: "leader_a".to_string(),
+            leader_group: "leader_a".to_string(),
+            signal_id: "sig-persisted-reduce".to_string(),
+            coin: "xyz:JPY".to_string(),
+            local_side: crate::domain::OrderSide::Buy,
+            order_cloid: None,
+            order_oid: None,
+            submitted_at_ms: None,
+            filled_at_ms: None,
+            planned_notional_usd: 59.8438,
+            pending_notional_usd: 59.8438,
+            filled_notional_usd: 0.0,
+            remaining_notional_usd: 59.8438,
+            status: crate::strategies::smart_money::CopyLedgerStatus::PendingReduce,
+        };
+        let open_entry = crate::strategies::smart_money::CopyLedgerEntry {
+            status: crate::strategies::smart_money::CopyLedgerStatus::Open,
+            signal_id: "sig-open".to_string(),
+            ..pending_entry.clone()
+        };
+        let persistence = crate::strategies::smart_money::CopyPersistenceSnapshot {
+            schema_version: 1,
+            saved_at_ms: now_ms(),
+            seen_event_keys: Vec::new(),
+            ledger_entries: vec![pending_entry, open_entry],
+        };
+
+        let refs = super::copy_live_daemon_recover_pending_reduce_plan_refs(
+            &persistence,
+            &["addr_a".to_string(), "addr_b".to_string()],
+        );
+
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].signal_id, "sig-persisted-reduce");
+        assert_eq!(refs[0].order.account_id, "addr_a");
+        assert_eq!(refs[0].order.coin, "xyz:JPY");
+        assert_eq!(refs[0].order.side, crate::domain::OrderSide::Sell);
+        assert!(refs[0].order.reduce_only);
+        assert!((refs[0].order.notional_usd - 59.8438).abs() < 1e-9);
+        uuid::Uuid::parse_str(&refs[0].order.cloid).expect("stable retry cloid");
+
+        let refs_again = super::copy_live_daemon_recover_pending_reduce_plan_refs(
+            &persistence,
+            &["addr_a".to_string()],
+        );
+        assert_eq!(refs_again[0].order.cloid, refs[0].order.cloid);
+    }
+
+    #[test]
     fn copy_live_daemon_reduce_refs_suppress_below_accumulated_min_notional() {
         let persistence = crate::strategies::smart_money::CopyPersistenceSnapshot {
             schema_version: 1,
@@ -7016,10 +7075,19 @@ mod tests {
             "failed to set xyz:HYUNDAI leverage to 10x before copy submit"
         ));
         assert!(copy_live_daemon_error_is_safe_pre_submit_skip(
+            "COPY_LIVE_MAX_LEVERAGE_TIMEOUT: addr_b xyz:NATGAS max leverage lookup timed out after 30s"
+        ));
+        assert!(copy_live_daemon_error_is_safe_pre_submit_skip(
+            "COPY_LIVE_LEVERAGE_UPDATE_TIMEOUT: addr_b xyz:NATGAS leverage update to 10x timed out after 45s; exchange state must be reconciled before retry"
+        ));
+        assert!(copy_live_daemon_error_is_safe_pre_submit_skip(
             "copy submit skipped before exchange: addr_b xyz:SP500 requested_notional=11.172000 effective_notional=7.416100 below exchange minimum 10.000000"
         ));
         assert!(copy_live_daemon_error_is_safe_pre_submit_skip(
             "exchange returned action-level order error: Order must have minimum value of $10. asset=110052"
+        ));
+        assert!(!copy_live_daemon_error_is_safe_pre_submit_skip(
+            "COPY_LIVE_ORDER_SUBMIT_TIMEOUT: submit ref addr_b xyz:NATGAS timed out after 60s"
         ));
         assert!(!copy_live_daemon_error_is_safe_pre_submit_skip(
             "exchange submit failed after order was sent"
@@ -8377,6 +8445,28 @@ fn main() -> Result<()> {
         .map_err(|_| anyhow::anyhow!("trade_xyz runtime thread panicked"))?
 }
 
+fn emit_json_report<T: Serialize>(report: &T) -> Result<()> {
+    let rendered = serde_json::to_string_pretty(report)?;
+    if let Ok(path) = std::env::var("TRADE_XYZ_JSON_REPORT_PATH") {
+        let path = path.trim();
+        if !path.is_empty() {
+            let path = Path::new(path);
+            if let Some(parent) = path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent).with_context(|| {
+                        format!("failed to create report directory {}", parent.display())
+                    })?;
+                }
+            }
+            std::fs::write(path, rendered)
+                .with_context(|| format!("failed to write JSON report {}", path.display()))?;
+            return Ok(());
+        }
+    }
+    println!("{rendered}");
+    Ok(())
+}
+
 async fn async_main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()))
@@ -8623,7 +8713,7 @@ async fn async_main() -> Result<()> {
                 },
             )
             .await?;
-            println!("{}", serde_json::to_string_pretty(&report)?);
+            emit_json_report(&report)?;
             Ok(())
         }
         Command::CopyBoundedLiveWindow {
@@ -10794,6 +10884,22 @@ async fn run_copy_live_daemon_supervisor(
     });
     let mut approved_records = Vec::new();
     let mut would_submit_plan_refs = Vec::new();
+    let recovered_pending_reduce_refs =
+        copy_live_daemon_recover_pending_reduce_plan_refs(&persistence, &target_accounts);
+    if !recovered_pending_reduce_refs.is_empty() {
+        checks.push(copy_shadow_smoke_check(
+            "recovered_pending_reduce_refs",
+            true,
+            format!(
+                "{} persisted pending reduce ref(s) recovered for retry",
+                recovered_pending_reduce_refs.len()
+            ),
+        ));
+        append_unique_copy_daemon_would_submit_refs(
+            &mut would_submit_plan_refs,
+            recovered_pending_reduce_refs,
+        );
+    }
     let mut submitted_plan_cloids = HashSet::new();
     let mut live_submit_chunks = Vec::new();
     let mut pending_unclassified_fill_count = 0usize;
@@ -10880,8 +10986,12 @@ async fn run_copy_live_daemon_supervisor(
                         approved_records.extend(new_approved_records);
                         if options.submit {
                             let immediate_reconciliations =
-                                reconcile_copy_bounded_window_accounts(config, &target_accounts)
-                                    .await;
+                                reconcile_copy_bounded_window_accounts_bounded(
+                                    config,
+                                    &target_accounts,
+                                    "immediate_submit_precheck",
+                                )
+                                .await;
                             let immediate_snapshot = pipelines.iter().fold(
                                 persistence.clone(),
                                 |snapshot, (_, pipeline)| {
@@ -11074,8 +11184,12 @@ async fn run_copy_live_daemon_supervisor(
 
     input.elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
     let saved = strategies::smart_money::load_copy_persistence_snapshot(&options.persistence_path)?;
-    let pre_submit_reconciliations =
-        reconcile_copy_bounded_window_accounts(config, &target_accounts).await;
+    let pre_submit_reconciliations = reconcile_copy_bounded_window_accounts_bounded(
+        config,
+        &target_accounts,
+        "pre_submit_reconcile",
+    )
+    .await;
     let saved = copy_live_daemon_prune_snapshot_against_live_markets(
         config,
         saved,
@@ -11308,14 +11422,24 @@ async fn run_copy_live_daemon_supervisor(
             options.max_total_fees_usd
         ),
     ));
+    let live_submit_required = options.submit && !executable_would_submit_orders.is_empty();
+    let persistent_live_submit_health_ok =
+        copy_live_daemon_live_submit_health_ok(&persistent_live_submit);
     checks.push(copy_shadow_smoke_check(
         "exchange_submit_mode",
-        !options.submit || copy_live_daemon_live_submit_health_ok(&persistent_live_submit),
-        if options.submit {
+        !live_submit_required || persistent_live_submit_health_ok,
+        if live_submit_required {
             format!(
                 "submit requested; persistent_live_submit ok={} health_ok={} submitted_reports={} order_evidence={} cleanup_errors={}",
                 persistent_live_submit.ok,
-                copy_live_daemon_live_submit_health_ok(&persistent_live_submit),
+                persistent_live_submit_health_ok,
+                persistent_live_submit.submitted_reports.len(),
+                persistent_live_submit.order_evidence.len(),
+                persistent_live_submit.cleanup_errors.len()
+            )
+        } else if options.submit {
+            format!(
+                "submit enabled but no executable order refs in this window; submitted_reports={} order_evidence={} cleanup_errors={}",
                 persistent_live_submit.submitted_reports.len(),
                 persistent_live_submit.order_evidence.len(),
                 persistent_live_submit.cleanup_errors.len()
@@ -11341,7 +11465,8 @@ async fn run_copy_live_daemon_supervisor(
         ),
     ));
     let final_reconciliations =
-        reconcile_copy_bounded_window_accounts(config, &target_accounts).await;
+        reconcile_copy_bounded_window_accounts_bounded(config, &target_accounts, "final_reconcile")
+            .await;
     let final_reconcile_health_ok =
         copy_live_daemon_reconciliations_healthy_for_mode_with_account_caps(
             &options,
@@ -11369,11 +11494,11 @@ async fn run_copy_live_daemon_supervisor(
         &account_symbol_caps,
     );
     let ok = copy_live_daemon_supervisor_ok(
-        options.submit,
+        live_submit_required,
         acceptance.ok,
         &checks,
         final_reconcile_health_ok,
-        copy_live_daemon_live_submit_health_ok(&persistent_live_submit),
+        persistent_live_submit_health_ok,
     );
     let next_actions = if ok && options.submit && options.hold_positions_after_submit {
         vec![
@@ -13155,19 +13280,45 @@ async fn copy_live_daemon_persistent_live_submit(
     let mut submitted_reports = Vec::new();
     let mut progress_snapshot_save_count = 0usize;
     let mut progress_snapshot_errors = Vec::new();
+    let mut live_submit_timeout_abort: Option<(String, usize)> = None;
     for plan in &submit_ready_refs {
-        submitted_reports.push(
-            execute_copy_daemon_submit_ref(config, options, plan)
-                .await
-                .unwrap_or_else(|error| {
-                    domain::WorkerReport::Error(domain::WorkerError {
-                        worker_id: plan.order.worker_id.clone(),
-                        account_id: plan.order.account_id.clone(),
-                        message: error.to_string(),
-                        error_at_ms: domain::now_ms(),
-                    })
-                }),
-        );
+        let mut submit_timed_out = false;
+        let submitted_report = match tokio::time::timeout(
+            Duration::from_secs(COPY_DAEMON_SUBMIT_REF_TIMEOUT_SECS),
+            execute_copy_daemon_submit_ref(config, options, plan),
+        )
+        .await
+        {
+            Ok(Ok(report)) => report,
+            Ok(Err(error)) => domain::WorkerReport::Error(domain::WorkerError {
+                worker_id: plan.order.worker_id.clone(),
+                account_id: plan.order.account_id.clone(),
+                message: error.to_string(),
+                error_at_ms: domain::now_ms(),
+            }),
+            Err(_) => {
+                submit_timed_out = true;
+                domain::WorkerReport::Error(domain::WorkerError {
+                    worker_id: plan.order.worker_id.clone(),
+                    account_id: plan.order.account_id.clone(),
+                    message: format!(
+                        "COPY_LIVE_SUBMIT_TIMEOUT: submit ref {} {} timed out after {}s; exchange state must be reconciled before retry",
+                        plan.order.account_id, plan.order.coin, COPY_DAEMON_SUBMIT_REF_TIMEOUT_SECS
+                    ),
+                    error_at_ms: domain::now_ms(),
+                })
+            }
+        };
+        submitted_reports.push(submitted_report);
+        if submit_timed_out {
+            live_submit_timeout_abort = Some((
+                format!("{} {}", plan.order.account_id, plan.order.coin),
+                submit_ready_refs
+                    .len()
+                    .saturating_sub(submitted_reports.len()),
+            ));
+            break;
+        }
         if copy_canary_has_live_submission(&submitted_reports) {
             match copy_live_daemon_save_live_submit_progress_snapshot(
                 options,
@@ -13181,8 +13332,20 @@ async fn copy_live_daemon_persistent_live_submit(
         }
     }
     let live_submitted_count = copy_canary_live_submitted_reports(&submitted_reports).len();
+    let mut order_evidence_timed_out = false;
     let order_evidence = if live_submitted_count > 0 {
-        collect_copy_canary_order_evidence(config, &submitted_reports).await
+        match tokio::time::timeout(
+            Duration::from_secs(COPY_DAEMON_ORDER_EVIDENCE_TIMEOUT_SECS),
+            collect_copy_canary_order_evidence(config, &submitted_reports),
+        )
+        .await
+        {
+            Ok(evidence) => evidence,
+            Err(_) => {
+                order_evidence_timed_out = true;
+                Vec::new()
+            }
+        }
     } else {
         Vec::new()
     };
@@ -13237,6 +13400,15 @@ async fn copy_live_daemon_persistent_live_submit(
             executable_refs.len().saturating_sub(submit_ready_refs.len())
         ),
     ));
+    if let Some((timed_out_ref, skipped_after_timeout)) = &live_submit_timeout_abort {
+        checks.push(copy_shadow_smoke_check(
+            "submit_timeout_fail_closed",
+            false,
+            format!(
+                "live submit timed out for {timed_out_ref}; skipped {skipped_after_timeout} remaining submit ref(s) until exchange reconciliation confirms state"
+            ),
+        ));
+    }
     checks.push(copy_shadow_smoke_check(
         "live_submit_progress_snapshot_saved",
         live_submitted_count == 0
@@ -13264,11 +13436,18 @@ async fn copy_live_daemon_persistent_live_submit(
     checks.push(copy_shadow_smoke_check(
         "order_status_evidence",
         evidence_ok,
-        format!(
-            "{} live submitted report(s), {} order evidence record(s)",
-            live_submitted_count,
-            order_evidence.len()
-        ),
+        if order_evidence_timed_out {
+            format!(
+                "{} live submitted report(s), order evidence collection timed out after {}s",
+                live_submitted_count, COPY_DAEMON_ORDER_EVIDENCE_TIMEOUT_SECS
+            )
+        } else {
+            format!(
+                "{} live submitted report(s), {} order evidence record(s)",
+                live_submitted_count,
+                order_evidence.len()
+            )
+        },
     ));
     let open_submitted_count = copy_canary_live_submitted_reports(&cleanup_targets).len();
     let cleanup_ok = if options.hold_positions_after_submit {
@@ -13342,6 +13521,8 @@ fn copy_live_daemon_error_is_safe_pre_submit_skip(message: &str) -> bool {
     normalized.contains("failed to set ")
         && normalized.contains(" leverage to ")
         && normalized.contains(" before copy submit")
+        || normalized.contains("copy_live_max_leverage_timeout")
+        || normalized.contains("copy_live_leverage_update_timeout")
         || normalized.contains("copy submit skipped before exchange")
             && normalized.contains("below exchange minimum")
         || normalized.contains("exchange returned action-level order error")
@@ -13400,7 +13581,11 @@ async fn copy_live_daemon_suppress_refs_below_effective_min(
             }
         };
 
-        match copy_live_daemon_open_order_effective_min_check(&scoped_config, &approved_order).await
+        match copy_live_daemon_open_order_effective_min_check_bounded(
+            &scoped_config,
+            &approved_order,
+        )
+        .await
         {
             Ok(Some(message)) => suppressed.push(CopyLiveDaemonSuppressedWouldSubmitRef {
                 plan: plan.clone(),
@@ -13531,7 +13716,8 @@ async fn execute_copy_daemon_submit_ref(
     let approved_order =
         approved_copy_daemon_order_from_ref(&scoped_config, options, &account, plan, false)?;
     if let Some(message) =
-        copy_live_daemon_open_order_effective_min_check(&scoped_config, &approved_order).await?
+        copy_live_daemon_open_order_effective_min_check_bounded(&scoped_config, &approved_order)
+            .await?
     {
         return Ok(domain::WorkerReport::Error(domain::WorkerError {
             worker_id: approved_order.worker_id.clone(),
@@ -13541,27 +13727,67 @@ async fn execute_copy_daemon_submit_ref(
         }));
     }
     let vault_password = copy_daemon_vault_password(&scoped_config)?;
-    let max_leverage = copy_daemon_live_plan_max_leverage(&scoped_config, plan).await?;
+    let max_leverage = match tokio::time::timeout(
+        Duration::from_secs(COPY_DAEMON_MAX_LEVERAGE_TIMEOUT_SECS),
+        copy_daemon_live_plan_max_leverage(&scoped_config, plan),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => anyhow::bail!(
+            "COPY_LIVE_MAX_LEVERAGE_TIMEOUT: {} {} max leverage lookup timed out after {}s",
+            plan.order.account_id,
+            plan.order.coin,
+            COPY_DAEMON_MAX_LEVERAGE_TIMEOUT_SECS
+        ),
+    };
     if let Some(leverage_options) =
         copy_daemon_live_leverage_update_options_with_max(options, plan, max_leverage)?
     {
         let leverage = leverage_options.leverage;
-        trading::execute_manual_leverage_update(
-            scoped_config.clone(),
-            leverage_options,
-            vault_password.as_deref(),
+        match tokio::time::timeout(
+            Duration::from_secs(COPY_DAEMON_LEVERAGE_UPDATE_TIMEOUT_SECS),
+            trading::execute_manual_leverage_update(
+                scoped_config.clone(),
+                leverage_options,
+                vault_password.as_deref(),
+            ),
         )
         .await
-        .with_context(|| {
-            format!(
-                "failed to set {} leverage to {}x before copy submit",
-                plan.order.coin, leverage
-            )
-        })?;
+        {
+            Ok(result) => {
+                result.with_context(|| {
+                    format!(
+                        "failed to set {} leverage to {}x before copy submit",
+                        plan.order.coin, leverage
+                    )
+                })?;
+            }
+            Err(_) => anyhow::bail!(
+                "COPY_LIVE_LEVERAGE_UPDATE_TIMEOUT: {} {} leverage update to {}x timed out after {}s; exchange state must be reconciled before retry",
+                plan.order.account_id,
+                plan.order.coin,
+                leverage,
+                COPY_DAEMON_LEVERAGE_UPDATE_TIMEOUT_SECS
+            ),
+        }
     }
     let secret = secrets::load_account_secret(&scoped_config, &account, vault_password.as_deref())?;
     let executor = trading::AccountExecutor::live(scoped_config, account, secret);
-    Ok(executor.submit(approved_order).await)
+    match tokio::time::timeout(
+        Duration::from_secs(COPY_DAEMON_ORDER_SUBMIT_TIMEOUT_SECS),
+        executor.submit(approved_order),
+    )
+    .await
+    {
+        Ok(report) => Ok(report),
+        Err(_) => anyhow::bail!(
+            "COPY_LIVE_ORDER_SUBMIT_TIMEOUT: submit ref {} {} timed out after {}s; exchange state must be reconciled before retry",
+            plan.order.account_id,
+            plan.order.coin,
+            COPY_DAEMON_ORDER_SUBMIT_TIMEOUT_SECS
+        ),
+    }
 }
 
 fn copy_daemon_vault_password(config: &config::AppConfig) -> Result<Option<String>> {
@@ -13686,6 +13912,26 @@ async fn copy_live_daemon_open_order_effective_min_check(
         )));
     }
     Ok(None)
+}
+
+async fn copy_live_daemon_open_order_effective_min_check_bounded(
+    config: &config::AppConfig,
+    order: &domain::ApprovedOrder,
+) -> Result<Option<String>> {
+    match tokio::time::timeout(
+        Duration::from_secs(COPY_DAEMON_EFFECTIVE_MIN_CHECK_TIMEOUT_SECS),
+        copy_live_daemon_open_order_effective_min_check(config, order),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => anyhow::bail!(
+            "copy submit effective min check for {} {} timed out after {}s",
+            order.account_id,
+            order.coin,
+            COPY_DAEMON_EFFECTIVE_MIN_CHECK_TIMEOUT_SECS
+        ),
+    }
 }
 
 fn copy_daemon_config_for_coin(config: &config::AppConfig, coin: &str) -> config::AppConfig {
@@ -14598,6 +14844,39 @@ async fn reconcile_copy_bounded_window_accounts(
     reconciliations
 }
 
+async fn reconcile_copy_bounded_window_accounts_bounded(
+    config: &config::AppConfig,
+    target_accounts: &[String],
+    label: &str,
+) -> Vec<CopyBoundedLiveWindowReconcile> {
+    match tokio::time::timeout(
+        Duration::from_secs(COPY_DAEMON_RECONCILE_BATCH_TIMEOUT_SECS),
+        reconcile_copy_bounded_window_accounts(config, target_accounts),
+    )
+    .await
+    {
+        Ok(reconciliations) => reconciliations,
+        Err(_) => target_accounts
+            .iter()
+            .map(|account_id| CopyBoundedLiveWindowReconcile {
+                account_id: account_id.clone(),
+                ok: false,
+                open_order_count: None,
+                asset_positions: None,
+                position_summaries: Vec::new(),
+                account_value: None,
+                withdrawable: None,
+                total_ntl_pos: None,
+                total_margin_used: None,
+                error: Some(format!(
+                    "{label} timed out after {}s",
+                    COPY_DAEMON_RECONCILE_BATCH_TIMEOUT_SECS
+                )),
+            })
+            .collect(),
+    }
+}
+
 async fn reconcile_copy_account_with_retries(
     config: &config::AppConfig,
     account_id: &str,
@@ -14775,6 +15054,45 @@ fn plan_copy_daemon_acceptance_order_refs_with_offset(
         }
     }
     Ok(plans)
+}
+
+fn copy_live_daemon_recover_pending_reduce_plan_refs(
+    persistence: &strategies::smart_money::CopyPersistenceSnapshot,
+    target_accounts: &[String],
+) -> Vec<CopyLiveDaemonWouldSubmitRef> {
+    let target_accounts = target_accounts.iter().collect::<HashSet<_>>();
+    persistence
+        .ledger_entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| {
+            entry.status == strategies::smart_money::CopyLedgerStatus::PendingReduce
+                && target_accounts.contains(&entry.local_account_id)
+                && entry.remaining_notional_usd > 1e-9
+        })
+        .map(|(offset, entry)| {
+            let cloid_seed = format!(
+                "copy-pending-reduce-retry:{}:{}:{}:{}",
+                entry.local_account_id, entry.coin, entry.signal_id, entry.remaining_notional_usd
+            );
+            CopyLiveDaemonWouldSubmitRef {
+                record_index: offset,
+                signal_id: entry.signal_id.clone(),
+                leader_id: entry.leader_id.clone(),
+                leader_address: String::new(),
+                order: CopyExecutionCanaryWouldSubmit {
+                    account_id: entry.local_account_id.clone(),
+                    worker_id: format!("worker-{}", entry.local_account_id),
+                    coin: entry.coin.clone(),
+                    side: opposite_order_side(entry.local_side),
+                    notional_usd: entry.remaining_notional_usd,
+                    reduce_only: true,
+                    cloid: uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, cloid_seed.as_bytes())
+                        .to_string(),
+                },
+            }
+        })
+        .collect()
 }
 
 fn copy_live_daemon_order_refs_to_orders(

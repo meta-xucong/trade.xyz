@@ -40,6 +40,7 @@ const INFO_MAX_ATTEMPTS: usize = 6;
 const INFO_BASE_BACKOFF_MS: u64 = 750;
 const INFO_MAX_BACKOFF_MS: u64 = 15_000;
 const INFO_GLOBAL_COOLDOWN_CAP_MS: u64 = 60_000;
+const INFO_REQUEST_TIMEOUT_SECS: u64 = 15;
 const XYZ_SNAPSHOT_CACHE_TTL_MS: u64 = 15_000;
 const SPOT_SNAPSHOT_CACHE_TTL_MS: u64 = 15_000;
 const PERP_DEX_INDEX_CACHE_TTL_MS: u64 = 300_000;
@@ -1663,6 +1664,7 @@ fn parse_optional_price(value: Option<&str>) -> Option<f64> {
 
 fn info_client() -> Result<Client> {
     Client::builder()
+        .timeout(Duration::from_secs(INFO_REQUEST_TIMEOUT_SECS))
         .user_agent(concat!(
             env!("CARGO_PKG_NAME"),
             "/",
