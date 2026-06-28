@@ -1703,7 +1703,7 @@ mod tests {
             error: None,
         };
         let over_cap_position = CopyBoundedLiveWindowReconcile {
-            total_ntl_pos: Some("50.1".to_string()),
+            total_ntl_pos: Some("60.1".to_string()),
             ..held_position.clone()
         };
         let stale_order_position = CopyBoundedLiveWindowReconcile {
@@ -5525,6 +5525,101 @@ mod tests {
                 &options,
                 &reconciliations,
                 &snapshot
+            )
+        );
+    }
+
+    #[test]
+    fn copy_live_daemon_follow_position_health_tolerates_small_mark_drift_above_account_cap() {
+        let mut options = follow_position_options();
+        options.max_total_notional_usd = 700.0;
+        let active_purrdat = crate::strategies::smart_money::CopyLedgerEntry {
+            local_account_id: "addr_b".to_string(),
+            leader_id: "leader_4".to_string(),
+            leader_group: "leader_4".to_string(),
+            signal_id: "copy-leader_4-purrdat-open-active".to_string(),
+            coin: "xyz:PURRDAT".to_string(),
+            local_side: crate::domain::OrderSide::Sell,
+            order_cloid: Some("33333333-3333-5333-8333-333333333333".to_string()),
+            order_oid: Some(9003),
+            submitted_at_ms: Some(now_ms()),
+            filled_at_ms: Some(now_ms()),
+            planned_notional_usd: 349.08,
+            pending_notional_usd: 0.0,
+            filled_notional_usd: 349.08,
+            remaining_notional_usd: 349.08,
+            status: crate::strategies::smart_money::CopyLedgerStatus::Open,
+        };
+        let snapshot = crate::strategies::smart_money::CopyPersistenceSnapshot {
+            schema_version: 1,
+            saved_at_ms: now_ms(),
+            seen_event_keys: Vec::new(),
+            ledger_entries: vec![active_purrdat],
+        };
+        let reconciliations = vec![CopyBoundedLiveWindowReconcile {
+            account_id: "addr_b".to_string(),
+            ok: false,
+            open_order_count: Some(0),
+            asset_positions: Some(1),
+            position_summaries: vec![super::CopyBoundedLiveWindowPositionSummary {
+                coin: "xyz:PURRDAT".to_string(),
+                szi: "-40.0".to_string(),
+                position_value: Some("351.612".to_string()),
+            }],
+            account_value: Some("71.33".to_string()),
+            withdrawable: Some("43.08".to_string()),
+            total_ntl_pos: Some("351.612".to_string()),
+            total_margin_used: Some("28.25".to_string()),
+            error: None,
+        }];
+        let account_caps = HashMap::from([("addr_b".to_string(), 350.0)]);
+
+        assert!(
+            super::copy_live_daemon_reconciliations_healthy_for_mode_with_account_caps(
+                &options,
+                &reconciliations,
+                &account_caps,
+            )
+        );
+        assert!(
+            super::copy_live_daemon_unmapped_position_keys(&snapshot, &reconciliations).is_empty()
+        );
+        let detail = super::copy_live_daemon_reconcile_health_detail_for_snapshot_with_account_caps(
+            &options,
+            &reconciliations,
+            &snapshot,
+            &account_caps,
+        );
+        assert!(detail.contains("addr_b<= 350.000000 (health<= 360.000000)"));
+    }
+
+    #[test]
+    fn copy_live_daemon_follow_position_health_rejects_large_account_cap_breach() {
+        let mut options = follow_position_options();
+        options.max_total_notional_usd = 700.0;
+        let reconciliations = vec![CopyBoundedLiveWindowReconcile {
+            account_id: "addr_b".to_string(),
+            ok: false,
+            open_order_count: Some(0),
+            asset_positions: Some(1),
+            position_summaries: vec![super::CopyBoundedLiveWindowPositionSummary {
+                coin: "xyz:PURRDAT".to_string(),
+                szi: "-40.0".to_string(),
+                position_value: Some("371.0".to_string()),
+            }],
+            account_value: Some("71.33".to_string()),
+            withdrawable: Some("43.08".to_string()),
+            total_ntl_pos: Some("371.0".to_string()),
+            total_margin_used: Some("28.25".to_string()),
+            error: None,
+        }];
+        let account_caps = HashMap::from([("addr_b".to_string(), 350.0)]);
+
+        assert!(
+            !super::copy_live_daemon_reconciliations_healthy_for_mode_with_account_caps(
+                &options,
+                &reconciliations,
+                &account_caps,
             )
         );
     }
@@ -11810,6 +11905,11 @@ fn copy_live_daemon_account_exposure_cap(
         .unwrap_or(options.max_total_notional_usd)
 }
 
+fn copy_live_daemon_account_exposure_health_cap(account_cap: f64) -> f64 {
+    let drift_tolerance = (account_cap * 0.02).max(10.0);
+    account_cap + drift_tolerance
+}
+
 fn copy_live_daemon_reconcile_healthy_for_mode_with_account_caps(
     options: &CopyLiveDaemonSupervisorOptions,
     reconcile: &CopyBoundedLiveWindowReconcile,
@@ -11833,7 +11933,8 @@ fn copy_live_daemon_reconcile_healthy_for_mode_with_account_caps(
         account_exposure_caps,
         &reconcile.account_id,
     );
-    total_ntl_pos.abs() <= account_cap + 1e-6
+    let health_cap = copy_live_daemon_account_exposure_health_cap(account_cap);
+    total_ntl_pos.abs() <= health_cap + 1e-6
 }
 
 #[cfg(test)]
@@ -11887,7 +11988,11 @@ fn copy_live_daemon_reconcile_health_detail_with_account_caps(
                         account_exposure_caps,
                         &reconcile.account_id,
                     );
-                    format!("{}<= {:.6}", reconcile.account_id, cap)
+                    let health_cap = copy_live_daemon_account_exposure_health_cap(cap);
+                    format!(
+                        "{}<= {:.6} (health<= {:.6})",
+                        reconcile.account_id, cap, health_cap
+                    )
                 })
                 .collect::<Vec<_>>()
                 .join(", ")
