@@ -444,6 +444,13 @@ impl AccountExecutor {
         }
     }
 
+    pub async fn submit_fast(&self, order: ApprovedOrder) -> WorkerReport {
+        match self {
+            Self::DryRun(executor) => executor.submit(order),
+            Self::Live(executor) => executor.submit_fast(order).await,
+        }
+    }
+
     pub async fn submit_bulk(&self, orders: Vec<ApprovedOrder>) -> Vec<WorkerReport> {
         match self {
             Self::DryRun(executor) => orders

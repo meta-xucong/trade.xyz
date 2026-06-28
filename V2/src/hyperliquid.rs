@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::{
         LazyLock, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -41,6 +41,8 @@ const INFO_BASE_BACKOFF_MS: u64 = 750;
 const INFO_MAX_BACKOFF_MS: u64 = 15_000;
 const INFO_GLOBAL_COOLDOWN_CAP_MS: u64 = 60_000;
 const INFO_REQUEST_TIMEOUT_SECS: u64 = 15;
+const INFO_RATE_WINDOW_MS: u64 = 60_000;
+const INFO_RATE_LIMIT_WEIGHT_PER_MIN: u32 = 300;
 const XYZ_SNAPSHOT_CACHE_TTL_MS: u64 = 15_000;
 const SPOT_SNAPSHOT_CACHE_TTL_MS: u64 = 15_000;
 const PERP_DEX_INDEX_CACHE_TTL_MS: u64 = 300_000;
@@ -70,6 +72,14 @@ static PERP_DEX_INDEX_CACHE: LazyLock<Mutex<PerpDexIndexCacheMap>> =
 static USER_RATE_LIMIT_CACHE: LazyLock<Mutex<UserRateLimitCacheMap>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static INFO_GLOBAL_COOLDOWN_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+static INFO_RATE_WINDOW: LazyLock<Mutex<InfoRateWindow>> =
+    LazyLock::new(|| Mutex::new(InfoRateWindow::default()));
+
+#[derive(Debug, Default)]
+struct InfoRateWindow {
+    entries: VecDeque<(u64, u32)>,
+    used_weight: u32,
+}
 
 #[derive(Debug, Deserialize)]
 struct PerpDex {
@@ -1680,8 +1690,11 @@ async fn post_info<T: DeserializeOwned>(
     body: serde_json::Value,
 ) -> Result<T> {
     let mut last_error: Option<anyhow::Error> = None;
+    let info_type = info_request_type(&body);
+    let info_weight = info_request_weight(&body);
 
     for attempt in 1..=INFO_MAX_ATTEMPTS {
+        acquire_info_rate_capacity(info_weight).await;
         wait_global_info_cooldown_if_needed().await;
         let request_result = client
             .post(info_url)
@@ -1729,17 +1742,25 @@ async fn post_info<T: DeserializeOwned>(
 
                     if should_retry_info_status(status) && attempt < INFO_MAX_ATTEMPTS {
                         let delay_ms = retry_delay_ms(attempt, Some(status), retry_after_ms);
+                        let cooldown_ms = if status == StatusCode::TOO_MANY_REQUESTS {
+                            delay_ms.max(30_000)
+                        } else {
+                            delay_ms
+                        };
                         if matches!(
                             status,
                             StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE
                         ) {
-                            set_global_info_cooldown(delay_ms);
+                            set_global_info_cooldown(cooldown_ms);
                         }
                         tracing::warn!(
                             %status,
+                            info_type = %info_type,
+                            info_weight,
                             attempt,
                             max_attempts = INFO_MAX_ATTEMPTS,
                             delay_ms,
+                            cooldown_ms,
                             retry_after_ms,
                             "Hyperliquid info request failed; retrying with backoff"
                         );
@@ -1763,6 +1784,73 @@ async fn post_info<T: DeserializeOwned>(
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("unknown info request error"))).with_context(
         || format!("{info_url} info request failed after {INFO_MAX_ATTEMPTS} attempts"),
     )
+}
+
+fn info_request_type(body: &serde_json::Value) -> String {
+    body.get("type")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+fn info_request_weight(body: &serde_json::Value) -> u32 {
+    match body.get("type").and_then(|value| value.as_str()) {
+        Some(
+            "l2Book"
+            | "allMids"
+            | "clearinghouseState"
+            | "orderStatus"
+            | "spotClearinghouseState"
+            | "exchangeStatus",
+        ) => 2,
+        Some("meta" | "perpDexs" | "metaAndAssetCtxs") => 20,
+        Some(_) | None => 20,
+    }
+}
+
+async fn acquire_info_rate_capacity(weight: u32) {
+    let weight = weight.clamp(1, INFO_RATE_LIMIT_WEIGHT_PER_MIN);
+    loop {
+        let sleep_ms = {
+            let now = crate::domain::now_ms();
+            let Ok(mut window) = INFO_RATE_WINDOW.lock() else {
+                return tokio::time::sleep(Duration::from_millis(250)).await;
+            };
+            prune_info_rate_window(&mut window, now);
+            if window.used_weight.saturating_add(weight) <= INFO_RATE_LIMIT_WEIGHT_PER_MIN {
+                window.entries.push_back((now, weight));
+                window.used_weight = window.used_weight.saturating_add(weight);
+                None
+            } else {
+                window
+                    .entries
+                    .front()
+                    .map(|(timestamp_ms, _)| {
+                        timestamp_ms
+                            .saturating_add(INFO_RATE_WINDOW_MS)
+                            .saturating_add(50)
+                            .saturating_sub(now)
+                            .clamp(50, 5_000)
+                    })
+                    .or(Some(250))
+            }
+        };
+        if let Some(sleep_ms) = sleep_ms {
+            tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+        } else {
+            return;
+        }
+    }
+}
+
+fn prune_info_rate_window(window: &mut InfoRateWindow, now_ms: u64) {
+    while let Some((timestamp_ms, weight)) = window.entries.front().copied() {
+        if now_ms.saturating_sub(timestamp_ms) < INFO_RATE_WINDOW_MS {
+            break;
+        }
+        window.entries.pop_front();
+        window.used_weight = window.used_weight.saturating_sub(weight);
+    }
 }
 
 fn should_retry_info_status(status: StatusCode) -> bool {
@@ -1820,8 +1908,9 @@ mod tests {
     use super::{
         DexAssetContext, DexAssetMeta, DexMeta, SpotAssetContext, SpotMarketSnapshot,
         SpotMetaAsset, SpotMetaResponse, SpotTokenInfo, XyzMarketSnapshot, build_order_plan,
-        hip3_asset_id, normalize_cloid_for_info, normalize_dex_coin,
-        parse_spot_clearinghouse_state_value, round_perp_price, round_size_down,
+        hip3_asset_id, info_request_type, info_request_weight, normalize_cloid_for_info,
+        normalize_dex_coin, parse_spot_clearinghouse_state_value, round_perp_price,
+        round_size_down,
     };
     use std::collections::HashMap;
 
@@ -1829,6 +1918,35 @@ mod tests {
     fn xyz_symbol_normalization_adds_prefix_and_uppercases() {
         assert_eq!(normalize_dex_coin("xyz", "tsla"), "xyz:TSLA");
         assert_eq!(normalize_dex_coin("xyz", "XYZ:nvda"), "xyz:NVDA");
+    }
+
+    #[test]
+    fn info_request_weight_matches_documented_heavy_defaults() {
+        assert_eq!(
+            info_request_type(&serde_json::json!({"type": "allMids"})),
+            "allMids"
+        );
+        assert_eq!(
+            info_request_weight(&serde_json::json!({"type": "allMids"})),
+            2
+        );
+        assert_eq!(
+            info_request_weight(&serde_json::json!({"type": "clearinghouseState"})),
+            2
+        );
+        assert_eq!(
+            info_request_weight(&serde_json::json!({"type": "spotClearinghouseState"})),
+            2
+        );
+        assert_eq!(
+            info_request_weight(&serde_json::json!({"type": "userFills"})),
+            20
+        );
+        assert_eq!(
+            info_request_weight(&serde_json::json!({"type": "meta"})),
+            20
+        );
+        assert_eq!(info_request_weight(&serde_json::json!({})), 20);
     }
 
     #[test]

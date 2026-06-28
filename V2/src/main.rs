@@ -13776,7 +13776,7 @@ async fn execute_copy_daemon_submit_ref(
     let executor = trading::AccountExecutor::live(scoped_config, account, secret);
     match tokio::time::timeout(
         Duration::from_secs(COPY_DAEMON_ORDER_SUBMIT_TIMEOUT_SECS),
-        executor.submit(approved_order),
+        executor.submit_fast(approved_order),
     )
     .await
     {

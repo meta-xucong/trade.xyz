@@ -102,6 +102,9 @@ const MARKET_SNAPSHOT_QUOTE_CACHE_TTL_MS: u64 = 15_000;
 const FIB_ENTRY_SIGNAL_EXECUTION_TTL_MS: u64 = 300_000;
 const MARKET_SNAPSHOT_UNIVERSE_CACHE_TTL_MS: u64 = 60_000;
 const ACCOUNT_FUNDING_BATCH_CACHE_TTL_MS: u64 = 5_000;
+const COPY_TARGET_LIVE_CACHE_TTL_MS: u64 = 120_000;
+const DASHBOARD_OPEN_ORDERS_CACHE_TTL_MS: u64 = 30_000;
+const DASHBOARD_OPEN_ORDERS_FALLBACK_TIMEOUT_SECS: u64 = 3;
 const MANUAL_PROTECTIVE_RULES_CACHE_TTL_MS: u64 = 10_000;
 const FIB_RECONCILE_INTERVAL_MS: u64 = 15_000;
 const FIB_COMPLETION_RESIDUAL_POSITION_DUST_USD: f64 = 0.50;
@@ -143,6 +146,8 @@ struct FrontendAppState {
     fib_stop_requests: Arc<RwLock<HashMap<String, u64>>>,
     realtime: RealtimeState,
     account_funding_batch_cache: Arc<RwLock<HashMap<String, AccountFundingBatchCacheEntry>>>,
+    copy_target_live_cache: Arc<RwLock<HashMap<String, CopyTargetLiveCacheEntry>>>,
+    dashboard_open_orders_cache: Arc<RwLock<HashMap<String, DashboardOpenOrdersCacheEntry>>>,
     manual_protective_rules_cache: Arc<RwLock<HashMap<String, ManualProtectiveRulesCacheEntry>>>,
 }
 
@@ -168,6 +173,18 @@ struct PersistedVaultSession {
 struct AccountFundingBatchCacheEntry {
     fetched_at_ms: u64,
     response: AccountFundingBatchResponse,
+}
+
+#[derive(Debug, Clone)]
+struct CopyTargetLiveCacheEntry {
+    fetched_at_ms: u64,
+    rows: Vec<CopyPnlAccountSummary>,
+}
+
+#[derive(Debug, Clone)]
+struct DashboardOpenOrdersCacheEntry {
+    fetched_at_ms: u64,
+    orders: Vec<OpenOrder>,
 }
 
 #[derive(Debug, Clone)]
@@ -440,6 +457,65 @@ impl FrontendAppState {
                 AccountFundingBatchCacheEntry {
                     fetched_at_ms: now_ms(),
                     response: response.clone(),
+                },
+            );
+        Ok(())
+    }
+
+    fn cached_copy_target_live_rows(
+        &self,
+        key: &str,
+    ) -> Result<Option<Vec<CopyPnlAccountSummary>>> {
+        let now = now_ms();
+        let cache = self
+            .copy_target_live_cache
+            .read()
+            .map_err(|_| anyhow::anyhow!("copy target live cache lock is poisoned"))?;
+        Ok(cache.get(key).and_then(|entry| {
+            (now.saturating_sub(entry.fetched_at_ms) <= COPY_TARGET_LIVE_CACHE_TTL_MS)
+                .then(|| entry.rows.clone())
+        }))
+    }
+
+    fn store_copy_target_live_cache(
+        &self,
+        key: String,
+        rows: &[CopyPnlAccountSummary],
+    ) -> Result<()> {
+        self.copy_target_live_cache
+            .write()
+            .map_err(|_| anyhow::anyhow!("copy target live cache lock is poisoned"))?
+            .insert(
+                key,
+                CopyTargetLiveCacheEntry {
+                    fetched_at_ms: now_ms(),
+                    rows: rows.to_vec(),
+                },
+            );
+        Ok(())
+    }
+
+    fn cached_dashboard_open_orders(&self, key: &str) -> Result<Option<Vec<OpenOrder>>> {
+        let now = now_ms();
+        let cache = self
+            .dashboard_open_orders_cache
+            .read()
+            .map_err(|_| anyhow::anyhow!("dashboard open orders cache lock is poisoned"))?;
+        Ok(cache.get(key).and_then(|entry| {
+            (now.saturating_sub(entry.fetched_at_ms) <= DASHBOARD_OPEN_ORDERS_CACHE_TTL_MS)
+                .then(|| entry.orders.clone())
+        }))
+    }
+
+    fn store_dashboard_open_orders_cache(&self, key: String, orders: &[OpenOrder]) -> Result<()> {
+        self.dashboard_open_orders_cache
+            .write()
+            .map_err(|_| anyhow::anyhow!("dashboard open orders cache lock is poisoned"))?
+            .insert(
+                key,
+                DashboardOpenOrdersCacheEntry {
+                    fetched_at_ms: now_ms(),
+                    orders: orders.to_vec(),
                 },
             );
         Ok(())
@@ -978,6 +1054,8 @@ pub async fn run(options: FrontendOptions) -> Result<()> {
         fib_stop_requests: Arc::new(RwLock::new(HashMap::new())),
         realtime: realtime.clone(),
         account_funding_batch_cache: Arc::new(RwLock::new(HashMap::new())),
+        copy_target_live_cache: Arc::new(RwLock::new(HashMap::new())),
+        dashboard_open_orders_cache: Arc::new(RwLock::new(HashMap::new())),
         manual_protective_rules_cache: Arc::new(RwLock::new(HashMap::new())),
     };
     if let Err(error) = state.restore_vault_session_from_cache() {
@@ -4271,7 +4349,6 @@ impl FrontendStateResponse {
         let mut recent_events = Vec::new();
         let mut accounts = Vec::new();
         let mut positions = Vec::new();
-        let position_truth = build_position_truth_snapshot(state, &config);
 
         for account in config.enabled_worker_accounts() {
             let state_market_id = frontend_perp_market_id_for_dex(&config.hyperliquid.dex);
@@ -4292,6 +4369,7 @@ impl FrontendStateResponse {
             };
             match account_state {
                 Ok(account_state) => {
+                    let position_truth = build_position_truth_snapshot(state, &config);
                     let equity_usd = parse_decimal(&account_state.margin_summary.account_value);
                     let available_usdc = account_state
                         .withdrawable
@@ -9144,6 +9222,20 @@ struct CopyLiveAccountSummaries {
     targets: Vec<CopyPnlAccountSummary>,
 }
 
+fn copy_target_live_cache_key(leader_addresses: &[String], markets: &[&'static str]) -> String {
+    let leaders = leader_addresses
+        .iter()
+        .map(|address| address.trim().to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(",");
+    let markets = markets
+        .iter()
+        .map(|market| market.trim().to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("leaders={leaders}|markets={markets}")
+}
+
 async fn read_copy_live_account_summaries(
     state: &FrontendAppState,
     settings: Option<&CopyUiSettings>,
@@ -9186,18 +9278,27 @@ async fn read_copy_live_account_summaries(
     .unwrap_or_default();
     let local_summary = aggregate_copy_local_account_summaries(&local_summaries);
 
-    let targets = tokio::time::timeout(
-        Duration::from_secs(8),
-        read_copy_live_target_account_rows(
-            &config,
-            &state.realtime,
-            &leader_addresses,
-            &normalized_markets,
-        ),
-    )
-    .await
-    .ok()
-    .unwrap_or_default();
+    let target_cache_key = copy_target_live_cache_key(&leader_addresses, &normalized_markets);
+    let targets = if let Some(cached) = state.cached_copy_target_live_rows(&target_cache_key)? {
+        cached
+    } else {
+        let refreshed = tokio::time::timeout(
+            Duration::from_secs(12),
+            read_copy_live_target_account_rows(
+                &config,
+                &state.realtime,
+                &leader_addresses,
+                &normalized_markets,
+            ),
+        )
+        .await
+        .ok()
+        .unwrap_or_default();
+        if !leader_addresses.is_empty() && !refreshed.is_empty() {
+            state.store_copy_target_live_cache(target_cache_key, &refreshed)?;
+        }
+        refreshed
+    };
 
     Ok(CopyLiveAccountSummaries {
         local: local_summary,
@@ -9247,27 +9348,23 @@ async fn read_copy_live_target_account_rows(
     leader_addresses: &[String],
     markets: &[&'static str],
 ) -> Vec<CopyPnlAccountSummary> {
-    let summary_futures = leader_addresses
-        .iter()
-        .enumerate()
-        .map(|(index, address)| async move {
-            copy_live_account_summary_for_address(
-                config,
-                realtime,
-                format!("leader_{}", index + 1),
-                "target_live".to_string(),
-                address.clone(),
-                markets,
-                true,
-            )
-            .await
-            .ok()
-        });
-    join_all(summary_futures)
+    let mut rows = Vec::new();
+    for (index, address) in leader_addresses.iter().enumerate() {
+        if let Ok(summary) = copy_live_account_summary_for_address(
+            config,
+            realtime,
+            format!("leader_{}", index + 1),
+            "target_live".to_string(),
+            address.clone(),
+            markets,
+            false,
+        )
         .await
-        .into_iter()
-        .flatten()
-        .collect()
+        {
+            rows.push(summary);
+        }
+    }
+    rows
 }
 
 fn aggregate_copy_local_account_summaries(
@@ -10737,6 +10834,13 @@ fn build_copy_live_soak_status_response_from_dir(
             .is_none_or(|latest_round| latest_round < active_round)
     {
         response.latest_round = Some(active_round);
+        response.latest_ok = None;
+        response.submitted_reports = None;
+        response.order_evidence = None;
+        response.cleanup_errors = None;
+        response.final_flat = None;
+        response.final_reconcile_health = None;
+        response.hold_positions_after_submit = None;
         response.watcher_status = Some("running_window".to_string());
         if !run_id.is_empty() {
             let round_tag = format!("{active_round:04}");
@@ -11894,6 +11998,7 @@ async fn build_dashboard_open_orders_response(
             .collect::<Vec<_>>();
     }
     let mut open_orders = build_dashboard_fib_open_orders(
+        state,
         &config,
         &state.realtime,
         &fib_instances,
@@ -11901,6 +12006,7 @@ async fn build_dashboard_open_orders_response(
     )
     .await;
     let manual_open_orders = build_dashboard_manual_open_orders(
+        state,
         &config,
         &state.realtime,
         &open_orders,
@@ -12596,6 +12702,7 @@ async fn recover_fib_entry_refs_from_exchange_open_orders(
                 continue;
             };
             let orders = dashboard_open_orders_for_account(
+                state,
                 config,
                 realtime,
                 &market,
@@ -12742,6 +12849,7 @@ fn fib_entry_recovery_price_tolerance(entry_price: f64) -> f64 {
 }
 
 async fn build_dashboard_fib_open_orders(
+    state: &FrontendAppState,
     config: &AppConfig,
     realtime: &RealtimeState,
     fib_instances: &[FibInstanceRecord],
@@ -12768,6 +12876,7 @@ async fn build_dashboard_fib_open_orders(
 
         for order_ref in &record.entry_order_refs {
             let open_order = dashboard_open_order_for_ref(
+                state,
                 config,
                 realtime,
                 &market,
@@ -12790,6 +12899,7 @@ async fn build_dashboard_fib_open_orders(
 
         for order_ref in &record.protective_order_refs {
             let open_order = dashboard_open_order_for_ref(
+                state,
                 config,
                 realtime,
                 &market,
@@ -12815,6 +12925,7 @@ async fn build_dashboard_fib_open_orders(
 }
 
 async fn dashboard_open_order_for_ref(
+    state: &FrontendAppState,
     config: &AppConfig,
     realtime: &RealtimeState,
     market: &MarketProfile,
@@ -12825,7 +12936,7 @@ async fn dashboard_open_order_for_ref(
         return None;
     }
     let account = config.account(&order_ref.account_id)?;
-    dashboard_open_orders_for_account(config, realtime, market, account, cache)
+    dashboard_open_orders_for_account(state, config, realtime, market, account, cache)
         .await
         .iter()
         .find(|order| dashboard_open_order_matches_ref(order, order_ref))
@@ -12833,6 +12944,7 @@ async fn dashboard_open_order_for_ref(
 }
 
 async fn dashboard_open_orders_for_account<'a>(
+    state: &FrontendAppState,
     config: &AppConfig,
     realtime: &RealtimeState,
     market: &MarketProfile,
@@ -12843,13 +12955,22 @@ async fn dashboard_open_orders_for_account<'a>(
     if !cache.contains_key(&cache_key) {
         let fetched = if let Some(orders) = realtime.open_orders(market.id, &account.address) {
             orders
+        } else if let Ok(Some(orders)) = state.cached_dashboard_open_orders(&cache_key) {
+            orders
         } else {
-            fetch_open_orders(&config.app.environment, &market.dex, &account.address)
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|order| open_order_matches_market(order, market))
-                .collect::<Vec<_>>()
+            let fetched = tokio::time::timeout(
+                Duration::from_secs(DASHBOARD_OPEN_ORDERS_FALLBACK_TIMEOUT_SECS),
+                fetch_open_orders(&config.app.environment, &market.dex, &account.address),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|order| open_order_matches_market(order, market))
+            .collect::<Vec<_>>();
+            let _ = state.store_dashboard_open_orders_cache(cache_key.clone(), &fetched);
+            fetched
         };
         cache.insert(cache_key.clone(), fetched);
     }
@@ -12857,6 +12978,7 @@ async fn dashboard_open_orders_for_account<'a>(
 }
 
 async fn build_dashboard_manual_open_orders(
+    state: &FrontendAppState,
     config: &AppConfig,
     realtime: &RealtimeState,
     existing: &[DashboardOpenOrderResponse],
@@ -12877,6 +12999,7 @@ async fn build_dashboard_manual_open_orders(
             account.enabled && account.worker_enabled && account.market_allowed(market.id)
         }) {
             let orders = dashboard_open_orders_for_account(
+                state,
                 config,
                 realtime,
                 &market,
@@ -17871,6 +17994,12 @@ mod tests {
             account_funding_batch_cache: Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
+            copy_target_live_cache: Arc::new(std::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            dashboard_open_orders_cache: Arc::new(std::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
             manual_protective_rules_cache: Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
@@ -19797,9 +19926,47 @@ mod tests {
         assert_eq!(status.run_id.as_deref(), Some("20260615-214919"));
         assert_eq!(status.pid, Some(std::process::id()));
         assert_eq!(status.latest_round, Some(5));
-        assert_eq!(status.order_evidence, Some(1));
-        assert_eq!(status.final_flat, Some(false));
-        assert_eq!(status.final_reconcile_health, Some(true));
+        assert_eq!(status.latest_ok, None);
+        assert_eq!(status.order_evidence, None);
+        assert_eq!(status.final_flat, None);
+        assert_eq!(status.final_reconcile_health, None);
+        assert_eq!(status.watcher_status.as_deref(), Some("running_window"));
+    }
+
+    #[test]
+    fn copy_live_soak_status_does_not_apply_failed_summary_to_active_round() {
+        let dir = std::env::temp_dir().join(format!(
+            "trade_xyz_copy_live_soak_pending_after_failed_{}",
+            crate::domain::now_ms()
+        ));
+        fs::create_dir_all(&dir).expect("test dir");
+        fs::write(
+            dir.join("persistent-live-soak-20260628-130421-run.log"),
+            "2026-06-28T16:01:31+08:00 round=31 ok=False submitted=0 evidence=0\n2026-06-28T16:02:31+08:00 round=32 starting report=.codex-longrun\\persistent-live-soak-20260628-130421-round-0032.json\n",
+        )
+        .expect("run log");
+        fs::write(
+            dir.join("persistent-live-soak-20260628-130421-summary.jsonl"),
+            "{\"run_id\":\"20260628-130421\",\"round\":31,\"ok\":false,\"submitted_reports\":0,\"order_evidence\":0,\"cleanup_errors\":0,\"watcher_status\":\"watcher_recoverable_disconnect\",\"final_flat\":false,\"final_reconcile_health\":false,\"hold_positions_after_submit\":true,\"report_path\":\".codex-longrun\\\\persistent-live-soak-20260628-130421-round-0031.json\"}\n",
+        )
+        .expect("summary");
+        fs::write(
+            dir.join("persistent-live-soak-detached-current.pid"),
+            format!("{}\n", std::process::id()),
+        )
+        .expect("pid");
+
+        let status = build_copy_live_soak_status_response_from_dir(&dir, crate::domain::now_ms())
+            .expect("status");
+
+        assert!(status.running);
+        assert_eq!(status.status_kind, "running");
+        assert_eq!(status.latest_round, Some(32));
+        assert_eq!(status.latest_ok, None);
+        assert_eq!(status.final_reconcile_health, None);
+        assert_eq!(status.submitted_reports, None);
+        assert_eq!(status.order_evidence, None);
+        assert_eq!(status.cleanup_errors, None);
         assert_eq!(status.watcher_status.as_deref(), Some("running_window"));
     }
 
@@ -20024,7 +20191,7 @@ mod tests {
 
         assert!(status.running);
         assert_eq!(status.latest_round, Some(2));
-        assert_eq!(status.final_reconcile_health, Some(true));
+        assert_eq!(status.final_reconcile_health, None);
     }
 
     #[test]
@@ -20846,6 +21013,12 @@ mod tests {
             fib_stop_requests: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             realtime: RealtimeState::new(),
             account_funding_batch_cache: Arc::new(std::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            copy_target_live_cache: Arc::new(std::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            dashboard_open_orders_cache: Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
             manual_protective_rules_cache: Arc::new(std::sync::RwLock::new(
@@ -21979,6 +22152,12 @@ mod tests {
             account_funding_batch_cache: Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
+            copy_target_live_cache: Arc::new(std::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            dashboard_open_orders_cache: Arc::new(std::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
             manual_protective_rules_cache: Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
@@ -22045,6 +22224,12 @@ mod tests {
             account_funding_batch_cache: Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
+            copy_target_live_cache: Arc::new(std::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            dashboard_open_orders_cache: Arc::new(std::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
             manual_protective_rules_cache: Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
@@ -22105,6 +22290,12 @@ mod tests {
             fib_stop_requests: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             realtime: RealtimeState::new(),
             account_funding_batch_cache: Arc::new(std::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            copy_target_live_cache: Arc::new(std::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            dashboard_open_orders_cache: Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
             manual_protective_rules_cache: Arc::new(std::sync::RwLock::new(
@@ -22208,6 +22399,12 @@ mod tests {
             fib_stop_requests: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             realtime: RealtimeState::new(),
             account_funding_batch_cache: Arc::new(std::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            copy_target_live_cache: Arc::new(std::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            dashboard_open_orders_cache: Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
             manual_protective_rules_cache: Arc::new(std::sync::RwLock::new(
