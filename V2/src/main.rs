@@ -45,6 +45,7 @@ const COPY_DAEMON_ORDER_SUBMIT_TIMEOUT_SECS: u64 = 60;
 const COPY_DAEMON_MARGIN_BUFFER_RATIO: f64 = 0.10;
 const COPY_DAEMON_FEE_BUFFER_RATIO: f64 = 0.001;
 const COPY_DAEMON_RECOVERED_LEDGER_DUPLICATE_TOLERANCE_USD: f64 = 1.0;
+const COPY_DAEMON_PNL_DRIFT_TOLERANCE_USD: f64 = 1.0;
 
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
@@ -2405,6 +2406,7 @@ mod tests {
                         coin: coin.to_string(),
                         szi: szi.to_string(),
                         position_value: Some("123.45".to_string()),
+                        unrealized_pnl: None,
                         ..Default::default()
                     },
                     position_type: None,
@@ -2471,6 +2473,7 @@ mod tests {
                     coin: "xyz:GBP".to_string(),
                     szi: "38.0".to_string(),
                     position_value: Some("12.5".to_string()),
+                    unrealized_pnl: None,
                     ..Default::default()
                 },
                 position_type: None,
@@ -4001,6 +4004,7 @@ mod tests {
                 coin: "xyz:QNT".to_string(),
                 szi: "-8.58".to_string(),
                 position_value: Some("637.30".to_string()),
+                unrealized_pnl: None,
             }],
             account_value: Some("78.0".to_string()),
             withdrawable: Some("100.0".to_string()),
@@ -4053,6 +4057,7 @@ mod tests {
                 coin: "xyz:QNT".to_string(),
                 szi: "-8.58".to_string(),
                 position_value: Some("637.30".to_string()),
+                unrealized_pnl: None,
             }],
             account_value: Some("78.0".to_string()),
             withdrawable: Some("0.0".to_string()),
@@ -4106,6 +4111,7 @@ mod tests {
                 coin: "xyz:GBP".to_string(),
                 szi: "250.0".to_string(),
                 position_value: Some("340.0".to_string()),
+                unrealized_pnl: None,
             }],
             account_value: Some("90.0".to_string()),
             withdrawable: Some("80.0".to_string()),
@@ -5097,6 +5103,7 @@ mod tests {
                 coin: "xyz:JPY".to_string(),
                 szi: "0.62".to_string(),
                 position_value: Some("99.9254".to_string()),
+                unrealized_pnl: None,
             }],
             account_value: Some("42.5".to_string()),
             withdrawable: Some("13.1".to_string()),
@@ -5319,6 +5326,7 @@ mod tests {
                 coin: "xyz:GOLD".to_string(),
                 szi: "0.085".to_string(),
                 position_value: Some("349.996".to_string()),
+                unrealized_pnl: None,
             }],
             account_value: None,
             withdrawable: None,
@@ -5438,6 +5446,7 @@ mod tests {
                 coin: "xyz:JPY".to_string(),
                 szi: "0.51".to_string(),
                 position_value: Some("82.4109".to_string()),
+                unrealized_pnl: None,
             }],
             account_value: None,
             withdrawable: None,
@@ -5532,6 +5541,7 @@ mod tests {
                     coin: "xyz:GOLD".to_string(),
                     szi: "0.085".to_string(),
                     position_value: Some("349.996".to_string()),
+                    unrealized_pnl: None,
                 }],
                 account_value: None,
                 withdrawable: None,
@@ -5548,6 +5558,7 @@ mod tests {
                     coin: "xyz:SP500".to_string(),
                     szi: "0.015".to_string(),
                     position_value: Some("110.748".to_string()),
+                    unrealized_pnl: None,
                 }],
                 account_value: None,
                 withdrawable: None,
@@ -5602,6 +5613,7 @@ mod tests {
                 coin: "xyz:GOLD".to_string(),
                 szi: "0.085".to_string(),
                 position_value: Some("349.996".to_string()),
+                unrealized_pnl: None,
             }],
             account_value: Some("158.0".to_string()),
             withdrawable: Some("0.2".to_string()),
@@ -5661,6 +5673,7 @@ mod tests {
                 coin: "xyz:QNT".to_string(),
                 szi: "-4.9".to_string(),
                 position_value: Some("365.6282".to_string()),
+                unrealized_pnl: None,
             }],
             account_value: Some("158.0".to_string()),
             withdrawable: Some("0.2".to_string()),
@@ -5733,6 +5746,7 @@ mod tests {
                 coin: "xyz:SP500".to_string(),
                 szi: "0.081".to_string(),
                 position_value: Some("594.10".to_string()),
+                unrealized_pnl: Some("93.43".to_string()),
             }],
             account_value: Some("158.0".to_string()),
             withdrawable: Some("0.2".to_string()),
@@ -5786,6 +5800,7 @@ mod tests {
                 coin: "xyz:PURRDAT".to_string(),
                 szi: "-40.0".to_string(),
                 position_value: Some("351.612".to_string()),
+                unrealized_pnl: None,
             }],
             account_value: Some("71.33".to_string()),
             withdrawable: Some("43.08".to_string()),
@@ -5815,6 +5830,81 @@ mod tests {
     }
 
     #[test]
+    fn copy_live_daemon_follow_position_health_tolerates_pnl_drift_above_account_health_cap_for_mapped_copy()
+     {
+        let mut options = follow_position_options();
+        options.max_total_notional_usd = 700.0;
+        let active_spcx = crate::strategies::smart_money::CopyLedgerEntry {
+            local_account_id: "addr_b".to_string(),
+            leader_id: "leader_4".to_string(),
+            leader_group: "leader_4".to_string(),
+            signal_id: "copy-leader_4-spcx-open-active".to_string(),
+            coin: "xyz:SPCX".to_string(),
+            local_side: crate::domain::OrderSide::Sell,
+            order_cloid: Some("44444444-4444-5444-8444-444444444444".to_string()),
+            order_oid: Some(9004),
+            submitted_at_ms: Some(now_ms()),
+            filled_at_ms: Some(now_ms()),
+            planned_notional_usd: 350.0,
+            pending_notional_usd: 0.0,
+            filled_notional_usd: 349.9875,
+            remaining_notional_usd: 349.9875,
+            status: crate::strategies::smart_money::CopyLedgerStatus::Open,
+        };
+        let snapshot = crate::strategies::smart_money::CopyPersistenceSnapshot {
+            schema_version: 1,
+            saved_at_ms: now_ms(),
+            seen_event_keys: Vec::new(),
+            ledger_entries: vec![active_spcx],
+        };
+        let reconciliations = vec![CopyBoundedLiveWindowReconcile {
+            account_id: "addr_b".to_string(),
+            ok: false,
+            open_order_count: Some(0),
+            asset_positions: Some(1),
+            position_summaries: vec![super::CopyBoundedLiveWindowPositionSummary {
+                coin: "xyz:SPCX".to_string(),
+                szi: "-2.25".to_string(),
+                position_value: Some("368.1225".to_string()),
+                unrealized_pnl: Some("-18.1350".to_string()),
+            }],
+            account_value: Some("61.37".to_string()),
+            withdrawable: Some("43.97".to_string()),
+            total_ntl_pos: Some("368.1225".to_string()),
+            total_margin_used: Some("17.40".to_string()),
+            error: None,
+        }];
+        let account_caps = HashMap::from([("addr_b".to_string(), 350.0)]);
+
+        assert!(
+            !super::copy_live_daemon_reconciliations_healthy_for_mode_with_account_caps(
+                &options,
+                &reconciliations,
+                &account_caps,
+            )
+        );
+        assert!(
+            super::copy_live_daemon_reconciliations_healthy_for_snapshot_with_account_caps(
+                &options,
+                &reconciliations,
+                &snapshot,
+                &account_caps,
+            )
+        );
+        assert!(
+            super::copy_live_daemon_unmapped_position_keys(&snapshot, &reconciliations).is_empty()
+        );
+        let detail = super::copy_live_daemon_reconcile_health_detail_for_snapshot_with_account_caps(
+            &options,
+            &reconciliations,
+            &snapshot,
+            &account_caps,
+        );
+        assert!(detail.contains("1/1 account(s) healthy"));
+        assert!(detail.contains("mapped_copy_principal=349.987500"));
+    }
+
+    #[test]
     fn copy_live_daemon_follow_position_health_rejects_large_account_cap_breach() {
         let mut options = follow_position_options();
         options.max_total_notional_usd = 700.0;
@@ -5827,6 +5917,7 @@ mod tests {
                 coin: "xyz:PURRDAT".to_string(),
                 szi: "-40.0".to_string(),
                 position_value: Some("371.0".to_string()),
+                unrealized_pnl: None,
             }],
             account_value: Some("71.33".to_string()),
             withdrawable: Some("43.08".to_string()),
@@ -5840,6 +5931,63 @@ mod tests {
             !super::copy_live_daemon_reconciliations_healthy_for_mode_with_account_caps(
                 &options,
                 &reconciliations,
+                &account_caps,
+            )
+        );
+    }
+
+    #[test]
+    fn copy_live_daemon_follow_position_health_rejects_snapshot_principal_above_account_health_cap()
+    {
+        let mut options = follow_position_options();
+        options.max_total_notional_usd = 700.0;
+        let active_purrdat = crate::strategies::smart_money::CopyLedgerEntry {
+            local_account_id: "addr_b".to_string(),
+            leader_id: "leader_4".to_string(),
+            leader_group: "leader_4".to_string(),
+            signal_id: "copy-leader_4-purrdat-open-oversized".to_string(),
+            coin: "xyz:PURRDAT".to_string(),
+            local_side: crate::domain::OrderSide::Sell,
+            order_cloid: Some("55555555-5555-5555-8555-555555555555".to_string()),
+            order_oid: Some(9005),
+            submitted_at_ms: Some(now_ms()),
+            filled_at_ms: Some(now_ms()),
+            planned_notional_usd: 371.0,
+            pending_notional_usd: 0.0,
+            filled_notional_usd: 371.0,
+            remaining_notional_usd: 371.0,
+            status: crate::strategies::smart_money::CopyLedgerStatus::Open,
+        };
+        let snapshot = crate::strategies::smart_money::CopyPersistenceSnapshot {
+            schema_version: 1,
+            saved_at_ms: now_ms(),
+            seen_event_keys: Vec::new(),
+            ledger_entries: vec![active_purrdat],
+        };
+        let reconciliations = vec![CopyBoundedLiveWindowReconcile {
+            account_id: "addr_b".to_string(),
+            ok: false,
+            open_order_count: Some(0),
+            asset_positions: Some(1),
+            position_summaries: vec![super::CopyBoundedLiveWindowPositionSummary {
+                coin: "xyz:PURRDAT".to_string(),
+                szi: "-40.0".to_string(),
+                position_value: Some("371.0".to_string()),
+                unrealized_pnl: Some("0.0".to_string()),
+            }],
+            account_value: Some("71.33".to_string()),
+            withdrawable: Some("43.08".to_string()),
+            total_ntl_pos: Some("371.0".to_string()),
+            total_margin_used: Some("28.25".to_string()),
+            error: None,
+        }];
+        let account_caps = HashMap::from([("addr_b".to_string(), 350.0)]);
+
+        assert!(
+            !super::copy_live_daemon_reconciliations_healthy_for_snapshot_with_account_caps(
+                &options,
+                &reconciliations,
+                &snapshot,
                 &account_caps,
             )
         );
@@ -5894,6 +6042,7 @@ mod tests {
                 coin: "xyz:GOLD".to_string(),
                 szi: "0.085".to_string(),
                 position_value: Some("347.582".to_string()),
+                unrealized_pnl: None,
             }],
             account_value: None,
             withdrawable: None,
@@ -5937,6 +6086,7 @@ mod tests {
                 coin: "xyz:BE".to_string(),
                 szi: "-0.01".to_string(),
                 position_value: Some("3.2677".to_string()),
+                unrealized_pnl: None,
             }],
             account_value: Some("158.0".to_string()),
             withdrawable: Some("0.2".to_string()),
@@ -10018,6 +10168,7 @@ struct CopyBoundedLiveWindowPositionSummary {
     coin: String,
     szi: String,
     position_value: Option<String>,
+    unrealized_pnl: Option<String>,
 }
 
 fn run_copy_shadow_smoke(
@@ -11784,11 +11935,12 @@ async fn run_copy_live_daemon_supervisor(
         reconcile_copy_bounded_window_accounts_bounded(config, &target_accounts, "final_reconcile")
             .await;
     let final_reconcile_health_ok =
-        copy_live_daemon_reconciliations_healthy_for_mode_with_account_caps(
+        copy_live_daemon_reconciliations_healthy_for_snapshot_with_account_caps(
             &options,
             &final_reconciliations,
+            &saved,
             &account_symbol_caps,
-        ) && copy_live_daemon_unmapped_position_keys(&saved, &final_reconciliations).is_empty();
+        );
     checks.push(copy_shadow_smoke_check(
         "final_reconcile_health",
         final_reconcile_health_ok,
@@ -12076,6 +12228,7 @@ fn copy_live_daemon_watcher_progress_check(
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 fn copy_live_daemon_reconciliations_healthy_for_mode(
     options: &CopyLiveDaemonSupervisorOptions,
     reconciliations: &[CopyBoundedLiveWindowReconcile],
@@ -12164,8 +12317,79 @@ fn copy_live_daemon_reconciliations_healthy_for_snapshot(
     reconciliations: &[CopyBoundedLiveWindowReconcile],
     snapshot: &strategies::smart_money::CopyPersistenceSnapshot,
 ) -> bool {
-    copy_live_daemon_reconciliations_healthy_for_mode(options, reconciliations)
-        && copy_live_daemon_unmapped_position_keys(snapshot, reconciliations).is_empty()
+    copy_live_daemon_reconciliations_healthy_for_snapshot_with_account_caps(
+        options,
+        reconciliations,
+        snapshot,
+        &HashMap::new(),
+    )
+}
+
+fn copy_live_daemon_reconciliations_healthy_for_snapshot_with_account_caps(
+    options: &CopyLiveDaemonSupervisorOptions,
+    reconciliations: &[CopyBoundedLiveWindowReconcile],
+    snapshot: &strategies::smart_money::CopyPersistenceSnapshot,
+    account_exposure_caps: &HashMap<String, f64>,
+) -> bool {
+    if copy_live_daemon_unmapped_position_keys(snapshot, reconciliations).is_empty() {
+        let account_principal =
+            copy_live_daemon_active_copy_principal_notional_by_account(snapshot);
+        !reconciliations.is_empty()
+            && reconciliations.iter().all(|reconcile| {
+                copy_live_daemon_reconcile_healthy_for_snapshot_with_account_caps(
+                    options,
+                    reconcile,
+                    account_exposure_caps,
+                    &account_principal,
+                )
+            })
+    } else {
+        false
+    }
+}
+
+fn copy_live_daemon_reconcile_healthy_for_snapshot_with_account_caps(
+    options: &CopyLiveDaemonSupervisorOptions,
+    reconcile: &CopyBoundedLiveWindowReconcile,
+    account_exposure_caps: &HashMap<String, f64>,
+    account_principal_notional: &HashMap<String, f64>,
+) -> bool {
+    if copy_live_daemon_reconcile_healthy_for_mode_with_account_caps(
+        options,
+        reconcile,
+        account_exposure_caps,
+    ) {
+        return true;
+    }
+    if !options.hold_positions_after_submit {
+        return false;
+    }
+    if reconcile.error.is_some() || reconcile.open_order_count != Some(0) {
+        return false;
+    }
+    let Some(total_ntl_pos) = reconcile
+        .total_ntl_pos
+        .as_deref()
+        .and_then(|value| value.parse::<f64>().ok())
+        .map(f64::abs)
+        .filter(|value| value.is_finite())
+    else {
+        return false;
+    };
+    let account_cap = copy_live_daemon_account_exposure_cap(
+        options,
+        account_exposure_caps,
+        &reconcile.account_id,
+    );
+    let health_cap = copy_live_daemon_account_exposure_health_cap(account_cap);
+    if total_ntl_pos <= health_cap + 1e-6 {
+        return true;
+    }
+    let mapped_principal = account_principal_notional
+        .get(&reconcile.account_id)
+        .copied()
+        .unwrap_or_default();
+    mapped_principal > 0.0 && mapped_principal <= health_cap + 1e-6
 }
 
 fn copy_live_daemon_reconcile_health_detail_with_account_caps(
@@ -12255,11 +12479,69 @@ fn copy_live_daemon_reconcile_health_detail_for_snapshot_with_account_caps(
     snapshot: &strategies::smart_money::CopyPersistenceSnapshot,
     account_exposure_caps: &HashMap<String, f64>,
 ) -> String {
-    let base = copy_live_daemon_reconcile_health_detail_with_account_caps(
-        options,
-        reconciliations,
-        account_exposure_caps,
-    );
+    let account_principal = copy_live_daemon_active_copy_principal_notional_by_account(snapshot);
+    let base = if options.hold_positions_after_submit {
+        let healthy_count = reconciliations
+            .iter()
+            .filter(|reconcile| {
+                copy_live_daemon_reconcile_healthy_for_snapshot_with_account_caps(
+                    options,
+                    reconcile,
+                    account_exposure_caps,
+                    &account_principal,
+                )
+            })
+            .count();
+        let no_open_orders = reconciliations
+            .iter()
+            .filter(|reconcile| reconcile.open_order_count == Some(0))
+            .count();
+        let max_total_ntl = reconciliations
+            .iter()
+            .filter_map(|reconcile| {
+                reconcile
+                    .total_ntl_pos
+                    .as_deref()
+                    .and_then(|value| value.parse::<f64>().ok())
+            })
+            .map(f64::abs)
+            .fold(0.0_f64, f64::max);
+        let cap_detail = if account_exposure_caps.is_empty() {
+            format!("global fallback cap {:.6}", options.max_total_notional_usd)
+        } else {
+            reconciliations
+                .iter()
+                .map(|reconcile| {
+                    let cap = copy_live_daemon_account_exposure_cap(
+                        options,
+                        account_exposure_caps,
+                        &reconcile.account_id,
+                    );
+                    let health_cap = copy_live_daemon_account_exposure_health_cap(cap);
+                    let mapped_principal = account_principal
+                        .get(&reconcile.account_id)
+                        .copied()
+                        .unwrap_or_default();
+                    format!(
+                        "{}<= {:.6} (health<= {:.6}) mapped_copy_principal={mapped_principal:.6}",
+                        reconcile.account_id, cap, health_cap
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        format!(
+            "follow-position mode: {healthy_count}/{} account(s) healthy, {no_open_orders}/{} account(s) have no open orders, max_total_ntl_pos={max_total_ntl:.6}; per-account exposure caps: {cap_detail}; positions may remain until target close signals",
+            reconciliations.len(),
+            reconciliations.len()
+        )
+    } else {
+        copy_live_daemon_reconcile_health_detail_with_account_caps(
+            options,
+            reconciliations,
+            account_exposure_caps,
+        )
+    };
     let unmapped = copy_live_daemon_unmapped_position_keys(snapshot, reconciliations);
     if unmapped.is_empty() {
         return base;
@@ -15271,6 +15553,7 @@ fn copy_bounded_live_window_reconcile_from_report(
             coin: asset.position.coin.clone(),
             szi: asset.position.szi.clone(),
             position_value: asset.position.position_value.clone(),
+            unrealized_pnl: asset.position.unrealized_pnl.clone(),
         })
         .collect::<Vec<_>>();
     let total_ntl_zero = margin
@@ -16648,6 +16931,68 @@ fn copy_live_daemon_selected_account_set(
     accounts
 }
 
+fn copy_live_daemon_active_copy_principal_notional_by_account(
+    snapshot: &strategies::smart_money::CopyPersistenceSnapshot,
+) -> HashMap<String, f64> {
+    snapshot
+        .ledger_entries
+        .iter()
+        .filter(|entry| {
+            copy_live_daemon_ledger_entry_is_active_open_mapping(entry)
+                && copy_live_daemon_ledger_entry_has_live_order_evidence(entry)
+                && !entry.local_account_id.trim().is_empty()
+        })
+        .fold(HashMap::<String, f64>::new(), |mut acc, entry| {
+            let notional = copy_live_daemon_active_open_mapping_notional(entry);
+            if notional > 1e-9 {
+                *acc.entry(entry.local_account_id.clone()).or_insert(0.0) += notional;
+            }
+            acc
+        })
+}
+
+fn copy_live_daemon_ledger_entry_is_active_open_mapping(
+    entry: &strategies::smart_money::CopyLedgerEntry,
+) -> bool {
+    matches!(
+        entry.status,
+        strategies::smart_money::CopyLedgerStatus::Open
+            | strategies::smart_money::CopyLedgerStatus::PendingOpen
+    ) && copy_live_daemon_ledger_entry_is_open_lineage(entry)
+}
+
+fn copy_live_daemon_active_open_mapping_notional(
+    entry: &strategies::smart_money::CopyLedgerEntry,
+) -> f64 {
+    if entry.remaining_notional_usd > 1e-9 {
+        return entry.remaining_notional_usd.max(0.0);
+    }
+    if matches!(
+        entry.status,
+        strategies::smart_money::CopyLedgerStatus::PendingOpen
+    ) {
+        return entry
+            .filled_notional_usd
+            .max(entry.pending_notional_usd)
+            .max(entry.planned_notional_usd)
+            .max(0.0);
+    }
+    0.0
+}
+
+fn copy_live_daemon_uncovered_position_notional_explained_by_unrealized_pnl(
+    position: &CopyBoundedLiveWindowPositionSummary,
+    uncovered_notional: f64,
+) -> bool {
+    let pnl = position
+        .unrealized_pnl
+        .as_deref()
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .map(f64::abs)
+        .unwrap_or_default();
+    pnl.is_finite() && uncovered_notional <= pnl + COPY_DAEMON_PNL_DRIFT_TOLERANCE_USD
+}
+
 fn copy_live_daemon_unmapped_position_keys(
     snapshot: &strategies::smart_money::CopyPersistenceSnapshot,
     reconciliations: &[CopyBoundedLiveWindowReconcile],
@@ -16656,7 +17001,7 @@ fn copy_live_daemon_unmapped_position_keys(
         .ledger_entries
         .iter()
         .filter(|entry| {
-            copy_live_daemon_ledger_entry_is_open_lineage(entry)
+            copy_live_daemon_ledger_entry_is_active_open_mapping(entry)
                 && copy_live_daemon_ledger_entry_has_live_order_evidence(entry)
                 && !entry.local_account_id.trim().is_empty()
                 && !entry.coin.trim().is_empty()
@@ -16664,11 +17009,7 @@ fn copy_live_daemon_unmapped_position_keys(
         .fold(
             HashMap::<(String, String, String), f64>::new(),
             |mut acc, entry| {
-                let notional = entry
-                    .filled_notional_usd
-                    .max(entry.remaining_notional_usd)
-                    .max(entry.planned_notional_usd)
-                    .max(0.0);
+                let notional = copy_live_daemon_active_open_mapping_notional(entry);
                 if notional > 1e-9 {
                     *acc.entry((
                         entry.local_account_id.clone(),
@@ -16709,7 +17050,12 @@ fn copy_live_daemon_unmapped_position_keys(
                 .copied()
                 .unwrap_or_default();
             let uncovered_notional = (position_notional - mapped_notional).max(0.0);
-            if uncovered_notional + 1e-9 >= trading::HYPERLIQUID_MIN_ORDER_NOTIONAL_USD {
+            if uncovered_notional + 1e-9 >= trading::HYPERLIQUID_MIN_ORDER_NOTIONAL_USD
+                && !copy_live_daemon_uncovered_position_notional_explained_by_unrealized_pnl(
+                    position,
+                    uncovered_notional,
+                )
+            {
                 unmapped.push(format!(
                     "{}:{}:{}:uncovered={uncovered_notional:.6}:live={position_notional:.6}:mapped={mapped_notional:.6}",
                     reconciliation.account_id, position.coin, side_key
