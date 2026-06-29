@@ -29,6 +29,15 @@ test.afterEach(() => {
   }
 });
 
+async function openAppForScript(page) {
+  await page.goto("/", { waitUntil: "commit" });
+  await page.waitForFunction(() => (
+    typeof state !== "undefined"
+    && typeof updateRuntimeModeSummary === "function"
+    && typeof dashboardPositionAttribution === "function"
+  ));
+}
+
 test("smart money page saves simple principal-capped copy settings", async ({ page }) => {
   await page.goto("/");
   await page.locator('button[data-view="copy"]').click();
@@ -277,8 +286,25 @@ test("smart money summary keeps copy-owned truth separate from other live positi
   await expect(summary.locator(".copy-advanced-details")).toHaveJSProperty("open", true);
 });
 
+test("runtime summary uses copy summary running evidence", async ({ page }) => {
+  await openAppForScript(page);
+
+  const runtimeText = await page.evaluate(() => {
+    state.lang = "en";
+    state.app = { dry_run: false };
+    state.manualRunMode = "dry_run";
+    state.fibRunMode = "dry_run";
+    state.copyLiveSoakStatus = { running: false };
+    state.copySummary = { live_running: true };
+    updateRuntimeModeSummary();
+    return document.querySelector("#dryRun")?.textContent || "";
+  });
+
+  expect(runtimeText).toContain("Copy running");
+});
+
 test("dashboard attribution consumes backend position truth fields", async ({ page }) => {
-  await page.goto("/");
+  await openAppForScript(page);
 
   const result = await page.evaluate(() => {
     state.copySummary = {
@@ -341,6 +367,26 @@ test("dashboard attribution consumes backend position truth fields", async ({ pa
       attribution_parts: [
         { key: "dust", source: "backend_dust_threshold", ratio: 1 },
       ],
+    });
+    const backendNestedUnattributed = dashboardPositionAttribution({
+      account_id: "addr_a",
+      coin: "xyz:BOT",
+      size: -0.54,
+      position_value_usd: 17.74116,
+      pnl_usd: 0.730354,
+      attribution: {
+        owner: "unattributed",
+        attribution_source: "backend_position_truth",
+        copy_ratio: 0,
+        fib_ratio: 0,
+        unattributed_ratio: 1,
+        dust_ratio: 0,
+        attribution_parts: [{
+          key: "unattributed",
+          source: "live_position_without_strategy_evidence",
+          ratio: 1,
+        }],
+      },
     });
     const derivedDashboard = deriveDashboardView(
       [{ account_id: "addr_a" }, { account_id: "addr_b" }],
@@ -430,17 +476,42 @@ test("dashboard attribution consumes backend position truth fields", async ({ pa
         pnl_usd: 1.25,
       }]
     );
+    const statePnlNestedUnattributed = applyDashboardAttributionToPnl(
+      { total_equity_usd: 175.535855, total_available_usdc: 172.89389, total_unrealized_pnl_usd: 0.730354 },
+      [{
+        account_id: "addr_a",
+        coin: "xyz:BOT",
+        size: -0.54,
+        position_value_usd: 17.74116,
+        pnl_usd: 0.730354,
+        attribution: {
+          owner: "unattributed",
+          attribution_source: "backend_position_truth",
+          copy_ratio: 0,
+          fib_ratio: 0,
+          unattributed_ratio: 1,
+          dust_ratio: 0,
+          attribution_parts: [{
+            key: "unattributed",
+            source: "live_position_without_strategy_evidence",
+            ratio: 1,
+          }],
+        },
+      }]
+    );
 
     return {
       noBackend,
       backendMixed,
       backendDust,
+      backendNestedUnattributed,
       dashboardTotalPositionValue: derivedDashboard.pnl.total_position_value_usd,
       dashboardRowPositionValue: rowPositionValue,
       dashboardLegacyMarginValue:
         derivedDashboard.pnl.total_equity_usd - derivedDashboard.pnl.total_available_usdc,
       stateTruthPositionValue: statePnlWithoutPositionTotal.total_position_value_usd,
       stateRowsFallbackPositionValue: statePnlRowsFallback.total_position_value_usd,
+      nestedUnattributedPnl: statePnlNestedUnattributed,
     };
   });
 
@@ -453,11 +524,16 @@ test("dashboard attribution consumes backend position truth fields", async ({ pa
   expect(result.backendMixed.unattributed_ratio).toBe(0.25);
   expect(result.backendDust.owner).toBe("dust");
   expect(result.backendDust.dust_ratio).toBe(1);
+  expect(result.backendNestedUnattributed.owner).toBe("unattributed");
+  expect(result.backendNestedUnattributed.copy_ratio).toBe(0);
+  expect(result.backendNestedUnattributed.unattributed_ratio).toBe(1);
   expect(result.dashboardTotalPositionValue).toBeCloseTo(594.0945, 4);
   expect(result.dashboardTotalPositionValue).toBeCloseTo(result.dashboardRowPositionValue, 6);
   expect(result.dashboardTotalPositionValue).not.toBeCloseTo(result.dashboardLegacyMarginValue, 4);
   expect(result.stateTruthPositionValue).toBeCloseTo(135.5, 6);
   expect(result.stateRowsFallbackPositionValue).toBeCloseTo(100, 6);
+  expect(result.nestedUnattributedPnl.attributed_unrealized_pnl_usd).toBeCloseTo(0, 6);
+  expect(result.nestedUnattributedPnl.unattributed_unrealized_pnl_usd).toBeCloseTo(0.730354, 6);
 });
 
 test("dashboard cancel-all action requires confirmation before calling the API", async ({ page }) => {

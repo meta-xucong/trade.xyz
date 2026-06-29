@@ -6749,6 +6749,7 @@
             renderDashboardMetrics(state.dashboardPnl);
             renderPositions(state.dashboardPositions);
           }
+          updateRuntimeModeSummary();
           renderCopySummary();
         } catch (error) {
           if (!silent) {
@@ -9370,6 +9371,14 @@
         return fields;
       }
 
+      function positionBackendAttributionSource(position) {
+        const nested = position?.attribution;
+        if (nested && typeof nested === "object" && !Array.isArray(nested)) {
+          return nested;
+        }
+        return position || {};
+      }
+
       function backendAttributionLabelForPart(part) {
         const key = String(part?.key || "").trim().toLowerCase();
         const source = String(part?.source || "").trim().toLowerCase();
@@ -9384,12 +9393,16 @@
       }
 
       function dashboardBackendOwnershipBreakdown(position) {
-        const hasBackend = String(position?.attribution_source || "") === "backend_position_truth"
-          || Object.prototype.hasOwnProperty.call(position || {}, "owner")
-          || Object.prototype.hasOwnProperty.call(position || {}, "attribution_parts");
+        const positionObject = position || {};
+        const source = positionBackendAttributionSource(positionObject);
+        const fields = positionBackendAttributionFields(source);
+        const hasBackend = source !== positionObject
+          || String(fields.attribution_source || "") === "backend_position_truth"
+          || Object.prototype.hasOwnProperty.call(source || {}, "owner")
+          || Object.prototype.hasOwnProperty.call(source || {}, "attribution_parts");
         if (!hasBackend) return null;
-        const parts = Array.isArray(position?.attribution_parts)
-          ? position.attribution_parts
+        const parts = Array.isArray(fields.attribution_parts)
+          ? fields.attribution_parts
             .map((part) => ({
               key: String(part?.key || "unattributed").trim().toLowerCase() || "unattributed",
               source: String(part?.source || "").trim(),
@@ -9397,13 +9410,13 @@
             }))
             .filter((part) => part.ratio > MANUAL_POSITION_DUST_EPS)
           : [];
-        let owner = String(position?.owner || "").trim().toLowerCase();
+        let owner = String(fields.owner || "").trim().toLowerCase();
         if (!owner) owner = parts.length === 1 ? parts[0].key : (parts.length > 1 ? "mixed" : "unattributed");
         if (!["fib", "copy", "unattributed", "dust", "mixed"].includes(owner)) owner = "unattributed";
-        const fibRatio = Math.max(0, Math.min(parseNum(position?.fib_ratio), 1));
-        const copyRatio = Math.max(0, Math.min(parseNum(position?.copy_ratio), 1));
-        const dustRatio = Math.max(0, Math.min(parseNum(position?.dust_ratio), 1));
-        const unattributedRatio = Math.max(0, Math.min(parseNum(position?.unattributed_ratio), 1));
+        const fibRatio = Math.max(0, Math.min(parseNum(fields.fib_ratio), 1));
+        const copyRatio = Math.max(0, Math.min(parseNum(fields.copy_ratio), 1));
+        const dustRatio = Math.max(0, Math.min(parseNum(fields.dust_ratio), 1));
+        const unattributedRatio = Math.max(0, Math.min(parseNum(fields.unattributed_ratio), 1));
         const displayParts = parts.length > 0
           ? parts
           : [{ key: owner === "mixed" ? "unattributed" : owner, source: "", ratio: 1 }];
@@ -9710,12 +9723,17 @@
         return mode === "live" ? t("status.live") : t("status.dry_run");
       }
 
+      function copyRuntimeIsRunning() {
+        return state.copyLiveSoakStatus?.running === true
+          || state.copySummary?.live_running === true;
+      }
+
       function updateRuntimeModeSummary() {
         const app = state.app || {};
         const backend = app.dry_run === false ? t("status.live") : t("status.dry_run");
         const manual = compactModeLabel(state.manualRunMode);
         const fib = compactModeLabel(state.fibRunMode);
-        const copy = state.copyLiveSoakStatus?.running ? t("status.copy_running") : t("status.copy_stopped");
+        const copy = copyRuntimeIsRunning() ? t("status.copy_running") : t("status.copy_stopped");
         const summary = t("status.runtime_summary", { backend, manual, fib, copy });
         const node = $("dryRun");
         if (node) {
