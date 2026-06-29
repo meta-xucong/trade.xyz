@@ -44,6 +44,7 @@ const COPY_DAEMON_LEVERAGE_UPDATE_TIMEOUT_SECS: u64 = 45;
 const COPY_DAEMON_ORDER_SUBMIT_TIMEOUT_SECS: u64 = 60;
 const COPY_DAEMON_MARGIN_BUFFER_RATIO: f64 = 0.10;
 const COPY_DAEMON_FEE_BUFFER_RATIO: f64 = 0.001;
+const COPY_DAEMON_RECOVERED_LEDGER_DUPLICATE_TOLERANCE_USD: f64 = 1.0;
 
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
@@ -4721,6 +4722,128 @@ mod tests {
                 .iter()
                 .all(|entry| entry.signal_id != "sig-shadow-only")
         );
+    }
+
+    #[test]
+    fn copy_live_daemon_persistence_merge_drops_recovered_open_covered_by_evidence() {
+        let recovered_open = crate::strategies::smart_money::CopyLedgerEntry {
+            local_account_id: "addr_a".to_string(),
+            leader_id: "leader_4".to_string(),
+            leader_group: "leader_4".to_string(),
+            signal_id: "sig-recovered-sp500".to_string(),
+            coin: "xyz:SP500".to_string(),
+            local_side: crate::domain::OrderSide::Buy,
+            order_cloid: None,
+            order_oid: None,
+            submitted_at_ms: Some(1_000),
+            filled_at_ms: None,
+            planned_notional_usd: 162.20,
+            pending_notional_usd: 0.0,
+            filled_notional_usd: 162.20,
+            remaining_notional_usd: 162.20,
+            status: crate::strategies::smart_money::CopyLedgerStatus::Open,
+        };
+        let evidenced_open = crate::strategies::smart_money::CopyLedgerEntry {
+            signal_id: "sig-evidenced-sp500".to_string(),
+            order_cloid: Some("33333333-3333-5333-8333-333333333333".to_string()),
+            order_oid: Some(3003),
+            submitted_at_ms: Some(2_000),
+            filled_at_ms: Some(2_100),
+            planned_notional_usd: 162.05,
+            filled_notional_usd: 162.05,
+            remaining_notional_usd: 162.05,
+            ..recovered_open.clone()
+        };
+        let existing = crate::strategies::smart_money::CopyPersistenceSnapshot {
+            schema_version: 1,
+            saved_at_ms: now_ms(),
+            seen_event_keys: Vec::new(),
+            ledger_entries: vec![recovered_open],
+        };
+        let incoming = crate::strategies::smart_money::CopyPersistenceSnapshot {
+            schema_version: 1,
+            saved_at_ms: now_ms(),
+            seen_event_keys: Vec::new(),
+            ledger_entries: vec![evidenced_open],
+        };
+
+        let merged = copy_live_daemon_merge_persistence_snapshots_for_save(existing, incoming);
+
+        assert!(
+            merged
+                .ledger_entries
+                .iter()
+                .all(|entry| entry.signal_id != "sig-recovered-sp500")
+        );
+        let evidenced = merged
+            .ledger_entries
+            .iter()
+            .find(|entry| entry.signal_id == "sig-evidenced-sp500")
+            .expect("evidenced open");
+        assert_eq!(
+            evidenced.status,
+            crate::strategies::smart_money::CopyLedgerStatus::Open
+        );
+        assert_eq!(merged.ledger_entries.len(), 1);
+    }
+
+    #[test]
+    fn copy_live_daemon_persistence_merge_keeps_uncovered_recovered_residual() {
+        let recovered_open = crate::strategies::smart_money::CopyLedgerEntry {
+            local_account_id: "addr_a".to_string(),
+            leader_id: "leader_4".to_string(),
+            leader_group: "leader_4".to_string(),
+            signal_id: "sig-recovered-sp500".to_string(),
+            coin: "xyz:SP500".to_string(),
+            local_side: crate::domain::OrderSide::Buy,
+            order_cloid: None,
+            order_oid: None,
+            submitted_at_ms: Some(1_000),
+            filled_at_ms: None,
+            planned_notional_usd: 500.0,
+            pending_notional_usd: 0.0,
+            filled_notional_usd: 500.0,
+            remaining_notional_usd: 500.0,
+            status: crate::strategies::smart_money::CopyLedgerStatus::Open,
+        };
+        let evidenced_open = crate::strategies::smart_money::CopyLedgerEntry {
+            signal_id: "sig-evidenced-sp500".to_string(),
+            order_cloid: Some("44444444-4444-5444-8444-444444444444".to_string()),
+            order_oid: Some(4004),
+            submitted_at_ms: Some(2_000),
+            filled_at_ms: Some(2_100),
+            planned_notional_usd: 300.0,
+            filled_notional_usd: 300.0,
+            remaining_notional_usd: 300.0,
+            ..recovered_open.clone()
+        };
+        let existing = crate::strategies::smart_money::CopyPersistenceSnapshot {
+            schema_version: 1,
+            saved_at_ms: now_ms(),
+            seen_event_keys: Vec::new(),
+            ledger_entries: vec![recovered_open],
+        };
+        let incoming = crate::strategies::smart_money::CopyPersistenceSnapshot {
+            schema_version: 1,
+            saved_at_ms: now_ms(),
+            seen_event_keys: Vec::new(),
+            ledger_entries: vec![evidenced_open],
+        };
+
+        let merged = copy_live_daemon_merge_persistence_snapshots_for_save(existing, incoming);
+
+        let recovered = merged
+            .ledger_entries
+            .iter()
+            .find(|entry| entry.signal_id == "sig-recovered-sp500")
+            .expect("residual recovered open");
+        assert_eq!(
+            recovered.status,
+            crate::strategies::smart_money::CopyLedgerStatus::Open
+        );
+        assert!((recovered.remaining_notional_usd - 200.0).abs() < 1e-9);
+        assert!((recovered.filled_notional_usd - 200.0).abs() < 1e-9);
+        assert_eq!(merged.ledger_entries.len(), 2);
     }
 
     #[test]
@@ -16629,6 +16752,7 @@ fn copy_live_daemon_merge_persistence_snapshots(
     }
     let mut ledger_entries = entries_by_key.into_values().collect::<Vec<_>>();
     copy_live_daemon_apply_closed_reduces_to_open_entries(&mut ledger_entries);
+    copy_live_daemon_deduplicate_recovered_open_entries(&mut ledger_entries);
     ledger_entries.sort_by(|left, right| {
         copy_live_daemon_ledger_entry_identity(left)
             .cmp(&copy_live_daemon_ledger_entry_identity(right))
@@ -16658,6 +16782,88 @@ fn copy_live_daemon_ledger_entry_identity(
         "signal:{}:{}:{}:{}",
         entry.local_account_id, entry.coin, entry.signal_id, entry.leader_id
     )
+}
+
+fn copy_live_daemon_ledger_open_mapping_key(
+    entry: &strategies::smart_money::CopyLedgerEntry,
+) -> Option<(String, String, String, String)> {
+    if !matches!(
+        entry.status,
+        strategies::smart_money::CopyLedgerStatus::Open
+    ) {
+        return None;
+    }
+    Some((
+        entry.local_account_id.clone(),
+        entry.leader_group.clone(),
+        entry.coin.clone(),
+        copy_live_daemon_order_side_key(entry.local_side),
+    ))
+}
+
+fn copy_live_daemon_open_entry_has_order_evidence(
+    entry: &strategies::smart_money::CopyLedgerEntry,
+) -> bool {
+    entry.order_oid.is_some()
+        || entry
+            .order_cloid
+            .as_deref()
+            .is_some_and(|cloid| !cloid.trim().is_empty())
+        || entry.filled_at_ms.is_some()
+}
+
+fn copy_live_daemon_deduplicate_recovered_open_entries(
+    ledger_entries: &mut Vec<strategies::smart_money::CopyLedgerEntry>,
+) {
+    let mut evidenced_open_notional = HashMap::<(String, String, String, String), f64>::new();
+    for entry in ledger_entries.iter() {
+        if !copy_live_daemon_open_entry_has_order_evidence(entry) {
+            continue;
+        }
+        let Some(key) = copy_live_daemon_ledger_open_mapping_key(entry) else {
+            continue;
+        };
+        let remaining = entry.remaining_notional_usd.max(0.0);
+        if remaining.is_finite() && remaining > 0.0 {
+            *evidenced_open_notional.entry(key).or_insert(0.0) += remaining;
+        }
+    }
+
+    let mut duplicate_recovered_identities = HashSet::<String>::new();
+    for entry in ledger_entries.iter_mut() {
+        if copy_live_daemon_open_entry_has_order_evidence(entry) {
+            continue;
+        }
+        let Some(key) = copy_live_daemon_ledger_open_mapping_key(entry) else {
+            continue;
+        };
+        let Some(covered_notional) = evidenced_open_notional.get_mut(&key) else {
+            continue;
+        };
+        if *covered_notional <= 0.0 {
+            continue;
+        }
+
+        let current_remaining = entry.remaining_notional_usd.max(0.0);
+        let covered = current_remaining.min(*covered_notional);
+        *covered_notional = (*covered_notional - covered).max(0.0);
+        let residual = (current_remaining - covered).max(0.0);
+        if residual <= COPY_DAEMON_RECOVERED_LEDGER_DUPLICATE_TOLERANCE_USD {
+            duplicate_recovered_identities.insert(copy_live_daemon_ledger_entry_identity(entry));
+            entry.remaining_notional_usd = 0.0;
+            entry.pending_notional_usd = 0.0;
+            entry.status = strategies::smart_money::CopyLedgerStatus::Closed;
+        } else {
+            entry.planned_notional_usd = residual;
+            entry.filled_notional_usd = residual;
+            entry.remaining_notional_usd = residual;
+            entry.pending_notional_usd = 0.0;
+        }
+    }
+
+    ledger_entries.retain(|entry| {
+        !duplicate_recovered_identities.contains(&copy_live_daemon_ledger_entry_identity(entry))
+    });
 }
 
 fn copy_live_daemon_apply_closed_reduces_to_open_entries(
