@@ -507,6 +507,14 @@ impl FrontendAppState {
         }))
     }
 
+    fn cached_dashboard_open_orders_any_age(&self, key: &str) -> Result<Option<Vec<OpenOrder>>> {
+        let cache = self
+            .dashboard_open_orders_cache
+            .read()
+            .map_err(|_| anyhow::anyhow!("dashboard open orders cache lock is poisoned"))?;
+        Ok(cache.get(key).map(|entry| entry.orders.clone()))
+    }
+
     fn store_dashboard_open_orders_cache(&self, key: String, orders: &[OpenOrder]) -> Result<()> {
         self.dashboard_open_orders_cache
             .write()
@@ -534,6 +542,17 @@ impl FrontendAppState {
             (now.saturating_sub(entry.fetched_at_ms) <= MANUAL_PROTECTIVE_RULES_CACHE_TTL_MS)
                 .then(|| entry.response.clone())
         }))
+    }
+
+    fn cached_manual_protective_rules_any_age(
+        &self,
+        key: &str,
+    ) -> Result<Option<ManualProtectiveRulesResponse>> {
+        let cache = self
+            .manual_protective_rules_cache
+            .read()
+            .map_err(|_| anyhow::anyhow!("manual protective rules cache lock is poisoned"))?;
+        Ok(cache.get(key).map(|entry| entry.response.clone()))
     }
 
     fn store_manual_protective_rules_cache(
@@ -2568,7 +2587,22 @@ async fn manual_protective_rules(
             .collect::<Result<Vec<_>>>()?;
         let mut rules = Vec::new();
         for rule_group in join_all(rule_futures).await {
-            rules.extend(rule_group?);
+            match rule_group {
+                Ok(rule_group) => rules.extend(rule_group),
+                Err(error) => {
+                    if let Some(cached) =
+                        state.cached_manual_protective_rules_any_age(&cache_key)?
+                    {
+                        tracing::warn!(
+                            market = market.id,
+                            error = %format!("{error:#}"),
+                            "manual protective rules refresh failed; returning stale cache"
+                        );
+                        return Ok(cached);
+                    }
+                    return Err(error);
+                }
+            }
         }
         rules.sort_by(|left, right| {
             right
@@ -12975,23 +13009,52 @@ async fn dashboard_open_orders_for_account<'a>(
     let cache_key = format!("{}::{}", market.id, account.address.to_ascii_lowercase());
     if !cache.contains_key(&cache_key) {
         let fetched = if let Some(orders) = realtime.open_orders(market.id, &account.address) {
+            let _ = state.store_dashboard_open_orders_cache(cache_key.clone(), &orders);
             orders
         } else if let Ok(Some(orders)) = state.cached_dashboard_open_orders(&cache_key) {
             orders
         } else {
-            let fetched = tokio::time::timeout(
+            match tokio::time::timeout(
                 Duration::from_secs(DASHBOARD_OPEN_ORDERS_FALLBACK_TIMEOUT_SECS),
                 fetch_open_orders(&config.app.environment, &market.dex, &account.address),
             )
             .await
-            .ok()
-            .and_then(Result::ok)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|order| open_order_matches_market(order, market))
-            .collect::<Vec<_>>();
-            let _ = state.store_dashboard_open_orders_cache(cache_key.clone(), &fetched);
-            fetched
+            {
+                Ok(Ok(open_orders)) => {
+                    let fetched = open_orders
+                        .into_iter()
+                        .filter(|order| open_order_matches_market(order, market))
+                        .collect::<Vec<_>>();
+                    let _ = state.store_dashboard_open_orders_cache(cache_key.clone(), &fetched);
+                    fetched
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(
+                        market = market.id,
+                        account_id = %account.account_id,
+                        error = %format!("{error:#}"),
+                        "dashboard open-orders REST fallback failed; using stale cache if available"
+                    );
+                    state
+                        .cached_dashboard_open_orders_any_age(&cache_key)
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default()
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        market = market.id,
+                        account_id = %account.account_id,
+                        timeout_secs = DASHBOARD_OPEN_ORDERS_FALLBACK_TIMEOUT_SECS,
+                        "dashboard open-orders REST fallback timed out; using stale cache if available"
+                    );
+                    state
+                        .cached_dashboard_open_orders_any_age(&cache_key)
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default()
+                }
+            }
         };
         cache.insert(cache_key.clone(), fetched);
     }
@@ -17950,10 +18013,10 @@ mod tests {
     use crate::{
         audit::AuditEvent,
         config::{AppConfig, MARKET_CASH_PERP, MARKET_HL_PERP, MARKET_SPOT, MARKET_XYZ_PERP},
-        domain::{ExecutionMode, OrderSide, WorkerReport},
+        domain::{ExecutionMode, OrderSide, WorkerReport, now_ms},
         hyperliquid::{
-            SpotAssetContext, SpotMarketSnapshot, SpotMetaAsset, SpotMetaResponse, SpotTokenInfo,
-            UserFill,
+            OpenOrder, SpotAssetContext, SpotMarketSnapshot, SpotMetaAsset, SpotMetaResponse,
+            SpotTokenInfo, UserFill,
         },
         realtime::RealtimeState,
         secrets::{SecretUpsert, VaultEntrySummary, VaultSummary},
@@ -17962,15 +18025,18 @@ mod tests {
     use super::{
         COPY_LIVE_SOAK_DIR, COPY_UI_SETTINGS_PATH, CopyLiveAccountSummaries,
         CopyLiveSoakStartPayload, CopyPnlAccountSummary, CopyPnlPositionSummary,
-        CopyPnlReportSummary, CopyUiSettings, DashboardOpenOrderResponse, FibBasicConfig,
+        CopyPnlReportSummary, CopyUiSettings, DASHBOARD_OPEN_ORDERS_CACHE_TTL_MS,
+        DashboardOpenOrderResponse, DashboardOpenOrdersCacheEntry, FibBasicConfig,
         FibBasicLevelPlan, FibBasicPlan, FibInstanceRecord, FibInstanceStatus, FibOrderRef,
         FibPositionSnapshot, FibProfitLossMode, FibTradeDirection, FrontendAppState,
-        ManualSettingsPayload, NotificationSettings, NotificationSettingsPayload,
-        NotificationSettingsResponse, OrderStatusPayload, OrderStatusQuery, PerpFundingLayer,
-        PositionTruthSnapshot, ReadinessCheckResponse, SecretUsage, SpotFundingLayer,
-        VAULT_SESSION_TTL_MS, account_funding_next_actions, account_funding_summary,
-        aggregate_copy_local_account_summaries, apply_notification_settings_payload,
-        build_basic_plan, build_copy_live_soak_status_response_from_dir,
+        MANUAL_PROTECTIVE_RULES_CACHE_TTL_MS, ManualProtectiveRulesCacheEntry,
+        ManualProtectiveRulesResponse, ManualSettingsPayload, NotificationSettings,
+        NotificationSettingsPayload, NotificationSettingsResponse, OrderStatusPayload,
+        OrderStatusQuery, PerpFundingLayer, PositionTruthSnapshot, ReadinessCheckResponse,
+        SecretUsage, SpotFundingLayer, VAULT_SESSION_TTL_MS, account_funding_next_actions,
+        account_funding_summary, aggregate_copy_local_account_summaries,
+        apply_notification_settings_payload, build_basic_plan,
+        build_copy_live_soak_status_response_from_dir,
         build_copy_shadow_history_response_from_path, build_copy_summary_response_from_entries,
         build_fib_strategy_pnl_summary, build_position_truth_snapshot,
         copy_ledger_local_account_summaries_with_live_lineage, copy_ledger_position_summaries,
@@ -21159,6 +21225,98 @@ mod tests {
             crossed: true,
             fee: fee.to_string(),
         }
+    }
+
+    fn test_open_order(oid: u64, coin: &str) -> OpenOrder {
+        OpenOrder {
+            coin: coin.to_string(),
+            limit_px: "101".to_string(),
+            oid,
+            side: "A".to_string(),
+            sz: "0.1".to_string(),
+            timestamp: 1,
+            trigger_condition: "Trigger price above 100".to_string(),
+            is_trigger: true,
+            trigger_px: "100".to_string(),
+            is_position_tpsl: true,
+            reduce_only: true,
+            order_type: "Take Profit Market".to_string(),
+            orig_sz: "0.1".to_string(),
+            cloid: Some(format!("0x{oid:032x}")),
+        }
+    }
+
+    #[test]
+    fn dashboard_open_orders_stale_cache_is_available_for_network_fallback() {
+        let state = test_frontend_state_with_fib_records(Vec::new());
+        let cache_key = "xyz_perp::0x0000000000000000000000000000000000000001";
+        let stale_orders = vec![test_open_order(42, "ETH")];
+        state
+            .dashboard_open_orders_cache
+            .write()
+            .expect("dashboard open-orders cache")
+            .insert(
+                cache_key.to_string(),
+                DashboardOpenOrdersCacheEntry {
+                    fetched_at_ms: now_ms().saturating_sub(DASHBOARD_OPEN_ORDERS_CACHE_TTL_MS + 1),
+                    orders: stale_orders.clone(),
+                },
+            );
+
+        assert!(
+            state
+                .cached_dashboard_open_orders(cache_key)
+                .expect("fresh cache lookup")
+                .is_none()
+        );
+        assert_eq!(
+            state
+                .cached_dashboard_open_orders_any_age(cache_key)
+                .expect("stale fallback lookup")
+                .expect("stale cache should be retained")
+                .len(),
+            stale_orders.len()
+        );
+    }
+
+    #[test]
+    fn manual_protective_rules_stale_cache_is_available_for_network_fallback() {
+        let state = test_frontend_state_with_fib_records(Vec::new());
+        let cache_key = "mainnet|xyz_perp|addr_a|enabled_only";
+        let stale_response = ManualProtectiveRulesResponse {
+            environment: "mainnet".to_string(),
+            market: MARKET_XYZ_PERP.to_string(),
+            market_label: "XYZ Perp".to_string(),
+            dex: "xyz".to_string(),
+            include_disabled: false,
+            account_ids: vec!["addr_a".to_string()],
+            rules: Vec::new(),
+            fetched_at_ms: now_ms().saturating_sub(MANUAL_PROTECTIVE_RULES_CACHE_TTL_MS + 1),
+        };
+        state
+            .manual_protective_rules_cache
+            .write()
+            .expect("manual protective rules cache")
+            .insert(
+                cache_key.to_string(),
+                ManualProtectiveRulesCacheEntry {
+                    fetched_at_ms: stale_response.fetched_at_ms,
+                    response: stale_response,
+                },
+            );
+
+        assert!(
+            state
+                .cached_manual_protective_rules(cache_key)
+                .expect("fresh cache lookup")
+                .is_none()
+        );
+        assert!(
+            state
+                .cached_manual_protective_rules_any_age(cache_key)
+                .expect("stale fallback lookup")
+                .is_some()
+        );
     }
 
     #[test]

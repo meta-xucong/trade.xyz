@@ -850,18 +850,42 @@ async fn seed_account_snapshot_inner(
     config: &AppConfig,
     address: &str,
 ) -> Result<()> {
-    let default_orders = fetch_open_orders(&config.app.environment, "", address).await?;
-    let xyz_orders = fetch_open_orders(&config.app.environment, &config.hyperliquid.dex, address)
-        .await
-        .unwrap_or_default();
-    let cash_orders = fetch_open_orders(&config.app.environment, "cash", address)
-        .await
-        .unwrap_or_default();
-    let spot_and_default = split_default_and_spot_orders(default_orders);
-    state.replace_open_orders(MARKET_HL_PERP, address, spot_and_default.default_perp);
-    state.replace_open_orders(MARKET_SPOT, address, spot_and_default.spot);
-    state.replace_open_orders(MARKET_XYZ_PERP, address, xyz_orders);
-    state.replace_open_orders(MARKET_CASH_PERP, address, cash_orders);
+    match fetch_open_orders(&config.app.environment, "", address).await {
+        Ok(default_orders) => {
+            let spot_and_default = split_default_and_spot_orders(default_orders);
+            state.replace_open_orders(MARKET_HL_PERP, address, spot_and_default.default_perp);
+            state.replace_open_orders(MARKET_SPOT, address, spot_and_default.spot);
+        }
+        Err(error) => {
+            tracing::warn!(
+                %address,
+                error = %format!("{error:#}"),
+                "failed to seed default/spot open orders; preserving existing realtime cache"
+            );
+        }
+    }
+    match fetch_open_orders(&config.app.environment, &config.hyperliquid.dex, address).await {
+        Ok(xyz_orders) => state.replace_open_orders(MARKET_XYZ_PERP, address, xyz_orders),
+        Err(error) => {
+            tracing::warn!(
+                %address,
+                dex = %config.hyperliquid.dex,
+                error = %format!("{error:#}"),
+                "failed to seed dex open orders; preserving existing realtime cache"
+            );
+        }
+    }
+    match fetch_open_orders(&config.app.environment, "cash", address).await {
+        Ok(cash_orders) => state.replace_open_orders(MARKET_CASH_PERP, address, cash_orders),
+        Err(error) => {
+            tracing::warn!(
+                %address,
+                dex = "cash",
+                error = %format!("{error:#}"),
+                "failed to seed dex open orders; preserving existing realtime cache"
+            );
+        }
+    }
 
     if let Ok(default_state) =
         fetch_default_clearinghouse_state(&config.app.environment, address).await

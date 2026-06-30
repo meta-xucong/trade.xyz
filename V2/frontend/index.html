@@ -9156,6 +9156,12 @@
           };
           return map;
         } catch (error) {
+          if (cached && cached.rules_by_key) {
+            if (!silent) {
+              $("manualQuoteStatus").textContent = t("manual.quote.status_err", { error: error.message || String(error) });
+            }
+            return cached.rules_by_key || {};
+          }
           if (!silent) {
             $("manualQuoteStatus").textContent = t("manual.quote.status_err", { error: error.message || String(error) });
           }
