@@ -3587,6 +3587,7 @@ mod tests {
                 50.0,
                 0.05,
                 &held_position,
+                None,
                 contract,
                 &HashMap::new(),
             );
@@ -3683,6 +3684,7 @@ mod tests {
                 50.0,
                 0.05,
                 &low_margin_position,
+                None,
                 contract,
                 &HashMap::new(),
             );
@@ -5902,6 +5904,88 @@ mod tests {
         );
         assert!(detail.contains("1/1 account(s) healthy"));
         assert!(detail.contains("mapped_copy_principal=349.987500"));
+    }
+
+    #[test]
+    fn copy_live_daemon_submit_plan_contract_tolerates_snapshot_pnl_drift_after_all_opens_suppressed()
+     {
+        let mut options = follow_position_options();
+        options.max_total_notional_usd = 700.0;
+        let active_spcx = crate::strategies::smart_money::CopyLedgerEntry {
+            local_account_id: "addr_b".to_string(),
+            leader_id: "leader_4".to_string(),
+            leader_group: "leader_4".to_string(),
+            signal_id: "copy-leader_4-spcx-open-active".to_string(),
+            coin: "xyz:SPCX".to_string(),
+            local_side: crate::domain::OrderSide::Sell,
+            order_cloid: Some("66666666-6666-5666-8666-666666666666".to_string()),
+            order_oid: Some(9006),
+            submitted_at_ms: Some(now_ms()),
+            filled_at_ms: Some(now_ms()),
+            planned_notional_usd: 350.0,
+            pending_notional_usd: 0.0,
+            filled_notional_usd: 349.9875,
+            remaining_notional_usd: 349.9875,
+            status: crate::strategies::smart_money::CopyLedgerStatus::Open,
+        };
+        let snapshot = crate::strategies::smart_money::CopyPersistenceSnapshot {
+            schema_version: 1,
+            saved_at_ms: now_ms(),
+            seen_event_keys: Vec::new(),
+            ledger_entries: vec![active_spcx],
+        };
+        let reconciliations = vec![CopyBoundedLiveWindowReconcile {
+            account_id: "addr_b".to_string(),
+            ok: false,
+            open_order_count: Some(0),
+            asset_positions: Some(1),
+            position_summaries: vec![super::CopyBoundedLiveWindowPositionSummary {
+                coin: "xyz:SPCX".to_string(),
+                szi: "-2.25".to_string(),
+                position_value: Some("368.1225".to_string()),
+                unrealized_pnl: Some("-18.1350".to_string()),
+            }],
+            account_value: Some("61.37".to_string()),
+            withdrawable: Some("43.97".to_string()),
+            total_ntl_pos: Some("368.1225".to_string()),
+            total_margin_used: Some("17.40".to_string()),
+            error: None,
+        }];
+        let account_caps = HashMap::from([("addr_b".to_string(), 350.0)]);
+
+        let old_contract = super::copy_live_daemon_submit_plan_contract_with_account_caps(
+            &options,
+            &[],
+            &[],
+            0.0,
+            0.0,
+            &reconciliations,
+            &account_caps,
+        );
+        assert!(!old_contract.ok, "{old_contract:#?}");
+
+        let snapshot_contract =
+            super::copy_live_daemon_submit_plan_contract_with_snapshot_and_account_caps(
+                &options,
+                &[],
+                &[],
+                0.0,
+                0.0,
+                &reconciliations,
+                &snapshot,
+                &account_caps,
+            );
+
+        assert!(snapshot_contract.ok, "{snapshot_contract:#?}");
+        assert!(
+            snapshot_contract
+                .checks
+                .iter()
+                .any(|check| check.name == "pre_submit_reconcile_health"
+                    && check.ok
+                    && check.detail.contains("mapped_copy_principal=349.987500")),
+            "{snapshot_contract:#?}"
+        );
     }
 
     #[test]
@@ -11502,13 +11586,14 @@ async fn run_copy_live_daemon_supervisor(
                                 let pending_estimated_fees_usd =
                                     normalize_report_zero(pending_planned_notional_usd * 0.001);
                                 let immediate_contract =
-                                    copy_live_daemon_submit_plan_contract_with_account_caps(
+                                    copy_live_daemon_submit_plan_contract_with_snapshot_and_account_caps(
                                         &options,
                                         &pending_executable_refs,
                                         &candidate_suppressed_refs,
                                         pending_planned_notional_usd,
                                         pending_estimated_fees_usd,
                                         &immediate_reconciliations,
+                                        &immediate_snapshot,
                                         &account_symbol_caps,
                                     );
                                 let (
@@ -11522,6 +11607,7 @@ async fn run_copy_live_daemon_supervisor(
                                     pending_planned_notional_usd,
                                     pending_estimated_fees_usd,
                                     &immediate_reconciliations,
+                                    Some(&immediate_snapshot),
                                     immediate_contract,
                                     &account_symbol_caps,
                                 );
@@ -11700,13 +11786,14 @@ async fn run_copy_live_daemon_supervisor(
     let planned_notional_usd =
         copy_live_daemon_open_notional_usd_from_orders(&executable_would_submit_orders);
     let estimated_fees_usd = normalize_report_zero(planned_notional_usd * 0.001);
-    let submit_plan_contract = copy_live_daemon_submit_plan_contract_with_account_caps(
+    let submit_plan_contract = copy_live_daemon_submit_plan_contract_with_snapshot_and_account_caps(
         &options,
         &executable_submit_plan_refs,
         &suppressed_submit_plan_refs,
         planned_notional_usd,
         estimated_fees_usd,
         &pre_submit_reconciliations,
+        &saved,
         &account_symbol_caps,
     );
     let (
@@ -11720,6 +11807,7 @@ async fn run_copy_live_daemon_supervisor(
         planned_notional_usd,
         estimated_fees_usd,
         &pre_submit_reconciliations,
+        Some(&saved),
         submit_plan_contract,
         &account_symbol_caps,
     );
@@ -11815,13 +11903,14 @@ async fn run_copy_live_daemon_supervisor(
                 message: suppressed.message.clone(),
             })
             .collect::<Vec<_>>();
-        submit_plan_contract = copy_live_daemon_submit_plan_contract_with_account_caps(
+        submit_plan_contract = copy_live_daemon_submit_plan_contract_with_snapshot_and_account_caps(
             &options,
             &executable_submit_plan_refs,
             &suppressed_submit_plan_refs,
             planned_notional_usd,
             estimated_fees_usd,
             &pre_submit_reconciliations,
+            &saved,
             &account_symbol_caps,
         );
     }
@@ -12800,6 +12889,7 @@ fn copy_live_daemon_submit_plan_contract(
     )
 }
 
+#[cfg(test)]
 fn copy_live_daemon_submit_plan_contract_with_account_caps(
     options: &CopyLiveDaemonSupervisorOptions,
     executable_refs: &[CopyLiveDaemonWouldSubmitRef],
@@ -12807,6 +12897,50 @@ fn copy_live_daemon_submit_plan_contract_with_account_caps(
     planned_notional_usd: f64,
     estimated_fees_usd: f64,
     final_reconciliations: &[CopyBoundedLiveWindowReconcile],
+    account_exposure_caps: &HashMap<String, f64>,
+) -> CopyLiveDaemonSubmitPlanContract {
+    copy_live_daemon_submit_plan_contract_impl(
+        options,
+        executable_refs,
+        suppressed_refs,
+        planned_notional_usd,
+        estimated_fees_usd,
+        final_reconciliations,
+        None,
+        account_exposure_caps,
+    )
+}
+
+fn copy_live_daemon_submit_plan_contract_with_snapshot_and_account_caps(
+    options: &CopyLiveDaemonSupervisorOptions,
+    executable_refs: &[CopyLiveDaemonWouldSubmitRef],
+    suppressed_refs: &[CopyLiveDaemonSuppressedWouldSubmitRef],
+    planned_notional_usd: f64,
+    estimated_fees_usd: f64,
+    final_reconciliations: &[CopyBoundedLiveWindowReconcile],
+    snapshot: &strategies::smart_money::CopyPersistenceSnapshot,
+    account_exposure_caps: &HashMap<String, f64>,
+) -> CopyLiveDaemonSubmitPlanContract {
+    copy_live_daemon_submit_plan_contract_impl(
+        options,
+        executable_refs,
+        suppressed_refs,
+        planned_notional_usd,
+        estimated_fees_usd,
+        final_reconciliations,
+        Some(snapshot),
+        account_exposure_caps,
+    )
+}
+
+fn copy_live_daemon_submit_plan_contract_impl(
+    options: &CopyLiveDaemonSupervisorOptions,
+    executable_refs: &[CopyLiveDaemonWouldSubmitRef],
+    suppressed_refs: &[CopyLiveDaemonSuppressedWouldSubmitRef],
+    planned_notional_usd: f64,
+    estimated_fees_usd: f64,
+    final_reconciliations: &[CopyBoundedLiveWindowReconcile],
+    snapshot: Option<&strategies::smart_money::CopyPersistenceSnapshot>,
     account_exposure_caps: &HashMap<String, f64>,
 ) -> CopyLiveDaemonSubmitPlanContract {
     let executable_cloids = executable_refs
@@ -13018,6 +13152,13 @@ fn copy_live_daemon_submit_plan_contract_with_account_caps(
                     executable_refs,
                     final_reconciliations,
                 )
+            } else if let Some(snapshot) = snapshot {
+                copy_live_daemon_reconciliations_healthy_for_snapshot_with_account_caps(
+                    options,
+                    final_reconciliations,
+                    snapshot,
+                    account_exposure_caps,
+                )
             } else {
                 copy_live_daemon_reconciliations_healthy_for_mode_with_account_caps(
                     options,
@@ -13029,6 +13170,13 @@ fn copy_live_daemon_submit_plan_contract_with_account_caps(
                 copy_live_daemon_reduce_only_reconcile_health_detail(
                     executable_refs,
                     final_reconciliations,
+                )
+            } else if let Some(snapshot) = snapshot {
+                copy_live_daemon_reconcile_health_detail_for_snapshot_with_account_caps(
+                    options,
+                    final_reconciliations,
+                    snapshot,
+                    account_exposure_caps,
                 )
             } else {
                 copy_live_daemon_reconcile_health_detail_with_account_caps(
@@ -13135,6 +13283,7 @@ fn copy_live_daemon_suppress_refs_rejected_by_submit_contract(
     planned_notional_usd: f64,
     estimated_fees_usd: f64,
     reconciliations: &[CopyBoundedLiveWindowReconcile],
+    snapshot: Option<&strategies::smart_money::CopyPersistenceSnapshot>,
     contract: CopyLiveDaemonSubmitPlanContract,
     account_exposure_caps: &HashMap<String, f64>,
 ) -> (
@@ -13216,13 +13365,14 @@ fn copy_live_daemon_suppress_refs_rejected_by_submit_contract(
     } else {
         0.0
     };
-    let adjusted_contract = copy_live_daemon_submit_plan_contract_with_account_caps(
+    let adjusted_contract = copy_live_daemon_submit_plan_contract_impl(
         options,
         &retained_executable,
         &all_suppressed_refs,
         adjusted_planned_notional_usd,
         adjusted_estimated_fees_usd,
         reconciliations,
+        snapshot,
         account_exposure_caps,
     );
     (retained_executable, newly_suppressed, adjusted_contract)
