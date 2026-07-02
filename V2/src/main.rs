@@ -7879,6 +7879,9 @@ mod tests {
             "copy submit skipped before exchange: addr_b xyz:SP500 requested_notional=11.172000 effective_notional=7.416100 below exchange minimum 10.000000"
         ));
         assert!(copy_live_daemon_error_is_safe_pre_submit_skip(
+            "order size rounds to zero for xyz:GME at notional 0.2269 and price 22.693"
+        ));
+        assert!(copy_live_daemon_error_is_safe_pre_submit_skip(
             "exchange returned action-level order error: Order must have minimum value of $10. asset=110052"
         ));
         assert!(!copy_live_daemon_error_is_safe_pre_submit_skip(
@@ -7890,6 +7893,51 @@ mod tests {
         assert!(!copy_live_daemon_error_is_safe_pre_submit_skip(
             "failed to fetch order evidence after copy submit"
         ));
+    }
+
+    #[test]
+    fn copy_live_daemon_live_submit_health_accepts_round206_safe_skip_shape() {
+        let report = CopyLiveDaemonPersistentLiveSubmitReport {
+            ok: true,
+            mode: "persistent_live_submit".to_string(),
+            submit_requested: true,
+            submit_plan_contract_ok: true,
+            submitted_reports: vec![crate::domain::WorkerReport::Error(
+                crate::domain::WorkerError {
+                    worker_id: "worker-addr_b".to_string(),
+                    account_id: "addr_b".to_string(),
+                    message:
+                        "order size rounds to zero for xyz:GME at notional 0.2269 and price 22.693"
+                            .to_string(),
+                    error_at_ms: now_ms(),
+                },
+            )],
+            order_evidence: Vec::new(),
+            cleanup_runbooks: Vec::new(),
+            cleanup_errors: Vec::new(),
+            ledger_reconciliations: Vec::new(),
+            ledger_reconciliation_snapshot:
+                crate::strategies::smart_money::CopyPersistenceSnapshot::empty(),
+            checks: vec![
+                copy_shadow_smoke_check(
+                    "submitted_reports",
+                    true,
+                    "0 live submitted report(s), 1 pre-submit skipped ref(s), for 1 submit-eligible ref(s); 0 reduce-only no-op ref(s) skipped",
+                ),
+                copy_shadow_smoke_check(
+                    "order_status_evidence",
+                    true,
+                    "0 live submitted report(s), 0 order evidence record(s)",
+                ),
+                copy_shadow_smoke_check(
+                    "persistent_live_submit_chunks",
+                    true,
+                    "1 persistent live submit chunk(s) merged",
+                ),
+            ],
+        };
+
+        assert!(copy_live_daemon_live_submit_health_ok(&report));
     }
 
     #[test]
@@ -14479,6 +14527,7 @@ fn copy_live_daemon_error_is_safe_pre_submit_skip(message: &str) -> bool {
         || normalized.contains("copy_live_leverage_update_timeout")
         || normalized.contains("copy submit skipped before exchange")
             && normalized.contains("below exchange minimum")
+        || normalized.contains("order size rounds to zero for ")
         || normalized.contains("exchange returned action-level order error")
             && normalized.contains("minimum value")
         || normalized.contains("exchange returned action-level order error")
