@@ -107,9 +107,6 @@ pub fn evaluate_copy_signal_risk(input: CopySignalRiskInput<'_>) -> CopySignalRi
     if !input.leader_enabled {
         return copy_risk_rejected("COPY_LEADER_DISABLED");
     }
-    if input.now_ms.saturating_sub(input.action.received_at_ms) > input.max_signal_delay_ms {
-        return copy_risk_rejected("COPY_SIGNAL_TOO_OLD");
-    }
     if !matches!(input.action.confidence, LeaderActionConfidence::Strong) {
         return copy_risk_rejected("COPY_ACTION_AMBIGUOUS");
     }

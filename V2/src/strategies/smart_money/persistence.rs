@@ -3,7 +3,9 @@ use std::{collections::HashSet, fs, path::Path};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use super::{CopyLedger, CopyLedgerEntry};
+use super::{
+    CopyLedger, CopyLedgerEntry, CopyLedgerStatus, copy_ledger_entry_has_execution_evidence,
+};
 
 const COPY_PERSISTENCE_SCHEMA_VERSION: u32 = 1;
 
@@ -82,7 +84,7 @@ pub fn load_copy_persistence_snapshot(path: &Path) -> Result<CopyPersistenceSnap
     if raw.trim().is_empty() {
         return Ok(CopyPersistenceSnapshot::empty());
     }
-    let snapshot = serde_json::from_str::<CopyPersistenceSnapshot>(&raw)
+    let mut snapshot = serde_json::from_str::<CopyPersistenceSnapshot>(&raw)
         .with_context(|| format!("failed to parse copy persistence {}", path.display()))?;
     if snapshot.schema_version != COPY_PERSISTENCE_SCHEMA_VERSION {
         anyhow::bail!(
@@ -90,5 +92,13 @@ pub fn load_copy_persistence_snapshot(path: &Path) -> Result<CopyPersistenceSnap
             snapshot.schema_version
         );
     }
+    snapshot
+        .ledger_entries
+        .retain(copy_persistence_entry_is_safe_to_load);
     Ok(snapshot)
+}
+
+pub fn copy_persistence_entry_is_safe_to_load(entry: &CopyLedgerEntry) -> bool {
+    !matches!(entry.status, CopyLedgerStatus::Open)
+        || copy_ledger_entry_has_execution_evidence(entry)
 }

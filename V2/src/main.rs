@@ -1246,6 +1246,18 @@ mod tests {
     }
 
     #[test]
+    fn copy_live_daemon_watcher_progress_allows_submit_candidate_priority_stop() {
+        let check = copy_live_daemon_watcher_progress_check(
+            "stopped_after_submit_candidate",
+            42,
+            600,
+            45_000,
+        );
+        assert!(check.ok, "{check:#?}");
+        assert!(check.detail.contains("pre-submit checks and live submit"));
+    }
+
+    #[test]
     fn copy_live_daemon_immediate_submit_stop_requires_live_submission() {
         let submitted_at_ms = now_ms();
         let live_report = CopyLiveDaemonPersistentLiveSubmitReport {
@@ -4744,7 +4756,7 @@ mod tests {
             order_cloid: None,
             order_oid: None,
             submitted_at_ms: Some(1_000),
-            filled_at_ms: None,
+            filled_at_ms: Some(1_100),
             planned_notional_usd: 162.20,
             pending_notional_usd: 0.0,
             filled_notional_usd: 162.20,
@@ -4807,7 +4819,7 @@ mod tests {
             order_cloid: None,
             order_oid: None,
             submitted_at_ms: Some(1_000),
-            filled_at_ms: None,
+            filled_at_ms: Some(1_100),
             planned_notional_usd: 500.0,
             pending_notional_usd: 0.0,
             filled_notional_usd: 500.0,
@@ -7297,6 +7309,50 @@ mod tests {
             &[unselected_ref]
         ));
         Ok(())
+    }
+
+    #[test]
+    fn copy_live_daemon_accounts_for_refs_scopes_immediate_precheck() {
+        let addr_a_ref = CopyLiveDaemonWouldSubmitRef {
+            record_index: 0,
+            signal_id: "sig-a".to_string(),
+            leader_id: "leader_a".to_string(),
+            leader_address: "0x00000000000000000000000000000000000000aa".to_string(),
+            order: CopyExecutionCanaryWouldSubmit {
+                account_id: "addr_a".to_string(),
+                worker_id: "worker-addr_a".to_string(),
+                coin: "xyz:XYZ100".to_string(),
+                side: crate::domain::OrderSide::Buy,
+                notional_usd: 25.0,
+                reduce_only: false,
+                cloid: "aaaaaaaa-aaaa-5aaa-8aaa-aaaaaaaaaaaa".to_string(),
+            },
+        };
+        let duplicate_addr_a_ref = CopyLiveDaemonWouldSubmitRef {
+            order: CopyExecutionCanaryWouldSubmit {
+                cloid: "bbbbbbbb-bbbb-5bbb-8bbb-bbbbbbbbbbbb".to_string(),
+                ..addr_a_ref.order.clone()
+            },
+            ..addr_a_ref.clone()
+        };
+        let addr_b_ref = CopyLiveDaemonWouldSubmitRef {
+            order: CopyExecutionCanaryWouldSubmit {
+                account_id: "addr_b".to_string(),
+                worker_id: "worker-addr_b".to_string(),
+                cloid: "cccccccc-cccc-5ccc-8ccc-cccccccccccc".to_string(),
+                ..addr_a_ref.order.clone()
+            },
+            ..addr_a_ref.clone()
+        };
+
+        assert_eq!(
+            super::copy_live_daemon_accounts_for_refs(&[
+                addr_b_ref,
+                addr_a_ref,
+                duplicate_addr_a_ref
+            ]),
+            vec!["addr_a".to_string(), "addr_b".to_string()]
+        );
     }
 
     #[test]
@@ -11455,6 +11511,7 @@ async fn run_copy_live_daemon_supervisor(
     let mut live_submit_chunks = Vec::new();
     let mut pending_unclassified_fill_count = 0usize;
     let mut pending_unclassified_fill_labels = Vec::new();
+    let mut stop_for_submit_candidate = false;
     let started = Instant::now();
 
     if acceptance.ok && local_account.is_some() && !watcher_leaders.is_empty() {
@@ -11536,118 +11593,14 @@ async fn run_copy_live_daemon_supervisor(
                         );
                         approved_records.extend(new_approved_records);
                         if options.submit {
-                            let immediate_reconciliations =
-                                reconcile_copy_bounded_window_accounts_bounded(
-                                    config,
-                                    &target_accounts,
-                                    "immediate_submit_precheck",
-                                )
-                                .await;
-                            let immediate_snapshot = pipelines.iter().fold(
-                                persistence.clone(),
-                                |snapshot, (_, pipeline)| {
-                                    copy_live_daemon_merge_persistence_snapshots(
-                                        snapshot,
-                                        pipeline.persistence_snapshot(now),
-                                    )
-                                },
-                            );
                             let pending_candidate_plan_refs = copy_live_daemon_pending_plan_refs(
                                 &would_submit_plan_refs,
                                 &submitted_plan_cloids,
                             );
-                            let account_symbol_caps =
-                                copy_live_daemon_account_symbol_caps(config, &target_accounts);
-                            let (candidate_executable_refs, mut candidate_suppressed_refs) =
-                                copy_live_daemon_executable_refs_for_snapshot_with_symbol_caps(
-                                    &pending_candidate_plan_refs,
-                                    &options,
-                                    &immediate_snapshot,
-                                    &immediate_reconciliations,
-                                    &account_symbol_caps,
-                                );
-                            let (candidate_executable_refs, mut effective_min_suppressed_refs) =
-                                copy_live_daemon_suppress_refs_below_effective_min(
-                                    config,
-                                    &options,
-                                    &candidate_executable_refs,
-                                )
-                                .await;
-                            candidate_suppressed_refs.append(&mut effective_min_suppressed_refs);
-                            let pending_executable_refs = candidate_executable_refs
-                                .into_iter()
-                                .filter(|plan| !submitted_plan_cloids.contains(&plan.order.cloid))
-                                .collect::<Vec<_>>();
-                            if !pending_executable_refs.is_empty() {
-                                let pending_planned_notional_usd =
-                                    copy_live_daemon_open_notional_usd_from_refs(
-                                        &pending_executable_refs,
-                                    );
-                                let pending_estimated_fees_usd =
-                                    normalize_report_zero(pending_planned_notional_usd * 0.001);
-                                let immediate_contract =
-                                    copy_live_daemon_submit_plan_contract_with_snapshot_and_account_caps(
-                                        &options,
-                                        &pending_executable_refs,
-                                        &candidate_suppressed_refs,
-                                        pending_planned_notional_usd,
-                                        pending_estimated_fees_usd,
-                                        &immediate_reconciliations,
-                                        &immediate_snapshot,
-                                        &account_symbol_caps,
-                                    );
-                                let (
-                                    pending_executable_refs,
-                                    mut contract_suppressed_refs,
-                                    immediate_contract,
-                                ) = copy_live_daemon_suppress_refs_rejected_by_submit_contract(
-                                    &options,
-                                    pending_executable_refs,
-                                    candidate_suppressed_refs.clone(),
-                                    pending_planned_notional_usd,
-                                    pending_estimated_fees_usd,
-                                    &immediate_reconciliations,
-                                    Some(&immediate_snapshot),
-                                    immediate_contract,
-                                    &account_symbol_caps,
-                                );
-                                let mut candidate_suppressed_refs = candidate_suppressed_refs;
-                                candidate_suppressed_refs.append(&mut contract_suppressed_refs);
-                                let immediate_submit = copy_live_daemon_persistent_live_submit(
-                                    config,
-                                    &options,
-                                    &immediate_contract,
-                                    &pending_executable_refs,
-                                    &candidate_suppressed_refs,
-                                    &immediate_snapshot,
-                                    &approved_records,
-                                )
-                                .await;
-                                for plan in &pending_executable_refs {
-                                    submitted_plan_cloids.insert(plan.order.cloid.clone());
-                                }
-                                let submit_ok =
-                                    copy_live_daemon_live_submit_health_ok(&immediate_submit);
-                                let stop_after_live_submit =
-                                    copy_live_daemon_immediate_submit_should_stop_round(
-                                        &immediate_submit,
-                                    );
-                                live_submit_chunks.push(immediate_submit);
-                                if !submit_ok {
-                                    checks.push(copy_shadow_smoke_check(
-                                        "immediate_live_submit",
-                                        false,
-                                        "immediate persistent live submit failed health checks",
-                                    ));
-                                    input.watcher_status =
-                                        "stopped_immediate_submit_failed".to_string();
-                                    break;
-                                }
-                                if stop_after_live_submit {
-                                    input.watcher_status =
-                                        "stopped_after_immediate_live_submit".to_string();
-                                    break;
-                                }
+                            if !pending_candidate_plan_refs.is_empty() {
+                                stop_for_submit_candidate = true;
+                                input.watcher_status = "stopped_after_submit_candidate".to_string();
+                                break;
                             }
                         }
                     }
@@ -11737,9 +11690,22 @@ async fn run_copy_live_daemon_supervisor(
 
     input.elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
     let saved = strategies::smart_money::load_copy_persistence_snapshot(&options.persistence_path)?;
+    let preliminary_pending_would_submit_plan_refs =
+        copy_live_daemon_pending_plan_refs(&would_submit_plan_refs, &submitted_plan_cloids);
+    let pre_submit_accounts = if options.submit && stop_for_submit_candidate {
+        let accounts =
+            copy_live_daemon_accounts_for_refs(&preliminary_pending_would_submit_plan_refs);
+        if accounts.is_empty() {
+            target_accounts.clone()
+        } else {
+            accounts
+        }
+    } else {
+        target_accounts.clone()
+    };
     let pre_submit_reconciliations = reconcile_copy_bounded_window_accounts_bounded(
         config,
-        &target_accounts,
+        &pre_submit_accounts,
         "pre_submit_reconcile",
     )
     .await;
@@ -12170,6 +12136,7 @@ fn normalize_report_zero(value: f64) -> f64 {
     }
 }
 
+#[cfg(test)]
 fn copy_live_daemon_open_notional_usd_from_refs(refs: &[CopyLiveDaemonWouldSubmitRef]) -> f64 {
     normalize_report_zero(
         refs.iter()
@@ -12293,6 +12260,7 @@ fn copy_live_daemon_watcher_progress_check(
     elapsed_ms: u64,
 ) -> CopyShadowSmokeCheck {
     let status = watcher_status.to_ascii_lowercase();
+    let stopped_for_submit_candidate = status == "stopped_after_submit_candidate";
     let disconnected_before_progress = events_received == 0
         && matches!(
             status.as_str(),
@@ -12307,6 +12275,10 @@ fn copy_live_daemon_watcher_progress_check(
         if disconnected_before_progress {
             format!(
                 "watcher ended before receiving any events: status={watcher_status} events_received=0 elapsed_ms={elapsed_ms} duration_secs={duration_secs}; restart/backoff required before treating this as a healthy monitoring window"
+            )
+        } else if stopped_for_submit_candidate {
+            format!(
+                "watcher stopped after submit candidate so pre-submit checks and live submit can run before lower-priority event consumption: events_received={events_received} elapsed_ms={elapsed_ms} duration_secs={duration_secs}"
             )
         } else {
             format!(
@@ -15944,6 +15916,19 @@ fn copy_live_daemon_pending_suppressed_refs(
         .collect()
 }
 
+fn copy_live_daemon_accounts_for_refs(refs: &[CopyLiveDaemonWouldSubmitRef]) -> Vec<String> {
+    let mut accounts = refs
+        .iter()
+        .filter_map(|plan| {
+            let account_id = plan.order.account_id.trim();
+            (!account_id.is_empty()).then(|| account_id.to_string())
+        })
+        .collect::<Vec<_>>();
+    accounts.sort();
+    accounts.dedup();
+    accounts
+}
+
 fn copy_live_daemon_defer_open_refs_after_immediate_live_submit(
     refs: Vec<CopyLiveDaemonWouldSubmitRef>,
     live_submit_chunks: &[CopyLiveDaemonPersistentLiveSubmitReport],
@@ -16454,7 +16439,9 @@ fn copy_live_daemon_prepare_refs_for_follow_position_limits_with_symbol_caps(
             {
                 entry.pending_notional_usd.max(0.0)
             }
-            strategies::smart_money::CopyLedgerStatus::Open => {
+            strategies::smart_money::CopyLedgerStatus::Open
+                if strategies::smart_money::copy_ledger_entry_has_execution_evidence(entry) =>
+            {
                 entry.remaining_notional_usd.max(0.0)
             }
             strategies::smart_money::CopyLedgerStatus::PendingReduce
@@ -16464,6 +16451,7 @@ fn copy_live_daemon_prepare_refs_for_follow_position_limits_with_symbol_caps(
                 -entry.pending_notional_usd.max(0.0)
             }
             strategies::smart_money::CopyLedgerStatus::PendingOpen
+            | strategies::smart_money::CopyLedgerStatus::Open
             | strategies::smart_money::CopyLedgerStatus::PendingReduce
             | strategies::smart_money::CopyLedgerStatus::PendingClose => 0.0,
             strategies::smart_money::CopyLedgerStatus::Closed
@@ -16630,8 +16618,7 @@ fn copy_live_daemon_ledger_entry_has_submission(
 fn copy_live_daemon_ledger_entry_has_live_order_evidence(
     entry: &strategies::smart_money::CopyLedgerEntry,
 ) -> bool {
-    copy_live_daemon_ledger_entry_has_submission(entry)
-        || entry.filled_at_ms.is_some()
+    strategies::smart_money::copy_ledger_entry_has_execution_evidence(entry)
         || entry.filled_notional_usd > 0.0
 }
 
@@ -16700,6 +16687,9 @@ fn copy_live_daemon_persistence_snapshot_for_save(
     mut snapshot: strategies::smart_money::CopyPersistenceSnapshot,
 ) -> strategies::smart_money::CopyPersistenceSnapshot {
     snapshot.ledger_entries.retain(|entry| {
+        if !strategies::smart_money::copy_persistence_entry_is_safe_to_load(entry) {
+            return false;
+        }
         !matches!(
             entry.status,
             strategies::smart_money::CopyLedgerStatus::PendingOpen
@@ -17001,7 +16991,7 @@ fn copy_live_daemon_recover_open_ledger_from_live_positions(
                     order_cloid: None,
                     order_oid: None,
                     submitted_at_ms: Some(shadow.occurred_at_ms),
-                    filled_at_ms: None,
+                    filled_at_ms: Some(domain::now_ms()),
                     planned_notional_usd: position_notional,
                     pending_notional_usd: 0.0,
                     filled_notional_usd: position_notional,
@@ -17305,7 +17295,6 @@ fn copy_live_daemon_open_entry_has_order_evidence(
             .order_cloid
             .as_deref()
             .is_some_and(|cloid| !cloid.trim().is_empty())
-        || entry.filled_at_ms.is_some()
 }
 
 fn copy_live_daemon_deduplicate_recovered_open_entries(

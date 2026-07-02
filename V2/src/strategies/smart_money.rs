@@ -18,9 +18,13 @@ mod shadow_history;
 mod watcher;
 
 pub use conflict::{CopyConflictInput, CopyConflictResolution, resolve_copy_conflict};
-pub use ledger::{CopyLedger, CopyLedgerEntry, CopyLedgerReconcileResult, CopyLedgerStatus};
+pub use ledger::{
+    CopyLedger, CopyLedgerEntry, CopyLedgerReconcileResult, CopyLedgerStatus,
+    copy_ledger_entry_has_execution_evidence,
+};
 pub use persistence::{
-    CopyPersistenceSnapshot, load_copy_persistence_snapshot, save_copy_persistence_snapshot,
+    CopyPersistenceSnapshot, copy_persistence_entry_is_safe_to_load,
+    load_copy_persistence_snapshot, save_copy_persistence_snapshot,
 };
 pub use risk::{
     CopyLiveGateDecision, CopyLiveGateInput, CopySignalRiskDecision, CopySignalRiskInput,
@@ -1834,7 +1838,7 @@ mod tests {
     }
 
     #[test]
-    fn copy_risk_rejects_disabled_or_stale_leader_signal() {
+    fn copy_risk_rejects_disabled_but_delay_does_not_change_signal_behavior() {
         let action = semantic_action(
             "risk-open-1",
             LeaderActionKind::OpenLong,
@@ -1857,8 +1861,10 @@ mod tests {
                 max_signal_delay_ms: 10_000,
                 ..risk_input(&action)
             }),
-            CopySignalRiskDecision::Rejected {
-                reason_code: "COPY_SIGNAL_TOO_OLD".to_string(),
+            CopySignalRiskDecision::Approved {
+                side: OrderSide::Buy,
+                reduce_only: false,
+                notional_usd: 20.0,
             }
         );
     }
@@ -3273,6 +3279,79 @@ mod tests {
     }
 
     #[test]
+    fn copy_ledger_open_without_execution_evidence_is_not_mapped_exposure() {
+        let mut ghost_open = ledger_entry(
+            "sig-ghost-open",
+            OrderSide::Buy,
+            30.0,
+            0.0,
+            30.0,
+            30.0,
+            CopyLedgerStatus::Open,
+        );
+        ghost_open.order_cloid = None;
+        ghost_open.order_oid = None;
+        ghost_open.submitted_at_ms = None;
+        ghost_open.filled_at_ms = None;
+
+        let mut ledger = CopyLedger::new();
+        ledger.push(ghost_open);
+
+        assert_eq!(
+            ledger.effective_exposure_usd("addr_a", "xyz:XYZ100", OrderSide::Buy),
+            0.0
+        );
+        assert_eq!(
+            ledger.mapped_close_notional_usd("addr_a", "xyz:XYZ100", OrderSide::Sell),
+            0.0
+        );
+    }
+
+    #[test]
+    fn copy_persistence_load_drops_open_without_execution_evidence() {
+        let now = now_ms();
+        let dir = std::env::temp_dir().join(format!("trade_xyz_copy_persistence_ghost_{now}"));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("snapshot.json");
+        let mut ghost_open = ledger_entry(
+            "sig-ghost-open",
+            OrderSide::Buy,
+            30.0,
+            0.0,
+            30.0,
+            30.0,
+            CopyLedgerStatus::Open,
+        );
+        ghost_open.order_cloid = None;
+        ghost_open.order_oid = None;
+        ghost_open.submitted_at_ms = None;
+        ghost_open.filled_at_ms = None;
+        let mut real_open = ledger_entry(
+            "sig-real-open",
+            OrderSide::Buy,
+            20.0,
+            0.0,
+            20.0,
+            20.0,
+            CopyLedgerStatus::Open,
+        );
+        real_open.order_cloid = Some("11111111-1111-5111-8111-111111111111".to_string());
+        let snapshot = CopyPersistenceSnapshot {
+            schema_version: 1,
+            saved_at_ms: now,
+            seen_event_keys: vec!["event-a".to_string()],
+            ledger_entries: vec![ghost_open, real_open],
+        };
+        save_copy_persistence_snapshot(&path, &snapshot).expect("save snapshot");
+
+        let loaded = load_copy_persistence_snapshot(&path).expect("load snapshot");
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(loaded.ledger_entries.len(), 1);
+        assert_eq!(loaded.ledger_entries[0].signal_id, "sig-real-open");
+    }
+
+    #[test]
     fn copy_ledger_reconciles_filled_open_submission() {
         let mut ledger = CopyLedger::new();
         ledger.push(ledger_entry(
@@ -4340,7 +4419,7 @@ mod tests {
             order_cloid: None,
             order_oid: None,
             submitted_at_ms: None,
-            filled_at_ms: None,
+            filled_at_ms: matches!(status, CopyLedgerStatus::Open).then_some(now_ms()),
             planned_notional_usd,
             pending_notional_usd,
             filled_notional_usd,

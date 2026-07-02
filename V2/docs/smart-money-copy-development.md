@@ -165,8 +165,12 @@ Responsibilities:
 Responsibilities:
 
 - enforce copy-specific risk checks before portfolio/execution checks;
-- reject stale, duplicated, blacklisted, ambiguous, oversized, or unmapped
-  events with stable reason codes.
+- reject duplicated, blacklisted, ambiguous, oversized, or unmapped events with
+  stable reason codes.
+- Treat leader/signal delay as an observable latency metric, not as a behavior
+  switch. A delayed open, increase, reduce, or close must still follow the same
+  copy decision rules as a fresh signal; delayed signals are not rejected merely
+  because `max_signal_delay_ms` was exceeded.
 
 ## Data Model
 
@@ -532,6 +536,8 @@ Recommended TOML shape:
 [strategies.smart_money_copy.main]
 enabled = true
 mode = "dry_run"
+# Observability/alerting only for copy signals; it must not change whether an
+# otherwise valid open/increase/reduce/close is copied.
 max_signal_delay_ms = 1500
 dedupe_window_secs = 3600
 conflict_window_ms = 500

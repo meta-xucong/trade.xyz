@@ -94,9 +94,13 @@ The practical boundary is:
 
 Recommended defaults:
 
-- `max_signal_delay_ms`: short enough for scalp protection, but configurable by profile.
-- scalp profile: strict delay and slippage, smaller principal cap, no tail-chasing increases;
-- swing profile: wider delay tolerance, same mapped-close discipline.
+- `max_signal_delay_ms`: observability and alerting threshold only. It must not
+  change open/increase/reduce/close behavior by itself.
+- scalp profile: strict slippage, smaller principal cap, no tail-chasing
+  increases;
+- swing profile: wider alert tolerance, same mapped-close discipline.
+- When high signal delay is observed, optimize the event path and scheduling
+  priority. Do not "fix" delay by refusing otherwise valid copy signals.
 
 ### Sizing And Risk
 

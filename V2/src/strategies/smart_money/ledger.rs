@@ -436,13 +436,13 @@ impl CopyLedger {
                 CopyLedgerStatus::PendingOpen => {
                     open_notional += entry.pending_notional_usd.max(0.0);
                 }
-                CopyLedgerStatus::Open => {
+                CopyLedgerStatus::Open if copy_ledger_entry_has_execution_evidence(entry) => {
                     open_notional += entry.remaining_notional_usd.max(0.0);
                 }
                 CopyLedgerStatus::PendingReduce | CopyLedgerStatus::PendingClose => {
                     pending_reduce_notional += entry.pending_notional_usd.max(0.0);
                 }
-                CopyLedgerStatus::Closed | CopyLedgerStatus::Rejected => {}
+                CopyLedgerStatus::Open | CopyLedgerStatus::Closed | CopyLedgerStatus::Rejected => {}
             }
         }
 
@@ -483,7 +483,7 @@ impl CopyLedger {
                 CopyLedgerStatus::PendingOpen if copy_ledger_entry_has_submission(entry) => {
                     open_notional += entry.pending_notional_usd.max(0.0);
                 }
-                CopyLedgerStatus::Open => {
+                CopyLedgerStatus::Open if copy_ledger_entry_has_execution_evidence(entry) => {
                     open_notional += entry.remaining_notional_usd.max(0.0);
                 }
                 CopyLedgerStatus::PendingReduce | CopyLedgerStatus::PendingClose
@@ -492,6 +492,7 @@ impl CopyLedger {
                     pending_reduce_notional += entry.pending_notional_usd.max(0.0);
                 }
                 CopyLedgerStatus::PendingOpen
+                | CopyLedgerStatus::Open
                 | CopyLedgerStatus::PendingReduce
                 | CopyLedgerStatus::PendingClose
                 | CopyLedgerStatus::Closed
@@ -567,7 +568,7 @@ impl CopyLedger {
                 {
                     open_notional += entry.pending_notional_usd.max(0.0);
                 }
-                CopyLedgerStatus::Open => {
+                CopyLedgerStatus::Open if copy_ledger_entry_has_execution_evidence(entry) => {
                     open_notional += entry.remaining_notional_usd.max(0.0);
                 }
                 CopyLedgerStatus::PendingReduce | CopyLedgerStatus::PendingClose
@@ -576,6 +577,7 @@ impl CopyLedger {
                     pending_reduce_notional += entry.pending_notional_usd.max(0.0);
                 }
                 CopyLedgerStatus::PendingOpen
+                | CopyLedgerStatus::Open
                 | CopyLedgerStatus::PendingReduce
                 | CopyLedgerStatus::PendingClose
                 | CopyLedgerStatus::Closed
@@ -589,6 +591,15 @@ impl CopyLedger {
 
 fn copy_ledger_entry_has_submission(entry: &CopyLedgerEntry) -> bool {
     entry.submitted_at_ms.is_some()
+        || entry.order_oid.is_some()
+        || entry
+            .order_cloid
+            .as_deref()
+            .is_some_and(|cloid| !cloid.trim().is_empty())
+}
+
+pub fn copy_ledger_entry_has_execution_evidence(entry: &CopyLedgerEntry) -> bool {
+    entry.filled_at_ms.is_some()
         || entry.order_oid.is_some()
         || entry
             .order_cloid
