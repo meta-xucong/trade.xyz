@@ -153,6 +153,12 @@ On restart or reconnect:
 - keep reduce-only catch-up active for mapped exposure;
 - never close unrelated manual/V1/unowned exposure unless explicitly instructed by the operator.
 - If network/DNS breaks while targets sell, recovery must compare the restored ledger and live target/local snapshots. Mapped local exposure whose target is confirmed flat should be reduced after reconnect.
+- Recovery must also handle partial active mapping. If live local notional is
+  materially larger than the currently mapped active Copy open notional for the
+  same account/coin/side, the daemon must recover only the uncovered residual
+  instead of treating any small surviving active mapping as complete coverage.
+  The current implementation note and fix plan are documented in
+  [smart-money-copy-uncovered-position-recovery-fix.md](/D:/AI/trade.xyz/V2/docs/smart-money-copy-uncovered-position-recovery-fix.md).
 
 ### Health Monitor
 

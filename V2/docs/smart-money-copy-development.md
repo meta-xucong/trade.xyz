@@ -160,6 +160,12 @@ Responsibilities:
   restart without generating any exchange action;
 - support restart recovery and close/reduce mapping.
 
+Current bug-fix track:
+
+- Partial active mapping can still be insufficient for a live position. See
+  [smart-money-copy-uncovered-position-recovery-fix.md](/D:/AI/trade.xyz/V2/docs/smart-money-copy-uncovered-position-recovery-fix.md)
+  for the current `addr_b xyz:SP500` residual-attribution fix plan.
+
 ### `copy_risk`
 
 Responsibilities:
