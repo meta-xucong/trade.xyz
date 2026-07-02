@@ -216,7 +216,7 @@ if ([string]::IsNullOrWhiteSpace($botExe)) {
     $botExe = $env:TRADE_XYZ_BOT_EXE
 }
 if ([string]::IsNullOrWhiteSpace($botExe)) {
-    $botExe = "D:\CargoMoved\target-trade_xyz_bot\debug\trade_xyz_bot_v2.exe"
+    throw "BotExePath or TRADE_XYZ_BOT_EXE must be set before starting the soak; refusing to fall back to a possibly stale binary"
 }
 if (-not (Test-Path -LiteralPath $botExe)) {
     throw "trade_xyz_bot_v2.exe not found at $botExe; run cargo build --manifest-path V2\Cargo.toml before starting the soak"
