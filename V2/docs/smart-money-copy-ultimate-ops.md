@@ -153,6 +153,11 @@ On restart or reconnect:
 - keep reduce-only catch-up active for mapped exposure;
 - never close unrelated manual/V1/unowned exposure unless explicitly instructed by the operator.
 - If network/DNS breaks while targets sell, recovery must compare the restored ledger and live target/local snapshots. Mapped local exposure whose target is confirmed flat should be reduced after reconnect.
+- If WebSocket post fails during a live submit, the current submit batch must
+  stop immediately, keep the deterministic cloid/ledger intent for the next
+  reconciliation, and continue only when position truth remains healthy. The
+  implementation note is
+  [smart-money-copy-websocket-submit-fail-closed-fix.md](/D:/AI/trade.xyz/V2/docs/smart-money-copy-websocket-submit-fail-closed-fix.md).
 - Recovery must also handle partial active mapping. If live local notional is
   materially larger than the currently mapped active Copy open notional for the
   same account/coin/side, the daemon must recover only the uncovered residual

@@ -84,6 +84,7 @@ mod tests {
         copy_daemon_submitted_reports_needing_cleanup, copy_execution_canary_report,
         copy_live_daemon_defer_open_refs_after_immediate_live_submit,
         copy_live_daemon_error_is_safe_pre_submit_skip,
+        copy_live_daemon_error_is_submit_transport_failure,
         copy_live_daemon_immediate_submit_should_stop_round,
         copy_live_daemon_live_submit_health_ok,
         copy_live_daemon_merge_persistence_snapshots_for_save,
@@ -7896,6 +7897,78 @@ mod tests {
     }
 
     #[test]
+    fn copy_live_daemon_classifies_submit_transport_failures() {
+        assert!(copy_live_daemon_error_is_submit_transport_failure(
+            "COPY_LIVE_WS_POST_FAILED: Hyperliquid websocket order post failed: websocket post response channel closed"
+        ));
+        assert!(copy_live_daemon_error_is_submit_transport_failure(
+            "Hyperliquid websocket order post failed"
+        ));
+        assert!(copy_live_daemon_error_is_submit_transport_failure(
+            "failed to send websocket post request: IO error"
+        ));
+        assert!(!copy_live_daemon_error_is_submit_transport_failure(
+            "order size rounds to zero for xyz:GME at notional 0.2269 and price 22.693"
+        ));
+        assert!(!copy_live_daemon_error_is_submit_transport_failure(
+            "exchange returned action-level order error: Reduce only order would increase position."
+        ));
+        assert!(!copy_live_daemon_error_is_safe_pre_submit_skip(
+            "COPY_LIVE_WS_POST_FAILED: Hyperliquid websocket order post failed: websocket post response channel closed"
+        ));
+    }
+
+    #[test]
+    fn copy_live_daemon_live_submit_health_accepts_fail_closed_transport_error() {
+        let report = CopyLiveDaemonPersistentLiveSubmitReport {
+            ok: false,
+            mode: "persistent_live_submit".to_string(),
+            submit_requested: true,
+            submit_plan_contract_ok: true,
+            submitted_reports: vec![crate::domain::WorkerReport::Error(
+                crate::domain::WorkerError {
+                    worker_id: "worker-addr_b".to_string(),
+                    account_id: "addr_b".to_string(),
+                    message:
+                        "COPY_LIVE_WS_POST_FAILED: Hyperliquid websocket order post failed: websocket post response channel closed"
+                            .to_string(),
+                    error_at_ms: now_ms(),
+                },
+            )],
+            order_evidence: Vec::new(),
+            cleanup_runbooks: Vec::new(),
+            cleanup_errors: Vec::new(),
+            ledger_reconciliations: Vec::new(),
+            ledger_reconciliation_snapshot:
+                crate::strategies::smart_money::CopyPersistenceSnapshot::empty(),
+            checks: vec![
+                copy_shadow_smoke_check(
+                    "submitted_reports",
+                    false,
+                    "0 live submitted report(s), 0 pre-submit skipped ref(s), for 1 submit-eligible ref(s); 0 reduce-only no-op ref(s) skipped",
+                ),
+                copy_shadow_smoke_check(
+                    "submit_transport_fail_closed",
+                    true,
+                    "live submit transport failed for addr_b xyz:BOT; skipped 0 remaining submit ref(s) until the next exchange reconciliation",
+                ),
+                copy_shadow_smoke_check(
+                    "order_status_evidence",
+                    true,
+                    "0 live submitted report(s), 0 order evidence record(s)",
+                ),
+                copy_shadow_smoke_check(
+                    "ledger_reconciliation",
+                    true,
+                    "0 live submitted report(s), 0 ledger reconciliation result(s)",
+                ),
+            ],
+        };
+
+        assert!(copy_live_daemon_live_submit_health_ok(&report));
+    }
+
+    #[test]
     fn copy_live_daemon_live_submit_health_accepts_round206_safe_skip_shape() {
         let report = CopyLiveDaemonPersistentLiveSubmitReport {
             ok: true,
@@ -12415,6 +12488,7 @@ fn copy_live_daemon_live_submit_health_ok(
     let all_reports_accounted_for = report.submitted_reports.iter().all(|submitted| {
         matches!(submitted, domain::WorkerReport::Submitted(_))
             || copy_live_daemon_report_is_safe_pre_submit_skip(submitted)
+            || copy_live_daemon_report_is_submit_transport_failure(submitted)
     });
     if !all_reports_accounted_for {
         return false;
@@ -12423,7 +12497,9 @@ fn copy_live_daemon_live_submit_health_ok(
         check.ok
             || matches!(
                 check.name.as_str(),
-                "submitted_reports" | "persistent_live_submit_chunks"
+                "submitted_reports"
+                    | "submit_transport_fail_closed"
+                    | "persistent_live_submit_chunks"
             )
     });
     if !non_critical_checks_ok {
@@ -14283,6 +14359,7 @@ async fn copy_live_daemon_persistent_live_submit(
     let mut progress_snapshot_save_count = 0usize;
     let mut progress_snapshot_errors = Vec::new();
     let mut live_submit_timeout_abort: Option<(String, usize)> = None;
+    let mut live_submit_transport_abort: Option<(String, usize, String)> = None;
     for plan in &submit_ready_refs {
         let mut submit_timed_out = false;
         let submitted_report = match tokio::time::timeout(
@@ -14312,6 +14389,19 @@ async fn copy_live_daemon_persistent_live_submit(
             }
         };
         submitted_reports.push(submitted_report);
+        if let Some(error_message) = submitted_reports
+            .last()
+            .and_then(copy_live_daemon_report_submit_transport_failure_message)
+        {
+            live_submit_transport_abort = Some((
+                format!("{} {}", plan.order.account_id, plan.order.coin),
+                submit_ready_refs
+                    .len()
+                    .saturating_sub(submitted_reports.len()),
+                error_message.to_string(),
+            ));
+            break;
+        }
         if submit_timed_out {
             live_submit_timeout_abort = Some((
                 format!("{} {}", plan.order.account_id, plan.order.coin),
@@ -14408,6 +14498,15 @@ async fn copy_live_daemon_persistent_live_submit(
             false,
             format!(
                 "live submit timed out for {timed_out_ref}; skipped {skipped_after_timeout} remaining submit ref(s) until exchange reconciliation confirms state"
+            ),
+        ));
+    }
+    if let Some((failed_ref, skipped_after_failure, error_message)) = &live_submit_transport_abort {
+        checks.push(copy_shadow_smoke_check(
+            "submit_transport_fail_closed",
+            true,
+            format!(
+                "live submit transport failed for {failed_ref}; skipped {skipped_after_failure} remaining submit ref(s) until the next exchange reconciliation; error={error_message}"
             ),
         ));
     }
@@ -14518,6 +14617,23 @@ fn copy_live_daemon_report_is_safe_pre_submit_skip(report: &domain::WorkerReport
     copy_live_daemon_error_is_safe_pre_submit_skip(&error.message)
 }
 
+fn copy_live_daemon_report_is_submit_transport_failure(report: &domain::WorkerReport) -> bool {
+    copy_live_daemon_report_submit_transport_failure_message(report).is_some()
+}
+
+fn copy_live_daemon_report_submit_transport_failure_message(
+    report: &domain::WorkerReport,
+) -> Option<&str> {
+    let domain::WorkerReport::Error(error) = report else {
+        return None;
+    };
+    if copy_live_daemon_error_is_submit_transport_failure(&error.message) {
+        Some(error.message.as_str())
+    } else {
+        None
+    }
+}
+
 fn copy_live_daemon_error_is_safe_pre_submit_skip(message: &str) -> bool {
     let normalized = message.to_ascii_lowercase();
     normalized.contains("failed to set ")
@@ -14532,6 +14648,19 @@ fn copy_live_daemon_error_is_safe_pre_submit_skip(message: &str) -> bool {
             && normalized.contains("minimum value")
         || normalized.contains("exchange returned action-level order error")
             && normalized.contains("reduce only order would increase position")
+}
+
+fn copy_live_daemon_error_is_submit_transport_failure(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    normalized.contains("copy_live_ws_post_failed")
+        || normalized.contains("hyperliquid websocket order post failed")
+        || normalized.contains("websocket post worker is not running")
+        || normalized.contains("websocket post request timed out")
+        || normalized.contains("websocket post response channel closed")
+        || normalized.contains("failed to send websocket post request")
+        || normalized.contains("websocket post channel closed")
+        || normalized.contains("websocket post read error")
+        || normalized.contains("websocket post stream ended")
 }
 
 async fn copy_live_daemon_suppress_refs_below_effective_min(

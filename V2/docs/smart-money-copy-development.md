@@ -165,6 +165,9 @@ Current bug-fix track:
 - Partial active mapping can still be insufficient for a live position. See
   [smart-money-copy-uncovered-position-recovery-fix.md](/D:/AI/trade.xyz/V2/docs/smart-money-copy-uncovered-position-recovery-fix.md)
   for the current `addr_b xyz:SP500` residual-attribution fix plan.
+- WebSocket post transport failures must fail closed for the current submit
+  batch without masquerading as missing order evidence. See
+  [smart-money-copy-websocket-submit-fail-closed-fix.md](/D:/AI/trade.xyz/V2/docs/smart-money-copy-websocket-submit-fail-closed-fix.md).
 
 ### `copy_risk`
 
@@ -810,7 +813,8 @@ Only after dry-run shadow passes:
 - Route approved copy signals to per-account workers.
 - Use deterministic signal ids and cloids.
 - Submit through WebSocket post fast path where supported.
-- Reconcile asynchronously.
+- Reconcile asynchronously, and classify WebSocket post transport failures as a
+  fail-closed retry/reconcile state rather than a safe pre-submit skip.
 
 ### Phase C6: Shadow and Live Readiness
 

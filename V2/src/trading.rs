@@ -491,7 +491,7 @@ impl LiveExchangeExecutor {
             Err(error) => WorkerReport::Error(WorkerError {
                 worker_id: fallback.worker_id,
                 account_id: fallback.account_id,
-                message: error.to_string(),
+                message: format!("{error:#}"),
                 error_at_ms: now_ms(),
             }),
         }
@@ -710,7 +710,7 @@ impl LiveExchangeExecutor {
         let response_payload = WsPostClient::for_environment(&effective_config.app.environment)
             .post_action(payload)
             .await
-            .context("Hyperliquid websocket order post failed")?;
+            .context("COPY_LIVE_WS_POST_FAILED: Hyperliquid websocket order post failed")?;
         let response: ExchangeResponseStatus = serde_json::from_value(response_payload)
             .context("failed to parse Hyperliquid websocket order response")?;
 
