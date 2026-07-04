@@ -91,6 +91,10 @@ The practical boundary is:
 - Increase signals on an already observed target position are allowed only if the same leader already has a local mapping; otherwise they are rejected as `COPY_INCREASE_WITHOUT_LOCAL_MAPPING`.
 - Close/reduce signals without a local mapping are recorded as `COPY_CLOSE_WITHOUT_LOCAL_MAPPING`, but must never close another leader's or another strategy's exposure.
 - Reduce-only candidates bypass open exposure caps and open-order caps, but still require readable local exposure and exchange-valid size.
+- Same local account + same coin opposite opens are arbitrated before submit.
+  Different local accounts remain independent, but one account cannot use a new
+  open to net away another leader's still-mapped opposite exposure. See
+  `smart-money-copy-account-coin-conflict-arbitration.md`.
 
 Recommended defaults:
 
@@ -164,6 +168,13 @@ On restart or reconnect:
   instead of treating any small surviving active mapping as complete coverage.
   The current implementation note and fix plan are documented in
   [smart-money-copy-uncovered-position-recovery-fix.md](/D:/AI/trade.xyz/V2/docs/smart-money-copy-uncovered-position-recovery-fix.md).
+- Fast target reversals are two-leg operations: close old mapped local exposure
+  first, then open the new side only after close evidence and live exposure
+  reconciliation. The current implementation plan and checklist are documented
+  in
+  [smart-money-copy-flip-follow-fix.md](/D:/AI/trade.xyz/V2/docs/smart-money-copy-flip-follow-fix.md)
+  and
+  [smart-money-copy-flip-follow-checklist.md](/D:/AI/trade.xyz/V2/docs/smart-money-copy-flip-follow-checklist.md).
 
 ### Health Monitor
 

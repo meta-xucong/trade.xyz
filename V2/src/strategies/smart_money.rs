@@ -214,45 +214,71 @@ impl SmartMoneyCopyStrategy {
         let mut signals = Vec::new();
 
         for leg in action.kind.signal_legs() {
-            let action_key = semantic_leg_dedupe_key(action, leg.dedupe_suffix);
-            if self.seen_events.contains(&action_key) {
-                continue;
-            }
             let mut signal_notional_usd = leg.leader_notional_usd(action) * copy_ratio;
             if let Some(limit) = self.symbol_limits.get(&action.coin) {
                 signal_notional_usd = signal_notional_usd.min(limit.max_signal_notional_usd);
             }
-            if signal_notional_usd <= 0.0 {
-                continue;
+            if let Some(signal) =
+                self.signal_from_semantic_leg(ctx, action, leg, signal_notional_usd, true, now)
+            {
+                signals.push(signal);
             }
-            self.seen_events.insert(action_key.clone());
-            signals.push(CoordinatorSignal {
-                signal_id: format!(
-                    "copy-{}-{}-{:?}-{}-{now}",
-                    leader.leader_id, action.event_id, action.kind, leg.signal_id_suffix
-                ),
-                source: SignalSource::SmartMoney,
-                created_at_ms: action.received_at_ms,
-                dispatch_at_ms: now,
-                expires_at_ms: now + ctx.signal_ttl_ms,
-                target_accounts: ctx.target_accounts.clone(),
-                dedupe_key: action_key,
-                order: SignalOrder {
-                    market: action.market.clone(),
-                    dex: action.dex.clone(),
-                    coin: action.coin.clone(),
-                    side: leg.side,
-                    notional_usd: signal_notional_usd,
-                    reduce_only: leg.reduce_only,
-                    execution_mode: ExecutionMode::Taker,
-                    max_slippage_bps: self.config.max_slippage_bps,
-                    limit_price: None,
-                    apply_account_ratio: true,
-                },
-            });
         }
 
         signals
+    }
+
+    fn signal_from_semantic_leg(
+        &mut self,
+        ctx: &StrategyContext,
+        action: &SemanticLeaderAction,
+        leg: CopySignalLeg,
+        signal_notional_usd: f64,
+        apply_account_ratio: bool,
+        dispatch_at_ms: u64,
+    ) -> Option<CoordinatorSignal> {
+        if !matches!(action.confidence, LeaderActionConfidence::Strong) {
+            return None;
+        }
+        if signal_notional_usd <= 0.0 {
+            return None;
+        }
+        let leader = self
+            .leader_by_address
+            .get(&action.leader_address.to_lowercase())
+            .cloned()?;
+        if !leader.enabled {
+            return None;
+        }
+        let action_key = semantic_leg_dedupe_key(action, leg.dedupe_suffix);
+        if self.seen_events.contains(&action_key) {
+            return None;
+        }
+        self.seen_events.insert(action_key.clone());
+        Some(CoordinatorSignal {
+            signal_id: format!(
+                "copy-{}-{}-{:?}-{}-{dispatch_at_ms}",
+                leader.leader_id, action.event_id, action.kind, leg.signal_id_suffix
+            ),
+            source: SignalSource::SmartMoney,
+            created_at_ms: action.received_at_ms,
+            dispatch_at_ms,
+            expires_at_ms: dispatch_at_ms + ctx.signal_ttl_ms,
+            target_accounts: ctx.target_accounts.clone(),
+            dedupe_key: action_key,
+            order: SignalOrder {
+                market: action.market.clone(),
+                dex: action.dex.clone(),
+                coin: action.coin.clone(),
+                side: leg.side,
+                notional_usd: signal_notional_usd,
+                reduce_only: leg.reduce_only,
+                execution_mode: ExecutionMode::Taker,
+                max_slippage_bps: self.config.max_slippage_bps,
+                limit_price: None,
+                apply_account_ratio,
+            },
+        })
     }
 }
 
@@ -430,6 +456,15 @@ impl CopySignalLeg {
             CopySignalLegNotional::FlipOpen => action
                 .open_leader_notional_usd
                 .unwrap_or(action.leader_notional_usd),
+        }
+    }
+
+    fn action_kind(self) -> LeaderActionKind {
+        match (self.reduce_only, self.side) {
+            (true, OrderSide::Buy) => LeaderActionKind::CloseShort,
+            (true, OrderSide::Sell) => LeaderActionKind::CloseLong,
+            (false, OrderSide::Buy) => LeaderActionKind::OpenLong,
+            (false, OrderSide::Sell) => LeaderActionKind::OpenShort,
         }
     }
 }
@@ -663,6 +698,66 @@ struct PendingLeaderFill {
     before: Option<LeaderPositionSnapshot>,
 }
 
+fn aggregate_pending_leader_fills(mut pending_fills: Vec<PendingLeaderFill>) -> PendingLeaderFill {
+    if pending_fills.len() == 1 {
+        return pending_fills.remove(0);
+    }
+    let first = pending_fills
+        .first()
+        .expect("aggregate requires at least one pending fill");
+    let last = pending_fills
+        .last()
+        .expect("aggregate requires at least one pending fill");
+    let total_notional_usd = pending_fills
+        .iter()
+        .map(|pending| pending.fill.notional_usd.max(0.0))
+        .sum::<f64>();
+    let total_size = pending_fills
+        .iter()
+        .map(|pending| pending.fill.size.max(0.0))
+        .sum::<f64>();
+    let price = if total_size > 0.0 {
+        total_notional_usd / total_size
+    } else {
+        last.fill.price
+    };
+    let exchange_time_ms = pending_fills
+        .iter()
+        .map(|pending| pending.fill.exchange_time_ms)
+        .max()
+        .unwrap_or(last.fill.exchange_time_ms);
+    let received_at_ms = pending_fills
+        .iter()
+        .map(|pending| pending.fill.received_at_ms)
+        .max()
+        .unwrap_or(last.fill.received_at_ms);
+    let event_ids = pending_fills
+        .iter()
+        .map(|pending| pending.fill.event_id.as_str())
+        .collect::<Vec<_>>()
+        .join("+");
+    let before = pending_fills
+        .iter()
+        .find_map(|pending| pending.before.clone());
+
+    PendingLeaderFill {
+        fill: LeaderFillEvent {
+            event_id: format!("aggregate:{event_ids}"),
+            leader_id: first.fill.leader_id.clone(),
+            leader_address: first.fill.leader_address.clone(),
+            coin: first.fill.coin.clone(),
+            side: last.fill.side,
+            price,
+            size: total_size,
+            notional_usd: total_notional_usd,
+            reduce_only: pending_fills.iter().all(|pending| pending.fill.reduce_only),
+            exchange_time_ms,
+            received_at_ms,
+        },
+        before,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CopyDryRunShadowPipeline {
     config: CopyDryRunShadowConfig,
@@ -777,8 +872,13 @@ impl CopyDryRunShadowPipeline {
                                 .then_some(index)
                         })
                         .collect::<Vec<_>>();
-                    for index in matching_pending.into_iter().rev() {
-                        let pending = self.pending_fills.remove(index);
+                    if !matching_pending.is_empty() {
+                        let mut pending_group = Vec::new();
+                        for index in matching_pending.into_iter().rev() {
+                            pending_group.push(self.pending_fills.remove(index));
+                        }
+                        pending_group.reverse();
+                        let pending = aggregate_pending_leader_fills(pending_group);
                         let action = classify_leader_fill(
                             &pending.fill,
                             pending.before.as_ref(),
@@ -851,6 +951,45 @@ impl CopyDryRunShadowPipeline {
             {
                 continue;
             }
+            let snapshot = self.last_positions.get(&key);
+            let target_notional_usd = snapshot
+                .map(|snapshot| snapshot.position_notional_usd.abs())
+                .unwrap_or(0.0);
+            let target_size = snapshot
+                .map(|snapshot| normalize_position(snapshot.signed_size))
+                .unwrap_or(0.0);
+            let (
+                kind,
+                leader_notional_usd,
+                close_leader_notional_usd,
+                open_leader_notional_usd,
+                reason,
+            ) = match (entry.local_side, target_size) {
+                (OrderSide::Buy, size) if size < 0.0 => (
+                    LeaderActionKind::FlipLongToShort,
+                    exposure + target_notional_usd,
+                    Some(exposure),
+                    Some(target_notional_usd),
+                    "reconnect_target_opposite_catchup",
+                ),
+                (OrderSide::Sell, size) if size > 0.0 => (
+                    LeaderActionKind::FlipShortToLong,
+                    exposure + target_notional_usd,
+                    Some(exposure),
+                    Some(target_notional_usd),
+                    "reconnect_target_opposite_catchup",
+                ),
+                _ => (
+                    match entry.local_side {
+                        OrderSide::Buy => LeaderActionKind::CloseLong,
+                        OrderSide::Sell => LeaderActionKind::CloseShort,
+                    },
+                    exposure,
+                    Some(exposure),
+                    None,
+                    "reconnect_target_flat_catchup",
+                ),
+            };
             actions.push(SemanticLeaderAction {
                 leader_id: leader_id.to_string(),
                 leader_address: leader_address.to_string(),
@@ -863,17 +1002,14 @@ impl CopyDryRunShadowPipeline {
                     "copy-catchup-flat:{leader_id}:{}:{:?}:{now_ms}",
                     entry.coin, entry.local_side
                 ),
-                kind: match entry.local_side {
-                    OrderSide::Buy => LeaderActionKind::CloseLong,
-                    OrderSide::Sell => LeaderActionKind::CloseShort,
-                },
+                kind,
                 confidence: LeaderActionConfidence::Strong,
-                leader_notional_usd: exposure,
-                close_leader_notional_usd: Some(exposure),
-                open_leader_notional_usd: None,
+                leader_notional_usd,
+                close_leader_notional_usd,
+                open_leader_notional_usd,
                 exchange_time_ms: now_ms,
                 received_at_ms: now_ms,
-                reason: "reconnect_target_flat_catchup".to_string(),
+                reason: reason.to_string(),
             });
         }
         actions
@@ -906,10 +1042,8 @@ impl CopyDryRunShadowPipeline {
         now_ms: u64,
     ) -> Vec<CopyDryRunShadowRecord> {
         let live_gate = evaluate_copy_live_gate(self.config.live_gate);
-        let risk_decision = self.risk_decision_for_action(&action, now_ms);
-        if matches!(live_gate, CopyLiveGateDecision::Rejected { .. })
-            || !matches!(risk_decision, CopySignalRiskDecision::Approved { .. })
-        {
+        if matches!(live_gate, CopyLiveGateDecision::Rejected { .. }) {
+            let risk_decision = self.risk_decision_for_action(&action, now_ms);
             return vec![CopyDryRunShadowRecord {
                 action,
                 live_gate,
@@ -924,8 +1058,9 @@ impl CopyDryRunShadowPipeline {
             target_accounts: self.config.target_accounts.clone(),
             signal_ttl_ms: self.config.signal_ttl_ms,
         };
-        let signals = self.strategy.signals_from_semantic_action(&ctx, &action);
-        if signals.is_empty() {
+        let legs = action.kind.signal_legs();
+        if legs.is_empty() {
+            let risk_decision = self.risk_decision_for_action(&action, now_ms);
             return vec![CopyDryRunShadowRecord {
                 action,
                 live_gate,
@@ -936,38 +1071,64 @@ impl CopyDryRunShadowPipeline {
             }];
         }
 
-        signals
-            .into_iter()
-            .filter_map(|mut signal| {
-                if action.kind.is_full_close() && !signal.order.reduce_only {
-                    return None;
-                }
-                if let CopySignalRiskDecision::Approved {
-                    reduce_only,
-                    notional_usd,
-                    ..
-                } = risk_decision
-                {
-                    signal.order.reduce_only = reduce_only;
-                    signal.order.notional_usd = notional_usd;
-                    signal.order.apply_account_ratio = false;
-                }
-                let ledger_entry = ledger_entry_from_shadow_signal(
-                    &self.config.local_account_id,
-                    &action,
-                    &signal,
-                );
-                self.ledger.push(ledger_entry.clone());
-                Some(CopyDryRunShadowRecord {
+        let dispatch_at_ms = now_ms;
+        let mut records = Vec::new();
+        for leg in legs {
+            let risk_decision = self.risk_decision_for_action_leg(&action, leg, now_ms);
+            let CopySignalRiskDecision::Approved { notional_usd, .. } = risk_decision else {
+                records.push(CopyDryRunShadowRecord {
                     action: action.clone(),
                     live_gate: live_gate.clone(),
-                    risk_decision: risk_decision.clone(),
-                    signal: Some(signal),
-                    ledger_entry: Some(ledger_entry),
+                    risk_decision,
+                    signal: None,
+                    ledger_entry: None,
                     persistence_snapshot: self.persistence_snapshot(now_ms),
-                })
-            })
-            .collect()
+                });
+                continue;
+            };
+            let Some(signal) = self.strategy.signal_from_semantic_leg(
+                &ctx,
+                &action,
+                leg,
+                notional_usd,
+                false,
+                dispatch_at_ms,
+            ) else {
+                records.push(CopyDryRunShadowRecord {
+                    action: action.clone(),
+                    live_gate: live_gate.clone(),
+                    risk_decision,
+                    signal: None,
+                    ledger_entry: None,
+                    persistence_snapshot: self.persistence_snapshot(now_ms),
+                });
+                continue;
+            };
+            let ledger_entry =
+                ledger_entry_from_shadow_signal(&self.config.local_account_id, &action, &signal);
+            self.ledger.push(ledger_entry.clone());
+            records.push(CopyDryRunShadowRecord {
+                action: action.clone(),
+                live_gate: live_gate.clone(),
+                risk_decision,
+                signal: Some(signal),
+                ledger_entry: Some(ledger_entry),
+                persistence_snapshot: self.persistence_snapshot(now_ms),
+            });
+        }
+        records
+    }
+
+    fn risk_decision_for_action_leg(
+        &self,
+        action: &SemanticLeaderAction,
+        leg: CopySignalLeg,
+        now_ms: u64,
+    ) -> CopySignalRiskDecision {
+        let mut leg_action = action.clone();
+        leg_action.kind = leg.action_kind();
+        leg_action.leader_notional_usd = leg.leader_notional_usd(action);
+        self.risk_decision_for_action(&leg_action, now_ms)
     }
 
     fn risk_decision_for_action(
@@ -2616,7 +2777,7 @@ mod tests {
     }
 
     #[test]
-    fn dry_run_shadow_reconnect_opposite_snapshot_closes_mapped_short() {
+    fn dry_run_shadow_reconnect_opposite_snapshot_flips_mapped_short_to_target_long() {
         let now = now_ms();
         let mut ledger = CopyLedger::new();
         ledger.push(ledger_entry(
@@ -2635,8 +2796,17 @@ mod tests {
         let records =
             pipeline.handle_watcher_event(position_event("leader_a", 1.0, 100.0), now + 1);
 
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].action.kind, LeaderActionKind::CloseShort);
+        assert_eq!(records.len(), 2, "{records:#?}");
+        assert!(
+            records
+                .iter()
+                .all(|record| record.action.kind == LeaderActionKind::FlipShortToLong)
+        );
+        assert!(
+            records
+                .iter()
+                .all(|record| record.action.reason == "reconnect_target_opposite_catchup")
+        );
         assert_eq!(
             records[0].risk_decision,
             CopySignalRiskDecision::Approved {
@@ -2648,6 +2818,219 @@ mod tests {
         let signal = records[0].signal.as_ref().expect("catchup close signal");
         assert_eq!(signal.order.side, OrderSide::Buy);
         assert!(signal.order.reduce_only);
+        let open_signal = records[1].signal.as_ref().expect("catchup open signal");
+        assert_eq!(open_signal.order.side, OrderSide::Buy);
+        assert!(!open_signal.order.reduce_only);
+        assert_eq!(
+            open_signal.order.notional_usd,
+            COPY_DEFAULT_MAX_SIGNAL_NOTIONAL_USD
+        );
+    }
+
+    #[test]
+    fn dry_run_shadow_flip_short_to_long_preserves_close_and_open_legs() {
+        let now = now_ms();
+        let mut ledger = CopyLedger::new();
+        ledger.push(ledger_entry(
+            "sig-open-short",
+            OrderSide::Sell,
+            80.0,
+            0.0,
+            80.0,
+            80.0,
+            CopyLedgerStatus::Open,
+        ));
+        let mut pipeline =
+            CopyDryRunShadowPipeline::new(dry_run_shadow_config(), copy_strategy(), ledger);
+
+        pipeline.handle_watcher_event(position_event("leader_a", -1.0, 80.0), now);
+        pipeline.handle_watcher_event(
+            CopyLeaderWatcherEvent::Fill {
+                leader_id: "leader_a".to_string(),
+                leader_address: "0xABC".to_string(),
+                fill: leader_fill(
+                    "flip-short-long-close-open",
+                    "leader_a",
+                    OrderSide::Buy,
+                    140.0,
+                ),
+                is_snapshot: false,
+            },
+            now + 1,
+        );
+        let records = pipeline.handle_watcher_event(position_event("leader_a", 1.0, 60.0), now + 2);
+
+        assert_eq!(records.len(), 2, "{records:#?}");
+        assert!(
+            records
+                .iter()
+                .all(|record| record.action.kind == LeaderActionKind::FlipShortToLong)
+        );
+        let close_record = records
+            .iter()
+            .find(|record| {
+                record
+                    .signal
+                    .as_ref()
+                    .is_some_and(|signal| signal.order.reduce_only)
+            })
+            .expect("flip close record");
+        assert_eq!(
+            close_record.risk_decision,
+            CopySignalRiskDecision::Approved {
+                side: OrderSide::Buy,
+                reduce_only: true,
+                notional_usd: 80.0,
+            }
+        );
+        let close_signal = close_record.signal.as_ref().expect("flip close signal");
+        assert_eq!(close_signal.order.side, OrderSide::Buy);
+        assert!(close_signal.order.reduce_only);
+        assert_eq!(close_signal.order.notional_usd, 80.0);
+        assert_eq!(
+            close_record.ledger_entry.as_ref().map(|entry| entry.status),
+            Some(CopyLedgerStatus::PendingClose)
+        );
+
+        let open_record = records
+            .iter()
+            .find(|record| {
+                record
+                    .signal
+                    .as_ref()
+                    .is_some_and(|signal| !signal.order.reduce_only)
+            })
+            .expect("flip open record");
+        assert_eq!(
+            open_record.risk_decision,
+            CopySignalRiskDecision::Approved {
+                side: OrderSide::Buy,
+                reduce_only: false,
+                notional_usd: COPY_DEFAULT_MAX_SIGNAL_NOTIONAL_USD,
+            }
+        );
+        let open_signal = open_record.signal.as_ref().expect("flip open signal");
+        assert_eq!(open_signal.order.side, OrderSide::Buy);
+        assert!(!open_signal.order.reduce_only);
+        assert_eq!(
+            open_signal.order.notional_usd,
+            COPY_DEFAULT_MAX_SIGNAL_NOTIONAL_USD
+        );
+        assert_eq!(
+            open_record.ledger_entry.as_ref().map(|entry| entry.status),
+            Some(CopyLedgerStatus::PendingOpen)
+        );
+    }
+
+    #[test]
+    fn dry_run_shadow_aggregates_multiple_pending_fills_before_flip_snapshot() {
+        let now = now_ms();
+        let mut ledger = CopyLedger::new();
+        ledger.push(ledger_entry(
+            "sig-open-short",
+            OrderSide::Sell,
+            80.0,
+            0.0,
+            80.0,
+            80.0,
+            CopyLedgerStatus::Open,
+        ));
+        let mut pipeline =
+            CopyDryRunShadowPipeline::new(dry_run_shadow_config(), copy_strategy(), ledger);
+
+        pipeline.handle_watcher_event(position_event("leader_a", -1.0, 80.0), now);
+        for (event_id, notional) in [
+            ("flip-short-long-close-fill", 80.0),
+            ("flip-short-long-open-fill", 60.0),
+        ] {
+            pipeline.handle_watcher_event(
+                CopyLeaderWatcherEvent::Fill {
+                    leader_id: "leader_a".to_string(),
+                    leader_address: "0xABC".to_string(),
+                    fill: leader_fill(event_id, "leader_a", OrderSide::Buy, notional),
+                    is_snapshot: false,
+                },
+                now + 1,
+            );
+        }
+        let records = pipeline.handle_watcher_event(position_event("leader_a", 1.0, 60.0), now + 2);
+
+        assert_eq!(records.len(), 2, "{records:#?}");
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record
+                    .signal
+                    .as_ref()
+                    .is_some_and(|signal| signal.order.reduce_only))
+                .count(),
+            1
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record
+                    .signal
+                    .as_ref()
+                    .is_some_and(|signal| !signal.order.reduce_only))
+                .count(),
+            1
+        );
+        assert_eq!(pipeline.pending_fill_count(), 0);
+    }
+
+    #[test]
+    fn dry_run_shadow_flip_blocked_symbol_still_closes_but_rejects_open_leg() {
+        let now = now_ms();
+        let mut config = dry_run_shadow_config();
+        config.blocked_symbols = vec!["xyz:XYZ100".to_string()];
+        let mut ledger = CopyLedger::new();
+        ledger.push(ledger_entry(
+            "sig-open-short",
+            OrderSide::Sell,
+            80.0,
+            0.0,
+            80.0,
+            80.0,
+            CopyLedgerStatus::Open,
+        ));
+        let mut pipeline = CopyDryRunShadowPipeline::new(config, copy_strategy(), ledger);
+
+        pipeline.handle_watcher_event(position_event("leader_a", -1.0, 80.0), now);
+        pipeline.handle_watcher_event(
+            CopyLeaderWatcherEvent::Fill {
+                leader_id: "leader_a".to_string(),
+                leader_address: "0xABC".to_string(),
+                fill: leader_fill("flip-blocked-symbol", "leader_a", OrderSide::Buy, 140.0),
+                is_snapshot: false,
+            },
+            now + 1,
+        );
+        let records = pipeline.handle_watcher_event(position_event("leader_a", 1.0, 60.0), now + 2);
+
+        assert_eq!(records.len(), 2, "{records:#?}");
+        assert_eq!(
+            records[0].risk_decision,
+            CopySignalRiskDecision::Approved {
+                side: OrderSide::Buy,
+                reduce_only: true,
+                notional_usd: 80.0,
+            }
+        );
+        assert!(
+            records[0]
+                .signal
+                .as_ref()
+                .is_some_and(|signal| signal.order.reduce_only)
+        );
+        assert_eq!(
+            records[1].risk_decision,
+            CopySignalRiskDecision::Rejected {
+                reason_code: "COPY_SYMBOL_BLOCKED".to_string(),
+            }
+        );
+        assert!(records[1].signal.is_none());
+        assert!(records[1].ledger_entry.is_none());
     }
 
     #[test]

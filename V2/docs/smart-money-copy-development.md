@@ -20,6 +20,9 @@ Support 24/7 copy trading for one or more configured leader accounts:
 7. Execute through the V2 low-latency path.
 8. Reconcile fills, positions, and copy attribution after submission.
 
+Conflict arbitration detail: see
+`smart-money-copy-account-coin-conflict-arbitration.md`.
+
 The module must optimize for fast follow buys while staying conservative when
 the leader action is ambiguous.
 
@@ -168,6 +171,11 @@ Current bug-fix track:
 - WebSocket post transport failures must fail closed for the current submit
   batch without masquerading as missing order evidence. See
   [smart-money-copy-websocket-submit-fail-closed-fix.md](/D:/AI/trade.xyz/V2/docs/smart-money-copy-websocket-submit-fail-closed-fix.md).
+- Fast target close-then-reverse events must preserve both Flip legs and submit
+  the new-side open only after the old-side close is evidenced. See
+  [smart-money-copy-flip-follow-fix.md](/D:/AI/trade.xyz/V2/docs/smart-money-copy-flip-follow-fix.md)
+  and
+  [smart-money-copy-flip-follow-checklist.md](/D:/AI/trade.xyz/V2/docs/smart-money-copy-flip-follow-checklist.md).
 
 ### `copy_risk`
 
