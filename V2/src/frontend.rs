@@ -10848,6 +10848,7 @@ fn build_copy_live_soak_status_response_from_dir(
     {
         response.pid = Some(pid);
         pid_running = true;
+        let _ = write_copy_live_soak_current_pid(dir, pid);
     }
 
     let mut latest_completed_report_path: Option<String> = None;
@@ -11216,19 +11217,25 @@ fn find_running_copy_live_soak_pid() -> Option<u32> {
     #[cfg(windows)]
     {
         let script = r#"
+$wrapper = Get-CimInstance Win32_Process |
+  Where-Object {
+    $_.ProcessId -ne $PID -and
+    $_.Name -match '^(powershell|pwsh)\.exe$' -and
+    $_.CommandLine -like '*run-persistent-live-soak.ps1*' -and
+    $_.CommandLine -match '(?i)(^|\s)-File\s+' -and
+    $_.CommandLine -notlike '*Get-CimInstance*'
+  } |
+  Sort-Object CreationDate -Descending |
+  Select-Object -First 1
+if ($null -ne $wrapper) {
+  $wrapper.ProcessId
+  return
+}
 Get-CimInstance Win32_Process |
   Where-Object {
     $_.ProcessId -ne $PID -and
-    (
-      (
-        $_.Name -match '^(powershell|pwsh)\.exe$' -and
-        $_.CommandLine -like '*run-persistent-live-soak.ps1*' -and
-        $_.CommandLine -match '(?i)(^|\s)-File\s+'
-      ) -or (
-        $_.Name -eq 'trade_xyz_bot_v2.exe' -and
-        $_.CommandLine -like '*copy-live-daemon-supervisor*'
-      )
-    ) -and
+    $_.Name -eq 'trade_xyz_bot_v2.exe' -and
+    $_.CommandLine -like '*copy-live-daemon-supervisor*' -and
     $_.CommandLine -notlike '*Get-CimInstance*'
   } |
   Sort-Object CreationDate -Descending |

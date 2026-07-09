@@ -371,16 +371,34 @@ function Invoke-BotRound {
         return 124
     }
 
-    $process.Refresh()
-    if ($null -eq $process.ExitCode) {
-        Start-Sleep -Milliseconds 200
-        $process.Refresh()
+    try {
+        # WaitForExit(timeout) returning true does not always make ExitCode
+        # immediately readable on Windows PowerShell when redirection is active.
+        $process.WaitForExit()
+    } catch {
+        Write-SoakLog "round child final wait failed pid=$($process.Id) error=$($_.Exception.Message)"
     }
-    if ($null -eq $process.ExitCode) {
+
+    try {
+        $process.Refresh()
+    } catch {
+        Write-SoakLog "round child refresh failed pid=$($process.Id) error=$($_.Exception.Message)"
+    }
+
+    $exitCode = $null
+    try {
+        if ($process.HasExited) {
+            $exitCode = [int]$process.ExitCode
+        }
+    } catch {
+        Write-SoakLog "round child exit code read failed pid=$($process.Id) error=$($_.Exception.Message)"
+    }
+
+    if ($null -eq $exitCode) {
         Write-SoakLog "round child exited but ExitCode was unavailable pid=$($process.Id); treating as success only if report validation passes"
         return 0
     }
-    return $process.ExitCode
+    return $exitCode
 }
 
 $leaderArgs = @()

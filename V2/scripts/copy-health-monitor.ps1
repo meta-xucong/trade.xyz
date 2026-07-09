@@ -425,21 +425,49 @@ function Read-JsonObjectFile {
     }
 }
 
-function Get-SoakProcess {
+function Set-SoakPidFile {
+    param([int]$ProcessId)
+    if ($ProcessId -le 0) {
+        return
+    }
+    Set-Content -LiteralPath ".codex-longrun\persistent-live-soak-detached-current.pid" -Value ([string]$ProcessId) -Encoding ascii
+}
+
+function Get-SoakWrapperProcess {
     $pidPath = ".codex-longrun\persistent-live-soak-detached-current.pid"
     if (Test-Path -LiteralPath $pidPath) {
         $pidText = Get-Content -LiteralPath $pidPath -Raw -ErrorAction SilentlyContinue
         $soakPid = 0
         if ([int]::TryParse($pidText.Trim(), [ref]$soakPid)) {
             $byPid = Get-CimInstance Win32_Process -Filter "ProcessId=$soakPid" -ErrorAction SilentlyContinue
-            if ($byPid -and (Test-SoakProcessCommand $byPid)) {
+            if ($byPid -and (Test-SoakWrapperCommand $byPid)) {
                 return $byPid
             }
         }
     }
-    return Get-CimInstance Win32_Process | Where-Object {
-        Test-SoakProcessCommand $_
+    $wrapper = Get-CimInstance Win32_Process | Where-Object {
+        Test-SoakWrapperCommand $_
     } | Sort-Object CreationDate -Descending | Select-Object -First 1
+    if ($wrapper) {
+        Set-SoakPidFile -Pid $wrapper.ProcessId
+    }
+    return $wrapper
+}
+
+function Get-SoakRoundChildProcess {
+    return Get-CimInstance Win32_Process | Where-Object {
+        $commandLine = [string]$_.CommandLine
+        $_.Name -eq "trade_xyz_bot_v2.exe" `
+        -and $commandLine -like "*copy-live-daemon-supervisor*"
+    } | Sort-Object CreationDate -Descending | Select-Object -First 1
+}
+
+function Get-SoakProcess {
+    $wrapper = Get-SoakWrapperProcess
+    if ($wrapper) {
+        return $wrapper
+    }
+    return Get-SoakRoundChildProcess
 }
 
 function Test-SoakProcessCommand {
@@ -711,10 +739,10 @@ function Set-LatestSoakPid {
         } | Sort-Object CreationDate -Descending | Select-Object -First 1
     }
     if (-not $proc) {
-        $proc = Get-SoakProcess
+        $proc = Get-SoakWrapperProcess
     }
     if ($proc) {
-        Set-Content -LiteralPath ".codex-longrun\persistent-live-soak-detached-current.pid" -Value ([string]$proc.ProcessId) -Encoding ascii
+        Set-SoakPidFile -Pid $proc.ProcessId
         return $proc.ProcessId
     }
     return $null
@@ -758,9 +786,9 @@ function Start-CopyLiveSoak {
             Write-MonitorLog "restart requested run_id=$($start.data.status.run_id) pid=$soakPid accounts=$($runtimeAccountIds -join ',') principal_cap=$PrincipalCapUsd leverage=$Leverage markets=$($runtimeMarkets -join ',') max_total_notional=$MaxTotalNotionalUsd max_total_fees=$MaxTotalFeesUsd"
             return
         }
-        $existingAfterStart = Get-SoakProcess
+        $existingAfterStart = Get-SoakWrapperProcess
         if ($existingAfterStart) {
-            Set-Content -LiteralPath ".codex-longrun\persistent-live-soak-detached-current.pid" -Value ([string]$existingAfterStart.ProcessId) -Encoding ascii
+            Set-SoakPidFile -Pid $existingAfterStart.ProcessId
             Write-MonitorLog "frontend start returned ok and an existing soak process was found before fallback pid=$($existingAfterStart.ProcessId) run_id=$($start.data.status.run_id)"
             return
         }
@@ -768,9 +796,9 @@ function Start-CopyLiveSoak {
     } else {
         Write-MonitorLog "frontend start failed; falling back to direct soak script: $($start.error)"
     }
-    $existingBeforeFallback = Get-SoakProcess
+    $existingBeforeFallback = Get-SoakWrapperProcess
     if ($existingBeforeFallback) {
-        Set-Content -LiteralPath ".codex-longrun\persistent-live-soak-detached-current.pid" -Value ([string]$existingBeforeFallback.ProcessId) -Encoding ascii
+        Set-SoakPidFile -Pid $existingBeforeFallback.ProcessId
         Write-MonitorLog "direct soak fallback skipped; soak process appeared pid=$($existingBeforeFallback.ProcessId)"
         return
     }
@@ -806,7 +834,7 @@ function Start-CopyLiveSoak {
         $args += @("-BotExePath", $resolvedBotExePath)
     }
     $process = Start-Process -FilePath powershell -ArgumentList $args -WorkingDirectory $projectRoot -WindowStyle Hidden -PassThru
-    Set-Content -LiteralPath ".codex-longrun\persistent-live-soak-detached-current.pid" -Value ([string]$process.Id) -Encoding ascii
+    Set-SoakPidFile -Pid $process.Id
     Write-MonitorLog "direct soak restart requested pid=$($process.Id) accounts=$($runtimeAccountIds -join ',') principal_cap=$PrincipalCapUsd leverage=$Leverage markets=$($runtimeMarkets -join ',') max_total_notional=$MaxTotalNotionalUsd max_total_fees=$MaxTotalFeesUsd bot_exe=$resolvedBotExePath"
 }
 
@@ -905,16 +933,38 @@ while ($true) {
             Reset-StopCandidate "healthy"
             Write-MonitorLog "healthy pid=$($soakProcess.ProcessId) run_id=$($status.data.run_id) round=$($status.data.latest_round) message=$($status.data.message)"
         } elseif ($status.ok -and $status.data.running -and $null -eq $soakProcess) {
-            $diagnostic = "frontend_running_but_soak_process_missing run_id=$($status.data.run_id) round=$($status.data.latest_round) message=$($status.data.message)"
-            Write-MonitorLog "detected stopped soak; diagnostic: $diagnostic"
-            if (Test-StopCandidateConfirmed -Reason "soak_process_missing" -Diagnostic $diagnostic) {
-                Send-ConfirmedStopNotification -Reason "soak_process_missing" -Diagnostic $diagnostic
-                try {
-                    Start-CopyLiveSoak
-                    Reset-StopCandidate "restart_after_missing_process"
-                } catch {
-                    Send-MonitorNotification -Status "failed" -Reason "restart_failed" -Detail $_.Exception.Message
-                    throw
+            $statusPid = 0
+            if ($null -ne $status.data.pid) {
+                [void][int]::TryParse([string]$status.data.pid, [ref]$statusPid)
+            }
+            $statusPidRunning = $false
+            if ($null -ne $status.data.pid_running) {
+                $statusPidRunning = [bool]$status.data.pid_running
+            }
+            $heartbeatStale = Test-SoakHeartbeatStale
+            if ($statusPidRunning -and $statusPid -gt 0) {
+                Set-SoakPidFile -Pid $statusPid
+            }
+            if ($statusPidRunning -or -not $heartbeatStale) {
+                Reset-StopCandidate "healthy_status_runtime"
+                $runtimeDetail = if ($statusPidRunning -and $statusPid -gt 0) {
+                    "healthy_status_only pid=$statusPid run_id=$($status.data.run_id) round=$($status.data.latest_round) message=$($status.data.message)"
+                } else {
+                    "healthy_status_only run_id=$($status.data.run_id) round=$($status.data.latest_round) message=$($status.data.message) heartbeat_fresh=true"
+                }
+                Write-MonitorLog $runtimeDetail
+            } else {
+                $diagnostic = "frontend_running_but_soak_process_missing run_id=$($status.data.run_id) round=$($status.data.latest_round) message=$($status.data.message)"
+                Write-MonitorLog "detected stopped soak; diagnostic: $diagnostic"
+                if (Test-StopCandidateConfirmed -Reason "soak_process_missing" -Diagnostic $diagnostic) {
+                    Send-ConfirmedStopNotification -Reason "soak_process_missing" -Diagnostic $diagnostic
+                    try {
+                        Start-CopyLiveSoak
+                        Reset-StopCandidate "restart_after_missing_process"
+                    } catch {
+                        Send-MonitorNotification -Status "failed" -Reason "restart_failed" -Detail $_.Exception.Message
+                        throw
+                    }
                 }
             }
         } elseif ((Test-SoakProcessRunning) -and (Test-SoakHeartbeatStale)) {

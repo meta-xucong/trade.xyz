@@ -24,6 +24,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use futures_util::future::join_all;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -8244,6 +8245,9 @@ mod tests {
         assert!(copy_live_daemon_error_is_safe_pre_submit_skip(
             "exchange returned action-level order error: Only post-only orders allowed immediately after network upgrade"
         ));
+        assert!(copy_live_daemon_error_is_safe_pre_submit_skip(
+            "exchange returned action-level order error: Order could not immediately match against any resting orders. asset=110043"
+        ));
         assert!(!copy_live_daemon_error_is_safe_pre_submit_skip(
             "COPY_LIVE_ORDER_SUBMIT_TIMEOUT: submit ref addr_b xyz:NATGAS timed out after 60s"
         ));
@@ -8365,6 +8369,56 @@ mod tests {
                     "persistent_live_submit_chunks",
                     true,
                     "1 persistent live submit chunk(s) merged",
+                ),
+            ],
+        };
+
+        assert!(copy_live_daemon_live_submit_health_ok(&report));
+    }
+
+    #[test]
+    fn copy_live_daemon_live_submit_health_accepts_post_only_reject_as_safe_skip() {
+        let report = CopyLiveDaemonPersistentLiveSubmitReport {
+            ok: false,
+            mode: "persistent_live_submit".to_string(),
+            submit_requested: true,
+            submit_plan_contract_ok: true,
+            submitted_reports: vec![crate::domain::WorkerReport::Error(
+                crate::domain::WorkerError {
+                    worker_id: "worker-addr_a".to_string(),
+                    account_id: "addr_a".to_string(),
+                    message:
+                        "exchange returned action-level order error: Order could not immediately match against any resting orders. asset=110043"
+                            .to_string(),
+                    error_at_ms: now_ms(),
+                },
+            )],
+            order_evidence: Vec::new(),
+            cleanup_runbooks: Vec::new(),
+            cleanup_errors: Vec::new(),
+            ledger_reconciliations: Vec::new(),
+            ledger_reconciliation_snapshot:
+                crate::strategies::smart_money::CopyPersistenceSnapshot::empty(),
+            checks: vec![
+                copy_shadow_smoke_check(
+                    "submitted_reports",
+                    false,
+                    "0 live submitted report(s), 1 pre-submit skipped ref(s), for 1 submit-eligible ref(s); 0 reduce-only no-op ref(s) skipped",
+                ),
+                copy_shadow_smoke_check(
+                    "persistent_live_submit_chunks",
+                    false,
+                    "1 persistent live submit chunk(s) merged",
+                ),
+                copy_shadow_smoke_check(
+                    "order_status_evidence",
+                    true,
+                    "0 live submitted report(s), 0 order evidence record(s)",
+                ),
+                copy_shadow_smoke_check(
+                    "ledger_reconciliation",
+                    true,
+                    "0 live submitted report(s), 0 ledger reconciliation result(s)",
                 ),
             ],
         };
@@ -15304,6 +15358,8 @@ fn copy_live_daemon_error_is_safe_pre_submit_skip(message: &str) -> bool {
         || normalized.contains("exchange returned action-level order error")
             && normalized
                 .contains("only post-only orders allowed immediately after network upgrade")
+        || normalized.contains("exchange returned action-level order error")
+            && normalized.contains("could not immediately match against any resting orders")
 }
 
 fn copy_live_daemon_error_is_submit_transport_failure(message: &str) -> bool {
@@ -16710,16 +16766,27 @@ async fn reconcile_copy_bounded_window_accounts_bounded(
     target_accounts: &[String],
     label: &str,
 ) -> Vec<CopyBoundedLiveWindowReconcile> {
-    match tokio::time::timeout(
-        Duration::from_secs(COPY_DAEMON_RECONCILE_BATCH_TIMEOUT_SECS),
-        reconcile_copy_bounded_window_accounts(config, target_accounts),
-    )
-    .await
-    {
-        Ok(reconciliations) => reconciliations,
-        Err(_) => target_accounts
-            .iter()
-            .map(|account_id| CopyBoundedLiveWindowReconcile {
+    join_all(target_accounts.iter().map(|account_id| async move {
+        match tokio::time::timeout(
+            Duration::from_secs(COPY_DAEMON_RECONCILE_BATCH_TIMEOUT_SECS),
+            reconcile_copy_account_with_retries(config, account_id),
+        )
+        .await
+        {
+            Ok(Ok(report)) => copy_bounded_live_window_reconcile_from_report(report),
+            Ok(Err(error)) => CopyBoundedLiveWindowReconcile {
+                account_id: account_id.clone(),
+                ok: false,
+                open_order_count: None,
+                asset_positions: None,
+                position_summaries: Vec::new(),
+                account_value: None,
+                withdrawable: None,
+                total_ntl_pos: None,
+                total_margin_used: None,
+                error: Some(error.to_string()),
+            },
+            Err(_) => CopyBoundedLiveWindowReconcile {
                 account_id: account_id.clone(),
                 ok: false,
                 open_order_count: None,
@@ -16733,9 +16800,10 @@ async fn reconcile_copy_bounded_window_accounts_bounded(
                     "{label} timed out after {}s",
                     COPY_DAEMON_RECONCILE_BATCH_TIMEOUT_SECS
                 )),
-            })
-            .collect(),
-    }
+            },
+        }
+    }))
+    .await
 }
 
 async fn reconcile_copy_account_with_retries(
