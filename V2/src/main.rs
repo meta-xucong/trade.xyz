@@ -4681,11 +4681,19 @@ mod tests {
             signal_id: "sig-open".to_string(),
             ..pending_entry.clone()
         };
+        let pending_close_entry = crate::strategies::smart_money::CopyLedgerEntry {
+            status: crate::strategies::smart_money::CopyLedgerStatus::PendingClose,
+            signal_id: "sig-persisted-close-residual".to_string(),
+            planned_notional_usd: 12.5,
+            pending_notional_usd: 12.5,
+            remaining_notional_usd: 12.5,
+            ..pending_entry.clone()
+        };
         let persistence = crate::strategies::smart_money::CopyPersistenceSnapshot {
             schema_version: 1,
             saved_at_ms: now_ms(),
             seen_event_keys: Vec::new(),
-            ledger_entries: vec![pending_entry, open_entry],
+            ledger_entries: vec![pending_entry, pending_close_entry, open_entry],
         };
 
         let refs = super::copy_live_daemon_recover_pending_reduce_plan_refs(
@@ -4693,7 +4701,7 @@ mod tests {
             &["addr_a".to_string(), "addr_b".to_string()],
         );
 
-        assert_eq!(refs.len(), 1);
+        assert_eq!(refs.len(), 2);
         assert_eq!(refs[0].signal_id, "sig-persisted-reduce");
         assert_eq!(refs[0].order.account_id, "addr_a");
         assert_eq!(refs[0].order.coin, "xyz:JPY");
@@ -4701,12 +4709,16 @@ mod tests {
         assert!(refs[0].order.reduce_only);
         assert!((refs[0].order.notional_usd - 59.8438).abs() < 1e-9);
         uuid::Uuid::parse_str(&refs[0].order.cloid).expect("stable retry cloid");
+        assert_eq!(refs[1].signal_id, "sig-persisted-close-residual");
+        assert!((refs[1].order.notional_usd - 12.5).abs() < 1e-9);
+        assert!(refs[1].order.reduce_only);
 
         let refs_again = super::copy_live_daemon_recover_pending_reduce_plan_refs(
             &persistence,
             &["addr_a".to_string()],
         );
         assert_eq!(refs_again[0].order.cloid, refs[0].order.cloid);
+        assert_eq!(refs_again[1].order.cloid, refs[1].order.cloid);
     }
 
     #[test]
@@ -5306,7 +5318,7 @@ mod tests {
             order_oid: Some(9002),
             planned_notional_usd: 49.0941,
             pending_notional_usd: 0.0,
-            filled_notional_usd: 49.0622,
+            filled_notional_usd: 49.0941,
             remaining_notional_usd: 0.0,
             status: crate::strategies::smart_money::CopyLedgerStatus::Closed,
             ..open_entry.clone()
@@ -5345,6 +5357,161 @@ mod tests {
             close.status,
             crate::strategies::smart_money::CopyLedgerStatus::Closed
         );
+    }
+
+    #[test]
+    fn copy_live_daemon_persistence_merge_partial_closed_reduce_keeps_open_residual() {
+        let open_entry = crate::strategies::smart_money::CopyLedgerEntry {
+            local_account_id: "addr_a".to_string(),
+            leader_id: "leader_4".to_string(),
+            leader_group: "leader_4".to_string(),
+            signal_id: "sig-shaz-open".to_string(),
+            coin: "xyz:SHAZ".to_string(),
+            local_side: crate::domain::OrderSide::Sell,
+            order_cloid: None,
+            order_oid: None,
+            submitted_at_ms: Some(1_000),
+            filled_at_ms: Some(1_100),
+            planned_notional_usd: 98.60232,
+            pending_notional_usd: 0.0,
+            filled_notional_usd: 98.60232,
+            remaining_notional_usd: 98.60232,
+            status: crate::strategies::smart_money::CopyLedgerStatus::Open,
+        };
+        let closed_reduce = crate::strategies::smart_money::CopyLedgerEntry {
+            signal_id: "sig-shaz-close-close-1".to_string(),
+            order_cloid: Some("22222222-2222-5222-8222-222222222222".to_string()),
+            order_oid: Some(9002),
+            submitted_at_ms: Some(2_000),
+            filled_at_ms: Some(2_100),
+            planned_notional_usd: 98.60232,
+            pending_notional_usd: 0.0,
+            filled_notional_usd: 56.57876,
+            remaining_notional_usd: 0.0,
+            status: crate::strategies::smart_money::CopyLedgerStatus::Closed,
+            ..open_entry.clone()
+        };
+        let existing = crate::strategies::smart_money::CopyPersistenceSnapshot {
+            schema_version: 1,
+            saved_at_ms: now_ms(),
+            seen_event_keys: Vec::new(),
+            ledger_entries: vec![open_entry],
+        };
+        let incoming = crate::strategies::smart_money::CopyPersistenceSnapshot {
+            schema_version: 1,
+            saved_at_ms: now_ms(),
+            seen_event_keys: Vec::new(),
+            ledger_entries: vec![closed_reduce],
+        };
+
+        let merged = copy_live_daemon_merge_persistence_snapshots_for_save(existing, incoming);
+
+        let open = merged
+            .ledger_entries
+            .iter()
+            .find(|entry| entry.signal_id == "sig-shaz-open")
+            .expect("open entry");
+        assert_eq!(
+            open.status,
+            crate::strategies::smart_money::CopyLedgerStatus::Open
+        );
+        assert!((open.remaining_notional_usd - 42.02356).abs() < 1e-6);
+        let close = merged
+            .ledger_entries
+            .iter()
+            .find(|entry| entry.signal_id == "sig-shaz-close-close-1")
+            .expect("closed reduce entry");
+        assert_eq!(
+            close.status,
+            crate::strategies::smart_money::CopyLedgerStatus::Closed
+        );
+        assert!((close.filled_notional_usd - 56.57876).abs() < 1e-6);
+    }
+
+    #[test]
+    fn copy_live_daemon_persistence_merge_accumulates_multiple_partial_closed_reduces() {
+        let open_entry = crate::strategies::smart_money::CopyLedgerEntry {
+            local_account_id: "addr_a".to_string(),
+            leader_id: "leader_4".to_string(),
+            leader_group: "leader_4".to_string(),
+            signal_id: "sig-multi-open".to_string(),
+            coin: "xyz:SHAZ".to_string(),
+            local_side: crate::domain::OrderSide::Sell,
+            order_cloid: Some("11111111-1111-5111-8111-111111111111".to_string()),
+            order_oid: Some(9101),
+            submitted_at_ms: Some(1_000),
+            filled_at_ms: Some(1_100),
+            planned_notional_usd: 100.0,
+            pending_notional_usd: 0.0,
+            filled_notional_usd: 100.0,
+            remaining_notional_usd: 100.0,
+            status: crate::strategies::smart_money::CopyLedgerStatus::Open,
+        };
+        let first_reduce = crate::strategies::smart_money::CopyLedgerEntry {
+            signal_id: "sig-multi-close-1".to_string(),
+            order_cloid: Some("22222222-2222-5222-8222-222222222222".to_string()),
+            order_oid: Some(9102),
+            submitted_at_ms: Some(2_000),
+            filled_at_ms: Some(2_100),
+            planned_notional_usd: 30.0,
+            filled_notional_usd: 30.0,
+            remaining_notional_usd: 0.0,
+            status: crate::strategies::smart_money::CopyLedgerStatus::Closed,
+            ..open_entry.clone()
+        };
+        let second_reduce = crate::strategies::smart_money::CopyLedgerEntry {
+            signal_id: "sig-multi-close-2".to_string(),
+            order_cloid: Some("33333333-3333-5333-8333-333333333333".to_string()),
+            order_oid: Some(9103),
+            submitted_at_ms: Some(3_000),
+            filled_at_ms: Some(3_100),
+            planned_notional_usd: 20.0,
+            filled_notional_usd: 20.0,
+            remaining_notional_usd: 0.0,
+            status: crate::strategies::smart_money::CopyLedgerStatus::Closed,
+            ..open_entry.clone()
+        };
+        let existing = crate::strategies::smart_money::CopyPersistenceSnapshot {
+            schema_version: 1,
+            saved_at_ms: now_ms(),
+            seen_event_keys: Vec::new(),
+            ledger_entries: vec![open_entry],
+        };
+        let incoming = crate::strategies::smart_money::CopyPersistenceSnapshot {
+            schema_version: 1,
+            saved_at_ms: now_ms(),
+            seen_event_keys: Vec::new(),
+            ledger_entries: vec![first_reduce, second_reduce],
+        };
+
+        let merged = copy_live_daemon_merge_persistence_snapshots_for_save(existing, incoming);
+
+        let open = merged
+            .ledger_entries
+            .iter()
+            .find(|entry| entry.signal_id == "sig-multi-open")
+            .expect("open entry");
+        assert_eq!(
+            open.status,
+            crate::strategies::smart_money::CopyLedgerStatus::Open
+        );
+        assert!((open.remaining_notional_usd - 50.0).abs() < 1e-9);
+
+        let merged_again = copy_live_daemon_merge_persistence_snapshots_for_save(
+            merged,
+            crate::strategies::smart_money::CopyPersistenceSnapshot {
+                schema_version: 1,
+                saved_at_ms: now_ms(),
+                seen_event_keys: Vec::new(),
+                ledger_entries: Vec::new(),
+            },
+        );
+        let open_again = merged_again
+            .ledger_entries
+            .iter()
+            .find(|entry| entry.signal_id == "sig-multi-open")
+            .expect("open entry after repeated merge");
+        assert!((open_again.remaining_notional_usd - 50.0).abs() < 1e-9);
     }
 
     #[test]
@@ -16996,8 +17163,11 @@ fn copy_live_daemon_recover_pending_reduce_plan_refs(
         .iter()
         .enumerate()
         .filter(|(_, entry)| {
-            entry.status == strategies::smart_money::CopyLedgerStatus::PendingReduce
-                && target_accounts.contains(&entry.local_account_id)
+            matches!(
+                entry.status,
+                strategies::smart_money::CopyLedgerStatus::PendingReduce
+                    | strategies::smart_money::CopyLedgerStatus::PendingClose
+            ) && target_accounts.contains(&entry.local_account_id)
                 && entry.remaining_notional_usd > 1e-9
         })
         .map(|(offset, entry)| {
@@ -19004,10 +19174,7 @@ fn copy_live_daemon_apply_closed_reduces_to_open_entries(
         if !copy_live_daemon_closed_reduce_entry_consumes_open(entry) {
             continue;
         }
-        let reduction_notional = entry
-            .planned_notional_usd
-            .max(entry.filled_notional_usd)
-            .max(0.0);
+        let reduction_notional = entry.filled_notional_usd.max(0.0);
         if reduction_notional <= 0.0 || !reduction_notional.is_finite() {
             continue;
         }
@@ -19026,7 +19193,7 @@ fn copy_live_daemon_apply_closed_reduces_to_open_entries(
     if reductions.is_empty() {
         return;
     }
-    reductions.sort_by(|left, right| left.2.cmp(&right.2));
+    reductions.sort_by_key(|reduction| reduction.2);
 
     let mut open_indices_by_key = HashMap::<(String, String, String), Vec<usize>>::new();
     for (index, entry) in ledger_entries.iter().enumerate() {
@@ -19049,6 +19216,12 @@ fn copy_live_daemon_apply_closed_reduces_to_open_entries(
                 &copy_live_daemon_ledger_entry_event_time_ms(&ledger_entries[*right]),
             )
         });
+        for index in indices.iter().copied() {
+            ledger_entries[index].remaining_notional_usd = ledger_entries[index]
+                .filled_notional_usd
+                .max(ledger_entries[index].remaining_notional_usd)
+                .max(0.0);
+        }
     }
 
     for (key, mut reduction_notional, reduction_time_ms) in reductions {
@@ -19065,12 +19238,9 @@ fn copy_live_daemon_apply_closed_reduces_to_open_entries(
             {
                 continue;
             }
-            let baseline = ledger_entries[*index]
-                .filled_notional_usd
-                .max(ledger_entries[*index].remaining_notional_usd)
-                .max(0.0);
-            let remaining = (baseline - reduction_notional).max(0.0);
-            let consumed = baseline - remaining;
+            let available = ledger_entries[*index].remaining_notional_usd.max(0.0);
+            let remaining = (available - reduction_notional).max(0.0);
+            let consumed = available - remaining;
             reduction_notional = (reduction_notional - consumed).max(0.0);
             ledger_entries[*index].remaining_notional_usd = remaining;
             if remaining <= 1e-9 {

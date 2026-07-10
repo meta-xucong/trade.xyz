@@ -239,16 +239,40 @@ function Get-PositionTruthRiskDiagnostic {
     }
     $truth = $payload.position_truth
     $unattributedValue = Convert-ToDoubleOrZero $truth.unattributed_position_value_usd
-    if ($unattributedValue + 1e-9 -lt 10.0) {
+    $hasPositionDetails = ($payload.PSObject.Properties.Name -contains "positions") -and
+        $null -ne $payload.positions
+    if (-not $hasPositionDetails) {
+        if ($unattributedValue + 1e-9 -ge 10.0) {
+            return "unattributed_position_value_usd=$unattributedValue count=$($truth.unattributed_position_count) positions=unavailable"
+        }
         return ""
     }
-    $positions = @($payload.positions | Where-Object {
-        ([string]$_.owner) -eq "unattributed" -and
+    $unattributedPositions = @($payload.positions | Where-Object {
+        ([string]$_.owner) -eq "unattributed"
+    })
+    if ($unattributedPositions.Count -eq 0) {
+        if ($unattributedValue + 1e-9 -ge 10.0) {
+            return "unattributed_position_value_usd=$unattributedValue count=$($truth.unattributed_position_count) positions=inconsistent"
+        }
+        return ""
+    }
+    $unattributedDetailValue = 0.0
+    foreach ($position in $unattributedPositions) {
+        $unattributedDetailValue += Convert-ToDoubleOrZero $position.position_value_usd
+    }
+    if ($unattributedValue + 1e-9 -ge 10.0 -and
+        [Math]::Abs($unattributedValue - $unattributedDetailValue) -gt 0.01) {
+        return "unattributed_position_value_usd=$unattributedValue detail_unattributed_position_value_usd=$unattributedDetailValue count=$($truth.unattributed_position_count) positions=inconsistent"
+    }
+    $positions = @($unattributedPositions | Where-Object {
         ((Convert-ToDoubleOrZero $_.position_value_usd) + 1e-9 -ge 10.0)
     } | ForEach-Object {
         "$($_.account_id):$($_.coin):size=$($_.size):value=$($_.position_value_usd):pnl=$($_.pnl_usd)"
     })
-    $positionText = if ($positions.Count -gt 0) { $positions -join "," } else { "none" }
+    if ($positions.Count -eq 0) {
+        return ""
+    }
+    $positionText = $positions -join ","
     return "unattributed_position_value_usd=$unattributedValue count=$($truth.unattributed_position_count) positions=$positionText"
 }
 
@@ -781,6 +805,21 @@ function Start-CopyLiveSoak {
     }
     $start = Invoke-Json "/api/copy/live-soak/start" "POST" $body
     if ($start.ok) {
+        $statusPid = 0
+        $statusPidRunning = $false
+        if ($null -ne $start.data -and $null -ne $start.data.status) {
+            if ($null -ne $start.data.status.pid) {
+                [void][int]::TryParse([string]$start.data.status.pid, [ref]$statusPid)
+            }
+            if ($null -ne $start.data.status.pid_running) {
+                $statusPidRunning = [bool]$start.data.status.pid_running
+            }
+        }
+        if ($statusPidRunning -and $statusPid -gt 0) {
+            Set-SoakPidFile -Pid $statusPid
+            Write-MonitorLog "restart requested run_id=$($start.data.status.run_id) pid=$statusPid accounts=$($runtimeAccountIds -join ',') principal_cap=$PrincipalCapUsd leverage=$Leverage markets=$($runtimeMarkets -join ',') max_total_notional=$MaxTotalNotionalUsd max_total_fees=$MaxTotalFeesUsd"
+            return
+        }
         $soakPid = Set-LatestSoakPid $startedAt
         if ($soakPid) {
             Write-MonitorLog "restart requested run_id=$($start.data.status.run_id) pid=$soakPid accounts=$($runtimeAccountIds -join ',') principal_cap=$PrincipalCapUsd leverage=$Leverage markets=$($runtimeMarkets -join ',') max_total_notional=$MaxTotalNotionalUsd max_total_fees=$MaxTotalFeesUsd"

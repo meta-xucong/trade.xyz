@@ -8765,7 +8765,10 @@ fn clear_copy_live_soak_pause_flag() -> Result<()> {
 fn stop_copy_live_soak_from_frontend() -> Result<CopyLiveSoakActionResponse> {
     write_copy_live_soak_pause_flag()?;
     let before = build_copy_live_soak_status_response()?;
-    if !before.running {
+    let target_pid = copy_live_soak_stop_target_pid(before.running, before.pid, before.pid_running)
+        .filter(|pid| process_id_is_copy_live_soak(*pid))
+        .or_else(find_running_copy_live_soak_pid);
+    if target_pid.is_none() && !before.running {
         return Ok(CopyLiveSoakActionResponse {
             action: "stop".to_string(),
             status: before,
@@ -8773,7 +8776,7 @@ fn stop_copy_live_soak_from_frontend() -> Result<CopyLiveSoakActionResponse> {
             pid: None,
         });
     }
-    let Some(pid) = before.pid else {
+    let Some(pid) = target_pid else {
         return Ok(CopyLiveSoakActionResponse {
             action: "stop".to_string(),
             status: before,
@@ -8807,6 +8810,14 @@ fn stop_copy_live_soak_from_frontend() -> Result<CopyLiveSoakActionResponse> {
         message: format!("copy live soak stop requested for pid {}", pid),
         pid: Some(pid),
     })
+}
+
+fn copy_live_soak_stop_target_pid(
+    running: bool,
+    pid: Option<u32>,
+    pid_running: bool,
+) -> Option<u32> {
+    (running || pid_running).then_some(pid).flatten()
 }
 
 fn default_copy_soak_window_secs() -> u64 {
@@ -10838,7 +10849,10 @@ fn build_copy_live_soak_status_response_from_dir(
         response.pid = fs::read_to_string(&pid_path)
             .ok()
             .and_then(|text| text.trim().parse::<u32>().ok());
-        response.pid.map(process_id_is_running).unwrap_or(false)
+        response
+            .pid
+            .map(|pid| copy_live_soak_recorded_pid_is_running(dir, pid))
+            .unwrap_or(false)
     } else {
         false
     };
@@ -11197,6 +11211,41 @@ fn process_id_is_running(pid: u32) -> bool {
     }
 }
 
+fn copy_live_soak_command_line_matches(command_line: &str) -> bool {
+    let lower = command_line.to_ascii_lowercase();
+    lower.contains("run-persistent-live-soak.ps1") || lower.contains("copy-live-daemon-supervisor")
+}
+
+fn process_id_is_copy_live_soak(pid: u32) -> bool {
+    #[cfg(windows)]
+    {
+        let script = format!(
+            "$process = Get-CimInstance Win32_Process -Filter 'ProcessId={pid}' -ErrorAction SilentlyContinue; if ($null -ne $process) {{ $process.CommandLine }}"
+        );
+        let Ok(output) = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                &script,
+            ])
+            .output()
+        else {
+            return false;
+        };
+        output.status.success()
+            && copy_live_soak_command_line_matches(&String::from_utf8_lossy(&output.stdout))
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::read(format!("/proc/{pid}/cmdline"))
+            .ok()
+            .map(|bytes| String::from_utf8_lossy(&bytes).replace('\0', " "))
+            .is_some_and(|command_line| copy_live_soak_command_line_matches(&command_line))
+    }
+}
+
 fn write_copy_live_soak_current_pid(dir: &Path, pid: u32) -> Result<()> {
     fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
     fs::write(
@@ -11211,6 +11260,14 @@ fn is_default_copy_live_soak_dir(dir: &Path) -> bool {
         .and_then(|name| name.to_str())
         .map(|name| name == COPY_LIVE_SOAK_DIR)
         .unwrap_or(false)
+}
+
+fn copy_live_soak_recorded_pid_is_running(dir: &Path, pid: u32) -> bool {
+    if is_default_copy_live_soak_dir(dir) {
+        process_id_is_copy_live_soak(pid)
+    } else {
+        process_id_is_running(pid)
+    }
 }
 
 fn find_running_copy_live_soak_pid() -> Option<u32> {
@@ -20369,6 +20426,40 @@ mod tests {
         assert!(status.running);
         assert_eq!(status.latest_round, Some(2));
         assert_eq!(status.final_reconcile_health, None);
+    }
+
+    #[test]
+    fn copy_live_soak_stop_targets_live_wrapper_during_round_handoff() {
+        assert_eq!(
+            super::copy_live_soak_stop_target_pid(false, Some(50_656), true),
+            Some(50_656)
+        );
+        assert_eq!(
+            super::copy_live_soak_stop_target_pid(false, Some(50_656), false),
+            None
+        );
+        assert_eq!(
+            super::copy_live_soak_stop_target_pid(true, None, false),
+            None
+        );
+        assert!(super::copy_live_soak_command_line_matches(
+            "powershell -NoProfile -File V2\\scripts\\run-persistent-live-soak.ps1 -WindowSecs 600"
+        ));
+        assert!(super::copy_live_soak_command_line_matches(
+            "trade_xyz_bot_v2.exe copy-live-daemon-supervisor --submit true"
+        ));
+        assert!(!super::copy_live_soak_command_line_matches(
+            "powershell -NoProfile -File unrelated-maintenance.ps1"
+        ));
+        assert!(!super::process_id_is_copy_live_soak(std::process::id()));
+        assert!(!super::copy_live_soak_recorded_pid_is_running(
+            std::path::Path::new(super::COPY_LIVE_SOAK_DIR),
+            std::process::id()
+        ));
+        assert!(super::copy_live_soak_recorded_pid_is_running(
+            std::path::Path::new("isolated-status-test-dir"),
+            std::process::id()
+        ));
     }
 
     #[test]

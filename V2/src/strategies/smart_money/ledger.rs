@@ -144,6 +144,7 @@ impl CopyLedger {
                 }
             }
             CopyLedgerStatus::PendingReduce | CopyLedgerStatus::PendingClose => {
+                let original_entry = self.entries[index].clone();
                 let local_side = self.entries[index].local_side;
                 let account_id = self.entries[index].local_account_id.clone();
                 let coin = self.entries[index].coin.clone();
@@ -156,8 +157,11 @@ impl CopyLedger {
                     local_side,
                     filled_notional_usd,
                 );
+                let filled_for_current_entry = filled_notional_usd.min(current_pending_notional);
+                let remaining_pending_notional =
+                    (current_pending_notional - filled_for_current_entry).max(0.0);
                 let carried_reduce_notional =
-                    (filled_notional_usd - current_pending_notional).max(0.0);
+                    (filled_notional_usd - filled_for_current_entry).max(0.0);
                 if carried_reduce_notional > 0.0 {
                     self.close_carried_pending_reduces(
                         index,
@@ -169,15 +173,33 @@ impl CopyLedger {
                     );
                 }
                 self.entries[index].pending_notional_usd = 0.0;
-                self.entries[index].filled_notional_usd = filled_notional_usd;
+                self.entries[index].filled_notional_usd += filled_for_current_entry;
                 self.entries[index].remaining_notional_usd = 0.0;
                 self.entries[index].filled_at_ms = Some(filled_at);
                 self.entries[index].status = CopyLedgerStatus::Closed;
+                if remaining_pending_notional > 1e-9 {
+                    self.entries.push(CopyLedgerEntry {
+                        signal_id: copy_residual_reduce_signal_id(
+                            &original_entry.signal_id,
+                            report,
+                        ),
+                        order_cloid: None,
+                        order_oid: None,
+                        submitted_at_ms: None,
+                        filled_at_ms: None,
+                        planned_notional_usd: remaining_pending_notional,
+                        pending_notional_usd: remaining_pending_notional,
+                        filled_notional_usd: 0.0,
+                        remaining_notional_usd: remaining_pending_notional,
+                        status,
+                        ..original_entry
+                    });
+                }
                 CopyLedgerReconcileResult {
                     applied: true,
                     signal_id: report.signal_id.clone(),
                     status: Some(CopyLedgerStatus::Closed),
-                    filled_notional_usd,
+                    filled_notional_usd: self.entries[index].filled_notional_usd,
                     consumed_notional_usd,
                     reason_code: None,
                 }
@@ -737,6 +759,15 @@ fn copy_cloid_equivalent(left: &str, right: &str) -> bool {
         .is_some_and(|(left, right)| left == right)
 }
 
+fn copy_residual_reduce_signal_id(original_signal_id: &str, report: &OrderSubmitted) -> String {
+    let order_key = report
+        .oid
+        .map(|oid| oid.to_string())
+        .or_else(|| copy_normalized_cloid(&report.cloid))
+        .unwrap_or_else(|| report.submitted_at_ms.to_string());
+    format!("{original_signal_id}-residual-{order_key}")
+}
+
 fn copy_normalized_cloid(cloid: &str) -> Option<String> {
     let trimmed = cloid.trim();
     if trimmed.is_empty() {
@@ -748,4 +779,109 @@ fn copy_normalized_cloid(cloid: &str) -> Option<String> {
         .unwrap_or(trimmed);
     let hex = without_prefix.replace('-', "").to_ascii_lowercase();
     (hex.len() == 32 && hex.chars().all(|ch| ch.is_ascii_hexdigit())).then_some(hex)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn partial_pending_close_fill_splits_closed_evidence_from_retryable_residual() {
+        let mut ledger = CopyLedger::from_entries(vec![
+            CopyLedgerEntry {
+                local_account_id: "addr_a".to_string(),
+                leader_id: "leader_a".to_string(),
+                leader_group: "leader_a".to_string(),
+                signal_id: "sig-shaz-open".to_string(),
+                coin: "xyz:SHAZ".to_string(),
+                local_side: OrderSide::Sell,
+                order_cloid: Some("11111111-1111-5111-8111-111111111111".to_string()),
+                order_oid: Some(12344),
+                submitted_at_ms: Some(900),
+                filled_at_ms: Some(950),
+                planned_notional_usd: 98.60232,
+                pending_notional_usd: 0.0,
+                filled_notional_usd: 98.60232,
+                remaining_notional_usd: 98.60232,
+                status: CopyLedgerStatus::Open,
+            },
+            CopyLedgerEntry {
+                local_account_id: "addr_a".to_string(),
+                leader_id: "leader_a".to_string(),
+                leader_group: "leader_a".to_string(),
+                signal_id: "sig-close-close-1".to_string(),
+                coin: "xyz:SHAZ".to_string(),
+                local_side: OrderSide::Sell,
+                order_cloid: None,
+                order_oid: None,
+                submitted_at_ms: Some(1000),
+                filled_at_ms: None,
+                planned_notional_usd: 98.60232,
+                pending_notional_usd: 98.60232,
+                filled_notional_usd: 0.0,
+                remaining_notional_usd: 98.60232,
+                status: CopyLedgerStatus::PendingClose,
+            },
+        ]);
+        let report = OrderSubmitted {
+            signal_id: "sig-close-close-1".to_string(),
+            intent_id: "intent-close-1".to_string(),
+            worker_id: "worker-addr_a".to_string(),
+            account_id: "addr_a".to_string(),
+            cloid: "aaaaaaaa-aaaa-5aaa-8aaa-aaaaaaaaaaaa".to_string(),
+            coin: "xyz:SHAZ".to_string(),
+            side: OrderSide::Buy,
+            notional_usd: 56.57876,
+            submitted_price: Some(1.0),
+            submitted_size: Some(56.57876),
+            exchange_status: Some("filled".to_string()),
+            oid: Some(12345),
+            filled_size: Some(56.57876),
+            avg_fill_price: Some(1.0),
+            dry_run: false,
+            submitted_at_ms: 2000,
+        };
+
+        let result = ledger.apply_order_submission(&report);
+        let open = ledger
+            .entries()
+            .iter()
+            .find(|entry| entry.signal_id == "sig-shaz-open")
+            .expect("open entry");
+        let closed = ledger
+            .entries()
+            .iter()
+            .find(|entry| entry.signal_id == "sig-close-close-1")
+            .expect("closed evidence entry");
+        let residual = ledger
+            .entries()
+            .iter()
+            .find(|entry| entry.signal_id.starts_with("sig-close-close-1-residual-"))
+            .expect("residual retry entry");
+
+        assert!(result.applied);
+        assert_eq!(result.status, Some(CopyLedgerStatus::Closed));
+        assert_eq!(closed.status, CopyLedgerStatus::Closed);
+        assert!((closed.filled_notional_usd - 56.57876).abs() < 1e-9);
+        assert_eq!(closed.pending_notional_usd, 0.0);
+        assert_eq!(residual.status, CopyLedgerStatus::PendingClose);
+        assert!(residual.order_cloid.is_none());
+        assert!(residual.order_oid.is_none());
+        assert!((residual.pending_notional_usd - 42.02356).abs() < 1e-6);
+        assert!((residual.remaining_notional_usd - 42.02356).abs() < 1e-6);
+        assert!((open.remaining_notional_usd - 42.02356).abs() < 1e-6);
+
+        let replay = ledger.apply_order_submission(&report);
+        assert_eq!(
+            replay.reason_code.as_deref(),
+            Some("COPY_LEDGER_ALREADY_RECONCILED")
+        );
+        assert_eq!(ledger.entries().len(), 3);
+        let open_after_replay = ledger
+            .entries()
+            .iter()
+            .find(|entry| entry.signal_id == "sig-shaz-open")
+            .expect("open entry after replay");
+        assert!((open_after_replay.remaining_notional_usd - 42.02356).abs() < 1e-6);
+    }
 }
