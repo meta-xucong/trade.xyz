@@ -18,6 +18,7 @@ The V2 API process remained alive. The stopped component was the persistent live
 8. The stop API treated PID liveness as sufficient process identity. If a stale PID were reused by an unrelated process, `taskkill /T /F` could terminate the wrong process tree.
 9. The monitor's first aggregate/detail fail-closed guard covered missing details and an empty unattributed list, but not a partially returned non-empty list. An aggregate at or above 10 USD could therefore still fail open when the visible detail rows summed to a much smaller value and every visible row was individually below 10 USD.
 10. The status API still treated a recorded PID as running based on liveness alone. A stale PID reused by an unrelated process could therefore make the soak appear healthy and prevent monitor recovery even though stop now refused to terminate that unrelated process.
+11. PowerShell unwraps a single pipeline result into a scalar. The soak wrapper called `As-NonNullArray(...).Count` directly for order evidence, cleanup arrays, and final reconciliations, so exactly one item produced `null` instead of `1` in the summary even though the full report and trading health were correct.
 
 ## Fix
 
@@ -32,6 +33,7 @@ The V2 API process remained alive. The stopped component was the persistent live
 - Before termination, the stop API verifies that the candidate PID command line belongs to `run-persistent-live-soak.ps1` or `copy-live-daemon-supervisor`; otherwise it searches for the actual soak process and refuses to target the unrelated PID.
 - For aggregate unattributed exposure at or above 10 USD, the monitor also verifies that unattributed detail values sum to the aggregate within one cent. A partial non-empty detail response now fails closed as `positions=inconsistent` without changing the valid cross-symbol behavior when complete detail rows reconcile to the aggregate.
 - In the real `.codex-longrun` status directory, a recorded PID counts as running only when its command line also identifies a live-soak wrapper or daemon. Isolated status fixtures retain a liveness-only test seam, while production can recover from a reused unrelated PID.
+- Soak summary and degraded-round counts wrap every `As-NonNullArray` result in an array subexpression before reading `.Count`, preserving `0`, `1`, and multi-item cardinality for evidence, cleanup, and reconciliation data.
 
 ## Verification requirements
 
@@ -47,5 +49,6 @@ The V2 API process remained alive. The stopped component was the persistent live
 - Stop-target identity regression accepts the wrapper and daemon commands, and rejects an unrelated PowerShell command plus the current test process.
 - Monitor regression covers a partially returned non-empty detail list whose value contradicts the aggregate, plus the live complete-detail case where three individually sub-minimum positions reconcile to an aggregate above 10 USD without causing a false stop.
 - Status/stop PID regression rejects the current unrelated test process for the production directory while preserving isolated status fixture behavior.
+- PowerShell regression covers null, singleton, and two-item values and replays real round 7, where the corrected summary count is one submitted report and one order-evidence record.
 - A newly built binary completes a no-submit reconciliation before live soak is resumed.
 - After restart, at least one persistent live-soak round reports `ok=true`, `final_reconcile_health=true`, no cleanup errors, and submitted/evidence parity.

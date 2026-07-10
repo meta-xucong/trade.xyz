@@ -524,9 +524,9 @@ while ($true) {
             $normalizedMessage.Contains("copy_live_leverage_update_timeout")
         )
     }).Count
-    $evidenceCount = (As-NonNullArray $report.persistent_live_submit.order_evidence).Count
-    $cleanupCount = (As-NonNullArray $report.persistent_live_submit.cleanup_runbooks).Count
-    $cleanupErrors = (As-NonNullArray $report.persistent_live_submit.cleanup_errors).Count
+    $evidenceCount = @(As-NonNullArray $report.persistent_live_submit.order_evidence).Count
+    $cleanupCount = @(As-NonNullArray $report.persistent_live_submit.cleanup_runbooks).Count
+    $cleanupErrors = @(As-NonNullArray $report.persistent_live_submit.cleanup_errors).Count
     $finalReconcileHealth = $false
     foreach ($check in @($report.checks)) {
         if ($check.name -eq "final_reconcile_health") {
@@ -565,7 +565,7 @@ while ($true) {
         -and ($cleanupErrors -eq 0) `
         -and ($failedCheckNames.Count -gt 0) `
         -and (@($failedCheckNames | Where-Object { $_ -notin @("exchange_submit_mode", "final_reconcile_health") }).Count -eq 0) `
-        -and ((As-NonNullArray $report.final_reconciliations).Count -gt 0) `
+        -and (@(As-NonNullArray $report.final_reconciliations).Count -gt 0) `
         -and (@(As-NonNullArray $report.final_reconciliations | Where-Object { -not $_.error }).Count -eq 0)
     $readOnlyDegraded = (-not [bool]$report.ok) `
         -and ($submittedCount -eq 0) `
@@ -574,7 +574,7 @@ while ($true) {
         -and ($failedCheckNames.Count -gt 0) `
         -and ($failedCheckNames -contains "final_reconcile_health") `
         -and (@($failedCheckNames | Where-Object { $_ -notin @("watcher_runtime", "watcher_progress", "exchange_submit_mode", "final_reconcile_health") }).Count -eq 0) `
-        -and ((As-NonNullArray $report.final_reconciliations).Count -gt 0) `
+        -and (@(As-NonNullArray $report.final_reconciliations).Count -gt 0) `
         -and (@(As-NonNullArray $report.final_reconciliations | Where-Object { -not $_.error }).Count -eq 0)
     if ($watcherOnlyDegraded) {
         $consecutiveDegradedWatcherRounds += 1
