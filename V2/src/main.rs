@@ -5998,6 +5998,11 @@ mod tests {
         options.account_ids = vec!["addr_a".to_string(), "addr_b".to_string()];
         options.shadow_history_path = shadow_path;
 
+        assert!(
+            super::copy_live_daemon_unmapped_position_keys(&snapshot, &reconciliations).is_empty(),
+            "a persisted pending reduce must continue to map the live residual"
+        );
+
         let recovered = super::copy_live_daemon_recover_open_ledger_from_live_positions(
             snapshot,
             &reconciliations,
@@ -18948,15 +18953,31 @@ fn copy_live_daemon_unmapped_position_keys(
         .ledger_entries
         .iter()
         .filter(|entry| {
-            copy_live_daemon_ledger_entry_is_active_open_mapping(entry)
-                && copy_live_daemon_ledger_entry_has_live_order_evidence(entry)
+            ((copy_live_daemon_ledger_entry_is_active_open_mapping(entry)
+                && copy_live_daemon_ledger_entry_has_live_order_evidence(entry))
+                || matches!(
+                    entry.status,
+                    strategies::smart_money::CopyLedgerStatus::PendingReduce
+                        | strategies::smart_money::CopyLedgerStatus::PendingClose
+                ))
                 && !entry.local_account_id.trim().is_empty()
                 && !entry.coin.trim().is_empty()
         })
         .fold(
             HashMap::<(String, String, String), f64>::new(),
             |mut acc, entry| {
-                let notional = copy_live_daemon_active_open_mapping_notional(entry);
+                let notional = if matches!(
+                    entry.status,
+                    strategies::smart_money::CopyLedgerStatus::PendingReduce
+                        | strategies::smart_money::CopyLedgerStatus::PendingClose
+                ) {
+                    entry
+                        .remaining_notional_usd
+                        .max(entry.pending_notional_usd)
+                        .max(0.0)
+                } else {
+                    copy_live_daemon_active_open_mapping_notional(entry)
+                };
                 if notional > 1e-9 {
                     *acc.entry((
                         entry.local_account_id.clone(),
