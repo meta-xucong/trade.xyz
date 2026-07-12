@@ -8420,6 +8420,9 @@ mod tests {
         assert!(copy_live_daemon_error_is_safe_pre_submit_skip(
             "exchange returned action-level order error: Order could not immediately match against any resting orders. asset=110043"
         ));
+        assert!(copy_live_daemon_error_is_safe_pre_submit_skip(
+            "exchange returned action-level order error: Insufficient spot balance asset=10699"
+        ));
         assert!(!copy_live_daemon_error_is_safe_pre_submit_skip(
             "COPY_LIVE_ORDER_SUBMIT_TIMEOUT: submit ref addr_b xyz:NATGAS timed out after 60s"
         ));
@@ -15532,6 +15535,8 @@ fn copy_live_daemon_error_is_safe_pre_submit_skip(message: &str) -> bool {
                 .contains("only post-only orders allowed immediately after network upgrade")
         || normalized.contains("exchange returned action-level order error")
             && normalized.contains("could not immediately match against any resting orders")
+        || normalized.contains("exchange returned action-level order error")
+            && normalized.contains("insufficient spot balance")
 }
 
 fn copy_live_daemon_error_is_submit_transport_failure(message: &str) -> bool {

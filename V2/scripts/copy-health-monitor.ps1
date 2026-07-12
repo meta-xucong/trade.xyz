@@ -915,6 +915,18 @@ function Test-CopyLiveSoakPaused {
     return Test-Path -LiteralPath $copyLiveSoakPausePath
 }
 
+function Set-RestartFailurePause {
+    param([string]$Detail)
+    $alreadyPaused = Test-CopyLiveSoakPaused
+    if (-not $alreadyPaused) {
+        Set-Content -LiteralPath $copyLiveSoakPausePath -Value "restart_failed $(Get-Date -Format o)`n$Detail" -Encoding ascii
+        Send-MonitorNotification -Status "failed" -Reason "restart_failed" -Detail $Detail
+        Write-MonitorLog "restart failure paused automatic recovery detail=$Detail"
+    } else {
+        Write-MonitorLog "restart failure remains paused; notification suppressed detail=$Detail"
+    }
+}
+
 $monitorAccountIds = Get-RuntimeAccountIds
 $monitorMarkets = Get-RuntimeMarkets
 if ([double]::IsNaN($MaxTotalNotionalUsd) -or [double]::IsInfinity($MaxTotalNotionalUsd) -or $MaxTotalNotionalUsd -le 0.0) {
@@ -964,7 +976,7 @@ while ($true) {
                     Restart-CopyLiveSoakAfterStale -Reason "soak_heartbeat_stale" -Diagnostic $diagnostic
                     Reset-StopCandidate "restart_after_stale"
                 } catch {
-                    Send-MonitorNotification -Status "failed" -Reason "restart_failed" -Detail $_.Exception.Message
+                    Set-RestartFailurePause -Detail $_.Exception.Message
                     throw
                 }
             }
@@ -1001,7 +1013,7 @@ while ($true) {
                         Start-CopyLiveSoak
                         Reset-StopCandidate "restart_after_missing_process"
                     } catch {
-                        Send-MonitorNotification -Status "failed" -Reason "restart_failed" -Detail $_.Exception.Message
+                        Set-RestartFailurePause -Detail $_.Exception.Message
                         throw
                     }
                 }
@@ -1014,7 +1026,7 @@ while ($true) {
                     Restart-CopyLiveSoakAfterStale -Reason "soak_heartbeat_stale" -Diagnostic $diagnostic
                     Reset-StopCandidate "restart_after_stale_without_status"
                 } catch {
-                    Send-MonitorNotification -Status "failed" -Reason "restart_failed" -Detail $_.Exception.Message
+                    Set-RestartFailurePause -Detail $_.Exception.Message
                     throw
                 }
             }
@@ -1032,7 +1044,7 @@ while ($true) {
                     Start-CopyLiveSoak
                     Reset-StopCandidate "restart_after_not_running"
                 } catch {
-                    Send-MonitorNotification -Status "failed" -Reason "restart_failed" -Detail $_.Exception.Message
+                    Set-RestartFailurePause -Detail $_.Exception.Message
                     throw
                 }
             }
@@ -1048,7 +1060,7 @@ while ($true) {
                         Restart-CopyLiveSoakAfterStale -Reason "soak_heartbeat_stale" -Diagnostic $diagnostic
                         Reset-StopCandidate "restart_after_exception_stale"
                     } catch {
-                        Send-MonitorNotification -Status "failed" -Reason "restart_failed" -Detail $_.Exception.Message
+                        Set-RestartFailurePause -Detail $_.Exception.Message
                         throw
                     }
                 }
@@ -1066,7 +1078,7 @@ while ($true) {
                     Reset-StopCandidate "restart_after_exception_not_running"
                 } catch {
                     Write-MonitorLog "monitor restart failed after status exception: $($_.Exception.Message)"
-                    Send-MonitorNotification -Status "failed" -Reason "restart_failed" -Detail $_.Exception.Message
+                    Set-RestartFailurePause -Detail $_.Exception.Message
                 }
             }
         }
