@@ -457,19 +457,44 @@ function Set-SoakPidFile {
     Set-Content -LiteralPath ".codex-longrun\persistent-live-soak-detached-current.pid" -Value ([string]$ProcessId) -Encoding ascii
 }
 
+$script:processInspectionUnavailable = $false
+$script:lastProcessInspectionWarningAt = [datetime]::MinValue
+
+function Reset-ProcessInspectionState {
+    $script:processInspectionUnavailable = $false
+}
+
+function Invoke-SafeCimProcessQuery {
+    param([string]$Filter = "")
+    try {
+        if ([string]::IsNullOrWhiteSpace($Filter)) {
+            return @(Get-CimInstance Win32_Process -ErrorAction Stop)
+        }
+        return @(Get-CimInstance Win32_Process -Filter $Filter -ErrorAction Stop)
+    } catch {
+        $script:processInspectionUnavailable = $true
+        $now = Get-Date
+        if (($now - $script:lastProcessInspectionWarningAt).TotalSeconds -ge 60) {
+            $script:lastProcessInspectionWarningAt = $now
+            Write-MonitorLog "process inspection unavailable filter=$Filter error=$($_.Exception.Message)"
+        }
+        return @()
+    }
+}
+
 function Get-SoakWrapperProcess {
     $pidPath = ".codex-longrun\persistent-live-soak-detached-current.pid"
     if (Test-Path -LiteralPath $pidPath) {
         $pidText = Get-Content -LiteralPath $pidPath -Raw -ErrorAction SilentlyContinue
         $soakPid = 0
         if ([int]::TryParse($pidText.Trim(), [ref]$soakPid)) {
-            $byPid = Get-CimInstance Win32_Process -Filter "ProcessId=$soakPid" -ErrorAction SilentlyContinue
+            $byPid = Invoke-SafeCimProcessQuery -Filter "ProcessId=$soakPid"
             if ($byPid -and (Test-SoakWrapperCommand $byPid)) {
                 return $byPid
             }
         }
     }
-    $wrapper = Get-CimInstance Win32_Process | Where-Object {
+    $wrapper = Invoke-SafeCimProcessQuery | Where-Object {
         Test-SoakWrapperCommand $_
     } | Sort-Object CreationDate -Descending | Select-Object -First 1
     if ($wrapper) {
@@ -479,7 +504,7 @@ function Get-SoakWrapperProcess {
 }
 
 function Get-SoakRoundChildProcess {
-    return Get-CimInstance Win32_Process | Where-Object {
+    return Invoke-SafeCimProcessQuery | Where-Object {
         $commandLine = [string]$_.CommandLine
         $_.Name -eq "trade_xyz_bot_v2.exe" `
         -and $commandLine -like "*copy-live-daemon-supervisor*"
@@ -581,7 +606,7 @@ function Test-SoakProcessRunning {
 }
 
 function Get-SoakProcesses {
-    return Get-CimInstance Win32_Process | Where-Object {
+    return Invoke-SafeCimProcessQuery | Where-Object {
         Test-SoakProcessCommand $_
     } | Sort-Object CreationDate -Descending
 }
@@ -757,7 +782,7 @@ function Set-LatestSoakPid {
     $proc = $null
     while ((Get-Date) -lt $deadline -and $null -eq $proc) {
         Start-Sleep -Milliseconds 750
-        $proc = Get-CimInstance Win32_Process | Where-Object {
+        $proc = Invoke-SafeCimProcessQuery | Where-Object {
             (Test-SoakWrapperCommand $_) -and
             $_.CreationDate -ge $StartedAt.AddSeconds(-5)
         } | Sort-Object CreationDate -Descending | Select-Object -First 1
@@ -936,6 +961,7 @@ if ([double]::IsNaN($MaxTotalNotionalUsd) -or [double]::IsInfinity($MaxTotalNoti
 Write-MonitorLog "monitor started poll_secs=$PollSecs stop_confirm_polls=$StopConfirmPolls notification_cooldown_secs=$NotificationCooldownSecs base_url=$BaseUrl accounts=$($monitorAccountIds -join ',') principal_cap=$PrincipalCapUsd leverage=$Leverage markets=$($monitorMarkets -join ',') max_total_notional=$MaxTotalNotionalUsd max_total_fees=$MaxTotalFeesUsd bot_exe=$BotExePath"
 
 while ($true) {
+    Reset-ProcessInspectionState
     try {
         if (Test-CopyLiveSoakPaused) {
             Write-MonitorLog "paused_by_operator; automatic restart disabled"
@@ -968,6 +994,17 @@ while ($true) {
         }
         $status = Invoke-Json "/api/copy/live-soak/status"
         $soakProcess = Get-SoakProcess
+        if ($script:processInspectionUnavailable) {
+            $runtimeDetail = if ($status.ok -and $status.data.running) {
+                "healthy_status_only run_id=$($status.data.run_id) round=$($status.data.latest_round) process_inspection_unavailable=true"
+            } else {
+                "status_unavailable process_inspection_unavailable=true"
+            }
+            Reset-StopCandidate "process_inspection_unavailable"
+            Write-MonitorLog "monitor cycle degraded; $runtimeDetail; automatic restart deferred"
+            Start-Sleep -Seconds $PollSecs
+            continue
+        }
         if ($status.ok -and $status.data.running -and $null -ne $soakProcess -and (Test-SoakHeartbeatStale)) {
             $diagnostic = "soak_heartbeat_stale; $(Get-SoakHeartbeatDiagnostic)"
             Write-MonitorLog "detected stopped soak; diagnostic: $diagnostic"
@@ -1050,7 +1087,17 @@ while ($true) {
             }
         }
     } catch {
-        if (Test-SoakProcessRunning) {
+        $processRunning = $false
+        try {
+            $processRunning = Test-SoakProcessRunning
+        } catch {
+            $script:processInspectionUnavailable = $true
+            Write-MonitorLog "process inspection failed in monitor error path: $($_.Exception.Message)"
+        }
+        if ($script:processInspectionUnavailable) {
+            Reset-StopCandidate "process_inspection_unavailable"
+            Write-MonitorLog "monitor cycle degraded; status_exception=$($_.Exception.Message); process inspection unavailable; automatic restart deferred"
+        } elseif ($processRunning) {
             $proc = Get-SoakProcess
             if (Test-SoakHeartbeatStale) {
                 $diagnostic = "status_exception=$($_.Exception.Message); $(Get-SoakHeartbeatDiagnostic)"
