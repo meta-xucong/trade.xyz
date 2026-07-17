@@ -520,6 +520,23 @@ pub fn classify_leader_fill(
                 ),
             )
         }
+        (None, Some(after))
+            if !fill.reduce_only && normalize_position(after.signed_size) != 0.0 =>
+        {
+            let kind = if after.signed_size > 0.0 {
+                LeaderActionKind::OpenLong
+            } else {
+                LeaderActionKind::OpenShort
+            };
+            (
+                kind,
+                LeaderActionConfidence::Strong,
+                format!(
+                    "inferred_open_from_non_reduce_fill_after_position:{:.8}",
+                    after.signed_size
+                ),
+            )
+        }
         _ => (
             LeaderActionKind::Ambiguous,
             LeaderActionConfidence::Ambiguous,
@@ -624,9 +641,6 @@ pub fn leader_position_snapshots_from_clearinghouse_state(
         .filter_map(|asset_position| {
             let position = &asset_position.position;
             let signed_size = position.szi.parse::<f64>().ok()?;
-            if normalize_position(signed_size) == 0.0 {
-                return None;
-            }
             Some(LeaderPositionSnapshot {
                 leader_id: leader_id.to_string(),
                 market: market.clone(),
@@ -1610,6 +1624,23 @@ mod tests {
         assert_eq!(action.kind, LeaderActionKind::CloseShort);
         assert_eq!(action.kind.close_side(), Some(OrderSide::Buy));
         assert_eq!(action.confidence, LeaderActionConfidence::Strong);
+    }
+
+    #[test]
+    fn classify_fill_infers_open_from_non_reduce_fill_after_position_without_before_snapshot() {
+        let fill = leader_fill(
+            "fill-open-without-before",
+            "leader_a",
+            OrderSide::Buy,
+            100.0,
+        );
+        let after = leader_position("leader_a", "xyz:XYZ100", 1.0);
+
+        let action = classify_leader_fill(&fill, None, Some(&after));
+
+        assert_eq!(action.kind, LeaderActionKind::OpenLong);
+        assert_eq!(action.confidence, LeaderActionConfidence::Strong);
+        assert!(action.reason.contains("inferred_open"));
     }
 
     #[test]
@@ -4295,7 +4326,7 @@ mod tests {
     }
 
     #[test]
-    fn clearinghouse_adapter_extracts_nonzero_leader_positions() {
+    fn clearinghouse_adapter_preserves_zero_leader_positions_for_open_detection() {
         let state: crate::hyperliquid::ClearinghouseState = serde_json::from_str(
             r#"{
                 "marginSummary": {
@@ -4337,7 +4368,7 @@ mod tests {
             999,
         );
 
-        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots.len(), 2);
         assert_eq!(snapshots[0].leader_id, "leader_a");
         assert_eq!(snapshots[0].market.as_deref(), Some("xyz_perp"));
         assert_eq!(snapshots[0].dex.as_deref(), Some("xyz"));
@@ -4346,6 +4377,9 @@ mod tests {
         assert_eq!(snapshots[0].position_notional_usd, 25.0);
         assert_eq!(snapshots[0].snapshot_time_ms, 123456);
         assert_eq!(snapshots[0].received_at_ms, 999);
+        assert_eq!(snapshots[1].coin, "xyz:NVDA");
+        assert_eq!(snapshots[1].signed_size, 0.0);
+        assert_eq!(snapshots[1].position_notional_usd, 0.0);
     }
 
     #[test]
