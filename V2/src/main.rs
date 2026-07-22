@@ -49,6 +49,8 @@ const COPY_DAEMON_RECOVERED_LEDGER_DUPLICATE_TOLERANCE_USD: f64 = 1.0;
 const COPY_DAEMON_PNL_DRIFT_TOLERANCE_USD: f64 = 1.0;
 const COPY_DAEMON_LINEAGE_RESIDUAL_TOLERANCE_USD: f64 = 0.005;
 const COPY_DAEMON_CONFLICT_MIN_DIRECTION_SCORE_RATIO: f64 = 1.5;
+const COPY_DAEMON_DOWNTIME_BACKFILL_MAX_WINDOW_SECS: u64 = 72 * 60 * 60;
+const COPY_DAEMON_DOWNTIME_BACKFILL_OPEN_GRACE_MS: u64 = 5 * 60 * 1000;
 
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
@@ -84,17 +86,22 @@ mod tests {
         copy_bounded_live_window_ok, copy_daemon_live_leverage_update_options,
         copy_daemon_live_leverage_update_options_with_max,
         copy_daemon_submitted_reports_needing_cleanup, copy_execution_canary_report,
-        copy_live_daemon_close_open_barrier_chunks,
+        copy_live_daemon_build_downtime_backfill_plan, copy_live_daemon_close_open_barrier_chunks,
         copy_live_daemon_defer_open_refs_after_immediate_live_submit,
+        copy_live_daemon_downtime_backfill_candidates,
         copy_live_daemon_error_is_safe_pre_submit_skip,
         copy_live_daemon_error_is_submit_transport_failure,
+        copy_live_daemon_has_new_submit_candidate,
+        copy_live_daemon_has_startup_backfill_submit_candidate,
         copy_live_daemon_immediate_submit_should_stop_round,
         copy_live_daemon_live_submit_health_ok,
         copy_live_daemon_merge_persistence_snapshots_for_save,
         copy_live_daemon_merge_persistent_live_submit_reports,
-        copy_live_daemon_open_notional_usd_from_refs, copy_live_daemon_pending_plan_refs,
-        copy_live_daemon_pending_suppressed_refs, copy_live_daemon_persistence_snapshot_for_save,
-        copy_live_daemon_persistent_live_submit, copy_live_daemon_persistent_submit_dry_run,
+        copy_live_daemon_open_notional_usd_from_refs,
+        copy_live_daemon_pending_close_entries_for_backfill_refs,
+        copy_live_daemon_pending_plan_refs, copy_live_daemon_pending_suppressed_refs,
+        copy_live_daemon_persistence_snapshot_for_save, copy_live_daemon_persistent_live_submit,
+        copy_live_daemon_persistent_submit_dry_run,
         copy_live_daemon_persistent_submit_snapshot_safe_to_save,
         copy_live_daemon_prepare_refs_for_follow_position_limits,
         copy_live_daemon_reconcile_healthy_for_mode,
@@ -4684,6 +4691,7 @@ mod tests {
         let pending_close_entry = crate::strategies::smart_money::CopyLedgerEntry {
             status: crate::strategies::smart_money::CopyLedgerStatus::PendingClose,
             signal_id: "sig-persisted-close-residual".to_string(),
+            order_cloid: Some("11111111-1111-5111-8111-111111111111".to_string()),
             planned_notional_usd: 12.5,
             pending_notional_usd: 12.5,
             remaining_notional_usd: 12.5,
@@ -4712,6 +4720,7 @@ mod tests {
         assert_eq!(refs[1].signal_id, "sig-persisted-close-residual");
         assert!((refs[1].order.notional_usd - 12.5).abs() < 1e-9);
         assert!(refs[1].order.reduce_only);
+        assert_eq!(refs[1].order.cloid, "11111111-1111-5111-8111-111111111111");
 
         let refs_again = super::copy_live_daemon_recover_pending_reduce_plan_refs(
             &persistence,
@@ -7130,6 +7139,420 @@ mod tests {
             environment: None,
             ws_url: None,
         }
+    }
+
+    fn backfill_open_ledger_entry(
+        local_account_id: &str,
+        leader_id: &str,
+        coin: &str,
+        local_side: crate::domain::OrderSide,
+        notional_usd: f64,
+        filled_at_ms: u64,
+    ) -> crate::strategies::smart_money::CopyLedgerEntry {
+        crate::strategies::smart_money::CopyLedgerEntry {
+            local_account_id: local_account_id.to_string(),
+            leader_id: leader_id.to_string(),
+            leader_group: leader_id.to_string(),
+            signal_id: format!("open-{local_account_id}-{leader_id}-{coin}"),
+            coin: coin.to_string(),
+            local_side,
+            order_cloid: Some(format!("open-cloid-{local_account_id}-{leader_id}-{coin}")),
+            order_oid: Some(filled_at_ms),
+            submitted_at_ms: Some(filled_at_ms.saturating_sub(1_000)),
+            filled_at_ms: Some(filled_at_ms),
+            planned_notional_usd: notional_usd,
+            pending_notional_usd: 0.0,
+            filled_notional_usd: notional_usd,
+            remaining_notional_usd: notional_usd,
+            status: crate::strategies::smart_money::CopyLedgerStatus::Open,
+        }
+    }
+
+    fn downtime_backfill_user_fill(
+        coin: &str,
+        dir: &str,
+        oid: u64,
+        time: u64,
+    ) -> crate::hyperliquid::UserFill {
+        crate::hyperliquid::UserFill {
+            coin: coin.to_string(),
+            px: "7400".to_string(),
+            sz: "0.014".to_string(),
+            side: "A".to_string(),
+            time,
+            dir: dir.to_string(),
+            closed_pnl: "0".to_string(),
+            hash: format!("0x{oid:064x}"),
+            oid,
+            crossed: true,
+            fee: "0".to_string(),
+        }
+    }
+
+    fn downtime_backfill_state_with_position(
+        coin: &str,
+        szi: &str,
+    ) -> crate::hyperliquid::ClearinghouseState {
+        crate::hyperliquid::ClearinghouseState {
+            margin_summary: crate::hyperliquid::MarginSummary::default(),
+            cross_margin_summary: None,
+            cross_maintenance_margin_used: None,
+            withdrawable: None,
+            asset_positions: vec![crate::hyperliquid::AssetPosition {
+                position: crate::hyperliquid::PerpPosition {
+                    coin: coin.to_string(),
+                    szi: szi.to_string(),
+                    position_value: Some("104".to_string()),
+                    ..Default::default()
+                },
+                position_type: None,
+            }],
+            time: Some(1_720_000_000_000),
+        }
+    }
+
+    fn downtime_backfill_flat_state() -> crate::hyperliquid::ClearinghouseState {
+        crate::hyperliquid::ClearinghouseState {
+            margin_summary: crate::hyperliquid::MarginSummary::default(),
+            cross_margin_summary: None,
+            cross_maintenance_margin_used: None,
+            withdrawable: None,
+            asset_positions: Vec::new(),
+            time: Some(1_720_000_000_000),
+        }
+    }
+
+    #[test]
+    fn copy_live_daemon_downtime_backfill_generates_reduce_only_pending_close() {
+        let opened_at_ms = 1_720_000_000_000;
+        let close_time_ms = opened_at_ms + 60_000;
+        let ledger = crate::strategies::smart_money::CopyLedger::from_entries(vec![
+            backfill_open_ledger_entry(
+                "addr_b",
+                "leader_4",
+                "xyz:SP500",
+                crate::domain::OrderSide::Buy,
+                104.0,
+                opened_at_ms,
+            ),
+        ]);
+        let snapshot = crate::strategies::smart_money::CopyPersistenceSnapshot::new(
+            opened_at_ms,
+            Vec::new(),
+            &ledger,
+        );
+        let leaders = vec![CopyShadowSmokeLeader {
+            leader_id: "leader_4".to_string(),
+            leader_address: "0x0000000000000000000000000000000000000004".to_string(),
+        }];
+        let candidates = copy_live_daemon_downtime_backfill_candidates(
+            &snapshot,
+            &["addr_b".to_string()],
+            &leaders,
+        );
+        assert_eq!(candidates.len(), 1);
+        assert!(!candidates[0].ambiguous_scope);
+
+        let mut fills_by_leader_dex = HashMap::new();
+        fills_by_leader_dex.insert(
+            ("leader_4".to_string(), "xyz".to_string()),
+            vec![downtime_backfill_user_fill(
+                "xyz:SP500",
+                "Close Long",
+                495433473972,
+                close_time_ms,
+            )],
+        );
+        let mut states = HashMap::new();
+        states.insert(
+            ("leader_4".to_string(), "xyz".to_string()),
+            downtime_backfill_flat_state(),
+        );
+
+        let report = copy_live_daemon_build_downtime_backfill_plan(
+            &snapshot,
+            &candidates,
+            &fills_by_leader_dex,
+            &states,
+            close_time_ms + 10_000,
+        );
+        assert_eq!(report.refs_generated, 1);
+        let plan = &report.generated_refs[0];
+        assert_eq!(plan.leader_id, "leader_4");
+        assert_eq!(plan.order.account_id, "addr_b");
+        assert_eq!(plan.order.coin, "xyz:SP500");
+        assert_eq!(plan.order.side, crate::domain::OrderSide::Sell);
+        assert!(plan.order.reduce_only);
+        assert_eq!(plan.order.notional_usd, 104.0);
+
+        let pending_entries = copy_live_daemon_pending_close_entries_for_backfill_refs(
+            &report.generated_refs,
+            &candidates,
+            close_time_ms + 10_000,
+        );
+        assert_eq!(pending_entries.len(), 1);
+        assert_eq!(
+            pending_entries[0].status,
+            crate::strategies::smart_money::CopyLedgerStatus::PendingClose
+        );
+        assert_eq!(pending_entries[0].local_side, crate::domain::OrderSide::Buy);
+        assert_eq!(
+            pending_entries[0].order_cloid.as_deref(),
+            Some(plan.order.cloid.as_str())
+        );
+    }
+
+    #[test]
+    fn copy_live_daemon_downtime_backfill_skips_when_leader_still_has_same_side() {
+        let opened_at_ms = 1_720_000_000_000;
+        let close_time_ms = opened_at_ms + 60_000;
+        let ledger = crate::strategies::smart_money::CopyLedger::from_entries(vec![
+            backfill_open_ledger_entry(
+                "addr_b",
+                "leader_4",
+                "xyz:SP500",
+                crate::domain::OrderSide::Buy,
+                104.0,
+                opened_at_ms,
+            ),
+        ]);
+        let snapshot = crate::strategies::smart_money::CopyPersistenceSnapshot::new(
+            opened_at_ms,
+            Vec::new(),
+            &ledger,
+        );
+        let leaders = vec![CopyShadowSmokeLeader {
+            leader_id: "leader_4".to_string(),
+            leader_address: "0x0000000000000000000000000000000000000004".to_string(),
+        }];
+        let candidates = copy_live_daemon_downtime_backfill_candidates(
+            &snapshot,
+            &["addr_b".to_string()],
+            &leaders,
+        );
+        let mut fills_by_leader_dex = HashMap::new();
+        fills_by_leader_dex.insert(
+            ("leader_4".to_string(), "xyz".to_string()),
+            vec![downtime_backfill_user_fill(
+                "xyz:SP500",
+                "Close Long",
+                495433473972,
+                close_time_ms,
+            )],
+        );
+        let mut states = HashMap::new();
+        states.insert(
+            ("leader_4".to_string(), "xyz".to_string()),
+            downtime_backfill_state_with_position("xyz:SP500", "0.1"),
+        );
+
+        let report = copy_live_daemon_build_downtime_backfill_plan(
+            &snapshot,
+            &candidates,
+            &fills_by_leader_dex,
+            &states,
+            close_time_ms + 10_000,
+        );
+        assert_eq!(report.refs_generated, 0);
+        assert_eq!(report.skipped_leader_still_has_side, 1);
+    }
+
+    #[test]
+    fn copy_live_daemon_downtime_backfill_skips_ambiguous_multi_leader_scope() {
+        let opened_at_ms = 1_720_000_000_000;
+        let ledger = crate::strategies::smart_money::CopyLedger::from_entries(vec![
+            backfill_open_ledger_entry(
+                "addr_b",
+                "leader_4",
+                "xyz:SP500",
+                crate::domain::OrderSide::Buy,
+                50.0,
+                opened_at_ms,
+            ),
+            backfill_open_ledger_entry(
+                "addr_b",
+                "leader_5",
+                "xyz:SP500",
+                crate::domain::OrderSide::Buy,
+                54.0,
+                opened_at_ms + 1_000,
+            ),
+        ]);
+        let snapshot = crate::strategies::smart_money::CopyPersistenceSnapshot::new(
+            opened_at_ms,
+            Vec::new(),
+            &ledger,
+        );
+        let leaders = vec![
+            CopyShadowSmokeLeader {
+                leader_id: "leader_4".to_string(),
+                leader_address: "0x0000000000000000000000000000000000000004".to_string(),
+            },
+            CopyShadowSmokeLeader {
+                leader_id: "leader_5".to_string(),
+                leader_address: "0x0000000000000000000000000000000000000005".to_string(),
+            },
+        ];
+        let candidates = copy_live_daemon_downtime_backfill_candidates(
+            &snapshot,
+            &["addr_b".to_string()],
+            &leaders,
+        );
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates.iter().all(|candidate| candidate.ambiguous_scope));
+
+        let report = copy_live_daemon_build_downtime_backfill_plan(
+            &snapshot,
+            &candidates,
+            &HashMap::new(),
+            &HashMap::new(),
+            opened_at_ms + 60_000,
+        );
+        assert_eq!(report.refs_generated, 0);
+        assert_eq!(report.skipped_ambiguous_scope, 2);
+    }
+
+    #[test]
+    fn copy_live_daemon_downtime_backfill_dedupes_seen_leader_close_fill() {
+        let opened_at_ms = 1_720_000_000_000;
+        let close_time_ms = opened_at_ms + 60_000;
+        let seen_fill =
+            downtime_backfill_user_fill("xyz:SP500", "Close Long", 495433473972, close_time_ms);
+        let ledger = crate::strategies::smart_money::CopyLedger::from_entries(vec![
+            backfill_open_ledger_entry(
+                "addr_b",
+                "leader_4",
+                "xyz:SP500",
+                crate::domain::OrderSide::Buy,
+                104.0,
+                opened_at_ms,
+            ),
+        ]);
+        let snapshot = crate::strategies::smart_money::CopyPersistenceSnapshot::new(
+            opened_at_ms,
+            vec![format!(
+                "leader-semantic:leader_4:0xleader:{}:{}:{}:{}",
+                seen_fill.hash, seen_fill.oid, seen_fill.time, seen_fill.coin
+            )],
+            &ledger,
+        );
+        let leaders = vec![CopyShadowSmokeLeader {
+            leader_id: "leader_4".to_string(),
+            leader_address: "0x0000000000000000000000000000000000000004".to_string(),
+        }];
+        let candidates = copy_live_daemon_downtime_backfill_candidates(
+            &snapshot,
+            &["addr_b".to_string()],
+            &leaders,
+        );
+        let mut fills_by_leader_dex = HashMap::new();
+        fills_by_leader_dex.insert(("leader_4".to_string(), "xyz".to_string()), vec![seen_fill]);
+        let mut states = HashMap::new();
+        states.insert(
+            ("leader_4".to_string(), "xyz".to_string()),
+            downtime_backfill_flat_state(),
+        );
+
+        let report = copy_live_daemon_build_downtime_backfill_plan(
+            &snapshot,
+            &candidates,
+            &fills_by_leader_dex,
+            &states,
+            close_time_ms + 10_000,
+        );
+        assert_eq!(report.refs_generated, 0);
+        assert_eq!(report.skipped_seen_fills, 1);
+    }
+
+    #[test]
+    fn copy_live_daemon_startup_backfill_candidate_stops_before_watcher_window() {
+        let options = follow_position_options();
+        let backfill_ref = CopyLiveDaemonWouldSubmitRef {
+            record_index: 0,
+            signal_id: "copy-downtime-backfill-flat:leader_4:addr_b:xyz:SP500:buy:1-2".to_string(),
+            leader_id: "leader_4".to_string(),
+            leader_address: "0x0000000000000000000000000000000000000004".to_string(),
+            order: CopyExecutionCanaryWouldSubmit {
+                account_id: "addr_b".to_string(),
+                worker_id: "worker-addr_b".to_string(),
+                coin: "xyz:SP500".to_string(),
+                side: crate::domain::OrderSide::Sell,
+                notional_usd: 104.0,
+                reduce_only: true,
+                cloid: "11111111-1111-5111-8111-111111111111".to_string(),
+            },
+        };
+        assert!(copy_live_daemon_has_startup_backfill_submit_candidate(
+            &options,
+            &[backfill_ref]
+        ));
+
+        let ordinary_pending_reduce_ref = CopyLiveDaemonWouldSubmitRef {
+            record_index: 1,
+            signal_id: "sig-persisted-reduce".to_string(),
+            leader_id: "leader_4".to_string(),
+            leader_address: "0x0000000000000000000000000000000000000004".to_string(),
+            order: CopyExecutionCanaryWouldSubmit {
+                account_id: "addr_b".to_string(),
+                worker_id: "worker-addr_b".to_string(),
+                coin: "xyz:XYZ100".to_string(),
+                side: crate::domain::OrderSide::Buy,
+                notional_usd: 3.039,
+                reduce_only: true,
+                cloid: "22222222-2222-5222-8222-222222222222".to_string(),
+            },
+        };
+        assert!(!copy_live_daemon_has_startup_backfill_submit_candidate(
+            &options,
+            &[ordinary_pending_reduce_ref]
+        ));
+    }
+
+    #[test]
+    fn copy_live_daemon_new_submit_candidate_ignores_already_known_pending_reduce_refs() {
+        let options = follow_position_options();
+        let recovered_pending_reduce_ref = CopyLiveDaemonWouldSubmitRef {
+            record_index: 1,
+            signal_id: "sig-persisted-reduce".to_string(),
+            leader_id: "leader_5".to_string(),
+            leader_address: "0x0000000000000000000000000000000000000005".to_string(),
+            order: CopyExecutionCanaryWouldSubmit {
+                account_id: "addr_b".to_string(),
+                worker_id: "worker-addr_b".to_string(),
+                coin: "xyz:XYZ100".to_string(),
+                side: crate::domain::OrderSide::Buy,
+                notional_usd: 3.039,
+                reduce_only: true,
+                cloid: "22222222-2222-5222-8222-222222222222".to_string(),
+            },
+        };
+        let submitted_cloids = HashSet::from([recovered_pending_reduce_ref.order.cloid.clone()]);
+        assert!(!copy_live_daemon_has_new_submit_candidate(
+            &options,
+            &[recovered_pending_reduce_ref],
+            &submitted_cloids
+        ));
+
+        let fresh_reduce_ref = CopyLiveDaemonWouldSubmitRef {
+            record_index: 2,
+            signal_id: "sig-fresh-reduce".to_string(),
+            leader_id: "leader_4".to_string(),
+            leader_address: "0x0000000000000000000000000000000000000004".to_string(),
+            order: CopyExecutionCanaryWouldSubmit {
+                account_id: "addr_b".to_string(),
+                worker_id: "worker-addr_b".to_string(),
+                coin: "xyz:SP500".to_string(),
+                side: crate::domain::OrderSide::Sell,
+                notional_usd: 104.0,
+                reduce_only: true,
+                cloid: "33333333-3333-5333-8333-333333333333".to_string(),
+            },
+        };
+        assert!(copy_live_daemon_has_new_submit_candidate(
+            &options,
+            &[fresh_reduce_ref],
+            &submitted_cloids
+        ));
     }
 
     #[test]
@@ -11072,6 +11495,7 @@ struct CopyLiveDaemonSupervisorReport {
     watcher_subscriptions: Vec<Value>,
     persistence_path: String,
     shadow_history_path: String,
+    downtime_backfill: CopyLiveDaemonDowntimeBackfillReport,
     persistence_seen_keys_before: usize,
     persistence_seen_keys_after: usize,
     persistence_ledger_entries_before: usize,
@@ -11116,6 +11540,40 @@ struct CopyLiveDaemonWouldSubmitRef {
     leader_id: String,
     leader_address: String,
     order: CopyExecutionCanaryWouldSubmit,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CopyLiveDaemonDowntimeBackfillReport {
+    enabled: bool,
+    max_window_secs: u64,
+    window_start_ms: Option<u64>,
+    window_end_ms: Option<u64>,
+    active_candidate_count: usize,
+    ambiguous_candidate_count: usize,
+    leaders_queried: usize,
+    fills_scanned: usize,
+    close_fills_considered: usize,
+    current_state_checks: usize,
+    refs_generated: usize,
+    pending_entries_persisted: usize,
+    skipped_seen_fills: usize,
+    skipped_no_close_fill: usize,
+    skipped_leader_still_has_side: usize,
+    skipped_ambiguous_scope: usize,
+    errors: Vec<String>,
+    generated_refs: Vec<CopyLiveDaemonWouldSubmitRef>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct CopyLiveDaemonBackfillExposureCandidate {
+    local_account_id: String,
+    leader_id: String,
+    leader_address: String,
+    coin: String,
+    local_side: domain::OrderSide,
+    exposure_notional_usd: f64,
+    opened_at_ms: u64,
+    ambiguous_scope: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -12364,7 +12822,7 @@ async fn run_copy_live_daemon_supervisor(
     let local_account = local_account_id
         .as_deref()
         .and_then(|account_id| config.account(account_id));
-    let persistence =
+    let mut persistence =
         strategies::smart_money::load_copy_persistence_snapshot(&options.persistence_path)?;
     let persistence_seen_keys_before = persistence.seen_event_keys.len();
     let persistence_ledger_entries_before = persistence.ledger_entries.len();
@@ -12441,6 +12899,41 @@ async fn run_copy_live_daemon_supervisor(
         options.submit,
     ));
 
+    let downtime_backfill_enabled =
+        options.submit && options.live_gate && options.allow_live_submit;
+    let downtime_backfill =
+        if acceptance.ok && local_account.is_some() && !watcher_leaders.is_empty() {
+            copy_live_daemon_startup_downtime_backfill(
+                config,
+                &options,
+                &mut persistence,
+                &target_accounts,
+                &leaders,
+                &environment,
+                domain::now_ms(),
+            )
+            .await
+        } else {
+            copy_live_daemon_empty_downtime_backfill_report(downtime_backfill_enabled)
+        };
+    checks.push(copy_shadow_smoke_check(
+        "downtime_close_backfill",
+        downtime_backfill.errors.is_empty(),
+        if downtime_backfill.enabled {
+            format!(
+                "startup close-only backfill scanned {} fill(s), candidates={}, ambiguous={}, generated={} ref(s), persisted={} pending close entrie(s), errors={}",
+                downtime_backfill.fills_scanned,
+                downtime_backfill.active_candidate_count,
+                downtime_backfill.ambiguous_candidate_count,
+                downtime_backfill.refs_generated,
+                downtime_backfill.pending_entries_persisted,
+                downtime_backfill.errors.len()
+            )
+        } else {
+            "startup close-only backfill is disabled outside live submit mode".to_string()
+        },
+    ));
+
     let mut input = CopyShadowWatchReportInput::new(CopyShadowWatchReportBase {
         environment: environment.clone(),
         ws_url: ws_url.clone(),
@@ -12453,6 +12946,10 @@ async fn run_copy_live_daemon_supervisor(
     });
     let mut approved_records = Vec::new();
     let mut would_submit_plan_refs = Vec::new();
+    append_unique_copy_daemon_would_submit_refs(
+        &mut would_submit_plan_refs,
+        downtime_backfill.generated_refs.clone(),
+    );
     let recovered_pending_reduce_refs =
         copy_live_daemon_recover_pending_reduce_plan_refs(&persistence, &target_accounts);
     if !recovered_pending_reduce_refs.is_empty() {
@@ -12473,10 +12970,18 @@ async fn run_copy_live_daemon_supervisor(
     let mut live_submit_chunks = Vec::new();
     let mut pending_unclassified_fill_count = 0usize;
     let mut pending_unclassified_fill_labels = Vec::new();
-    let mut stop_for_submit_candidate = false;
+    let mut stop_for_submit_candidate = acceptance.ok
+        && local_account.is_some()
+        && !watcher_leaders.is_empty()
+        && copy_live_daemon_has_startup_backfill_submit_candidate(
+            &options,
+            &would_submit_plan_refs,
+        );
     let started = Instant::now();
 
-    if acceptance.ok && local_account.is_some() && !watcher_leaders.is_empty() {
+    if stop_for_submit_candidate {
+        input.watcher_status = "stopped_after_submit_candidate".to_string();
+    } else if acceptance.ok && local_account.is_some() && !watcher_leaders.is_empty() {
         let mut pipelines = target_accounts
             .iter()
             .filter_map(|account_id| {
@@ -12549,21 +13054,20 @@ async fn run_copy_live_daemon_supervisor(
                                 &new_approved_records,
                                 base_record_index,
                             )?;
+                        let new_submit_candidate = copy_live_daemon_has_new_submit_candidate(
+                            &options,
+                            &new_would_submit_refs,
+                            &submitted_plan_cloids,
+                        );
                         append_unique_copy_daemon_would_submit_refs(
                             &mut would_submit_plan_refs,
                             new_would_submit_refs,
                         );
                         approved_records.extend(new_approved_records);
-                        if options.submit {
-                            let pending_candidate_plan_refs = copy_live_daemon_pending_plan_refs(
-                                &would_submit_plan_refs,
-                                &submitted_plan_cloids,
-                            );
-                            if !pending_candidate_plan_refs.is_empty() {
-                                stop_for_submit_candidate = true;
-                                input.watcher_status = "stopped_after_submit_candidate".to_string();
-                                break;
-                            }
+                        if new_submit_candidate {
+                            stop_for_submit_candidate = true;
+                            input.watcher_status = "stopped_after_submit_candidate".to_string();
+                            break;
                         }
                     }
                 }
@@ -13065,6 +13569,7 @@ async fn run_copy_live_daemon_supervisor(
         watcher_subscriptions,
         persistence_path: options.persistence_path.display().to_string(),
         shadow_history_path: options.shadow_history_path.display().to_string(),
+        downtime_backfill,
         persistence_seen_keys_before,
         persistence_seen_keys_after: saved.seen_event_keys.len(),
         persistence_ledger_entries_before,
@@ -17163,6 +17668,545 @@ fn plan_copy_daemon_acceptance_order_refs_with_offset(
     Ok(plans)
 }
 
+fn copy_live_daemon_empty_downtime_backfill_report(
+    enabled: bool,
+) -> CopyLiveDaemonDowntimeBackfillReport {
+    CopyLiveDaemonDowntimeBackfillReport {
+        enabled,
+        max_window_secs: COPY_DAEMON_DOWNTIME_BACKFILL_MAX_WINDOW_SECS,
+        window_start_ms: None,
+        window_end_ms: None,
+        active_candidate_count: 0,
+        ambiguous_candidate_count: 0,
+        leaders_queried: 0,
+        fills_scanned: 0,
+        close_fills_considered: 0,
+        current_state_checks: 0,
+        refs_generated: 0,
+        pending_entries_persisted: 0,
+        skipped_seen_fills: 0,
+        skipped_no_close_fill: 0,
+        skipped_leader_still_has_side: 0,
+        skipped_ambiguous_scope: 0,
+        errors: Vec::new(),
+        generated_refs: Vec::new(),
+    }
+}
+
+async fn copy_live_daemon_startup_downtime_backfill(
+    _config: &config::AppConfig,
+    options: &CopyLiveDaemonSupervisorOptions,
+    persistence: &mut strategies::smart_money::CopyPersistenceSnapshot,
+    target_accounts: &[String],
+    leaders: &[CopyShadowSmokeLeader],
+    environment: &str,
+    now_ms: u64,
+) -> CopyLiveDaemonDowntimeBackfillReport {
+    let mut report = copy_live_daemon_empty_downtime_backfill_report(
+        options.submit && options.live_gate && options.allow_live_submit,
+    );
+    if !report.enabled {
+        return report;
+    }
+
+    let candidates =
+        copy_live_daemon_downtime_backfill_candidates(persistence, target_accounts, leaders);
+    report.active_candidate_count = candidates.len();
+    report.ambiguous_candidate_count = candidates
+        .iter()
+        .filter(|candidate| candidate.ambiguous_scope)
+        .count();
+    if candidates.is_empty() {
+        return report;
+    }
+    let Some(earliest_open_ms) = candidates
+        .iter()
+        .filter(|candidate| !candidate.ambiguous_scope)
+        .map(|candidate| candidate.opened_at_ms)
+        .min()
+    else {
+        report.skipped_ambiguous_scope = candidates.len();
+        return report;
+    };
+    let max_window_ms = COPY_DAEMON_DOWNTIME_BACKFILL_MAX_WINDOW_SECS.saturating_mul(1_000);
+    let window_start_ms = earliest_open_ms
+        .saturating_sub(COPY_DAEMON_DOWNTIME_BACKFILL_OPEN_GRACE_MS)
+        .max(now_ms.saturating_sub(max_window_ms));
+    report.window_start_ms = Some(window_start_ms);
+    report.window_end_ms = Some(now_ms);
+
+    let mut required_fill_queries = candidates
+        .iter()
+        .filter(|candidate| !candidate.ambiguous_scope)
+        .map(|candidate| {
+            let (_market, dex) = copy_daemon_market_dex_for_coin(&candidate.coin);
+            (candidate.leader_id.clone(), dex.unwrap_or_default())
+        })
+        .collect::<Vec<_>>();
+    required_fill_queries.sort();
+    required_fill_queries.dedup();
+
+    let leader_address_by_id = leaders
+        .iter()
+        .map(|leader| (leader.leader_id.clone(), leader.leader_address.clone()))
+        .collect::<HashMap<_, _>>();
+    let mut fills_by_leader_dex = HashMap::<(String, String), Vec<hyperliquid::UserFill>>::new();
+    for (leader_id, dex) in required_fill_queries {
+        let Some(leader_address) = leader_address_by_id.get(&leader_id) else {
+            report.errors.push(format!(
+                "downtime backfill skipped {leader_id}: leader address not configured"
+            ));
+            continue;
+        };
+        if dex.eq_ignore_ascii_case("spot") {
+            report.errors.push(format!(
+                "downtime backfill skipped {leader_id} spot scope: spot close backfill is not enabled"
+            ));
+            continue;
+        }
+        report.leaders_queried += 1;
+        match hyperliquid::fetch_user_fills_by_time(
+            environment,
+            &dex,
+            leader_address,
+            window_start_ms,
+            Some(now_ms),
+        )
+        .await
+        {
+            Ok(fills) => {
+                report.fills_scanned += fills.len();
+                fills_by_leader_dex.insert((leader_id, dex), fills);
+            }
+            Err(error) => report.errors.push(format!(
+                "downtime backfill userFillsByTime failed for {leader_id} dex={dex}: {error}"
+            )),
+        }
+    }
+
+    let mut required_state_queries = candidates
+        .iter()
+        .filter(|candidate| !candidate.ambiguous_scope)
+        .map(|candidate| {
+            let (_market, dex) = copy_daemon_market_dex_for_coin(&candidate.coin);
+            (candidate.leader_id.clone(), dex.unwrap_or_default())
+        })
+        .collect::<Vec<_>>();
+    required_state_queries.sort();
+    required_state_queries.dedup();
+    let mut leader_state_by_leader_dex =
+        HashMap::<(String, String), hyperliquid::ClearinghouseState>::new();
+    for (leader_id, dex) in required_state_queries {
+        let Some(leader_address) = leader_address_by_id.get(&leader_id) else {
+            continue;
+        };
+        if dex.eq_ignore_ascii_case("spot") {
+            continue;
+        }
+        report.current_state_checks += 1;
+        match hyperliquid::fetch_clearinghouse_state(environment, &dex, leader_address).await {
+            Ok(state) => {
+                leader_state_by_leader_dex.insert((leader_id, dex), state);
+            }
+            Err(error) => report.errors.push(format!(
+                "downtime backfill clearinghouseState failed for {leader_id} dex={dex}: {error}"
+            )),
+        }
+    }
+
+    let mut build_report = copy_live_daemon_build_downtime_backfill_plan(
+        persistence,
+        &candidates,
+        &fills_by_leader_dex,
+        &leader_state_by_leader_dex,
+        now_ms,
+    );
+    report.close_fills_considered = build_report.close_fills_considered;
+    report.refs_generated = build_report.refs_generated;
+    report.skipped_seen_fills = build_report.skipped_seen_fills;
+    report.skipped_no_close_fill = build_report.skipped_no_close_fill;
+    report.skipped_leader_still_has_side = build_report.skipped_leader_still_has_side;
+    report.skipped_ambiguous_scope = build_report.skipped_ambiguous_scope;
+    report.errors.append(&mut build_report.errors);
+
+    if build_report.generated_refs.is_empty() {
+        return report;
+    }
+
+    let mut snapshot_for_save = persistence.clone();
+    let pending_entries = copy_live_daemon_pending_close_entries_for_backfill_refs(
+        &build_report.generated_refs,
+        &candidates,
+        now_ms,
+    );
+    for entry in pending_entries {
+        snapshot_for_save.ledger_entries.push(entry);
+    }
+    snapshot_for_save
+        .seen_event_keys
+        .extend(copy_live_daemon_backfill_seen_event_keys(
+            &build_report.generated_refs,
+        ));
+    snapshot_for_save.seen_event_keys.sort();
+    snapshot_for_save.seen_event_keys.dedup();
+    snapshot_for_save.saved_at_ms = now_ms;
+
+    let snapshot_for_save = copy_live_daemon_persistence_snapshot_for_save(snapshot_for_save);
+    match strategies::smart_money::save_copy_persistence_snapshot(
+        &options.persistence_path,
+        &snapshot_for_save,
+    ) {
+        Ok(()) => {
+            report.pending_entries_persisted = build_report.generated_refs.len();
+            report.generated_refs = build_report.generated_refs;
+            *persistence = snapshot_for_save;
+        }
+        Err(error) => {
+            report.refs_generated = 0;
+            report.generated_refs.clear();
+            report.errors.push(format!(
+                "downtime backfill pending close snapshot save failed; no recovery refs will be submitted: {error}"
+            ));
+        }
+    }
+
+    report
+}
+
+fn copy_live_daemon_downtime_backfill_candidates(
+    persistence: &strategies::smart_money::CopyPersistenceSnapshot,
+    target_accounts: &[String],
+    leaders: &[CopyShadowSmokeLeader],
+) -> Vec<CopyLiveDaemonBackfillExposureCandidate> {
+    let target_accounts = target_accounts.iter().collect::<HashSet<_>>();
+    let leader_address_by_id = leaders
+        .iter()
+        .map(|leader| (leader.leader_id.clone(), leader.leader_address.clone()))
+        .collect::<HashMap<_, _>>();
+    let mut ownership_scopes = HashMap::<(String, String, String), HashSet<String>>::new();
+    let mut opened_at_by_group = HashMap::<(String, String, String, String), u64>::new();
+
+    for entry in persistence.ledger_entries.iter().filter(|entry| {
+        target_accounts.contains(&entry.local_account_id)
+            && matches!(
+                entry.status,
+                strategies::smart_money::CopyLedgerStatus::Open
+                    | strategies::smart_money::CopyLedgerStatus::PendingOpen
+            )
+    }) {
+        let leader_group = copy_live_daemon_entry_leader_group(entry);
+        if leader_group.trim().is_empty() {
+            continue;
+        }
+        let side_key = copy_live_daemon_order_side_key(entry.local_side);
+        ownership_scopes
+            .entry((
+                entry.local_account_id.clone(),
+                entry.coin.clone(),
+                side_key.clone(),
+            ))
+            .or_default()
+            .insert(leader_group.clone());
+        let opened_at_ms = entry
+            .filled_at_ms
+            .or(entry.submitted_at_ms)
+            .unwrap_or(persistence.saved_at_ms);
+        opened_at_by_group
+            .entry((
+                entry.local_account_id.clone(),
+                leader_group,
+                entry.coin.clone(),
+                side_key,
+            ))
+            .and_modify(|existing| *existing = (*existing).min(opened_at_ms))
+            .or_insert(opened_at_ms);
+    }
+
+    let ledger =
+        strategies::smart_money::CopyLedger::from_entries(persistence.ledger_entries.clone());
+    let mut candidates = Vec::new();
+    for ((local_account_id, leader_group, coin, side_key), opened_at_ms) in opened_at_by_group {
+        let Some(local_side) = copy_live_daemon_order_side_from_key(&side_key) else {
+            continue;
+        };
+        let exposure_notional_usd = ledger.submitted_effective_exposure_usd_for_leader_group(
+            &local_account_id,
+            &leader_group,
+            &coin,
+            local_side,
+        );
+        if exposure_notional_usd <= 1e-9 {
+            continue;
+        }
+        let ambiguous_scope = ownership_scopes
+            .get(&(local_account_id.clone(), coin.clone(), side_key))
+            .is_some_and(|groups| groups.len() > 1);
+        let Some(leader_address) = leader_address_by_id.get(&leader_group).cloned() else {
+            continue;
+        };
+        candidates.push(CopyLiveDaemonBackfillExposureCandidate {
+            local_account_id,
+            leader_id: leader_group,
+            leader_address,
+            coin,
+            local_side,
+            exposure_notional_usd,
+            opened_at_ms,
+            ambiguous_scope,
+        });
+    }
+    candidates.sort_by(|left, right| {
+        (
+            &left.local_account_id,
+            &left.leader_id,
+            &left.coin,
+            copy_live_daemon_order_side_key(left.local_side),
+        )
+            .cmp(&(
+                &right.local_account_id,
+                &right.leader_id,
+                &right.coin,
+                copy_live_daemon_order_side_key(right.local_side),
+            ))
+    });
+    candidates
+}
+
+fn copy_live_daemon_build_downtime_backfill_plan(
+    persistence: &strategies::smart_money::CopyPersistenceSnapshot,
+    candidates: &[CopyLiveDaemonBackfillExposureCandidate],
+    fills_by_leader_dex: &HashMap<(String, String), Vec<hyperliquid::UserFill>>,
+    leader_state_by_leader_dex: &HashMap<(String, String), hyperliquid::ClearinghouseState>,
+    now_ms: u64,
+) -> CopyLiveDaemonDowntimeBackfillReport {
+    let mut report = CopyLiveDaemonDowntimeBackfillReport {
+        enabled: true,
+        max_window_secs: COPY_DAEMON_DOWNTIME_BACKFILL_MAX_WINDOW_SECS,
+        window_start_ms: candidates
+            .iter()
+            .map(|candidate| candidate.opened_at_ms)
+            .min(),
+        window_end_ms: Some(now_ms),
+        active_candidate_count: candidates.len(),
+        ambiguous_candidate_count: candidates
+            .iter()
+            .filter(|candidate| candidate.ambiguous_scope)
+            .count(),
+        leaders_queried: fills_by_leader_dex.len(),
+        fills_scanned: fills_by_leader_dex.values().map(Vec::len).sum(),
+        close_fills_considered: 0,
+        current_state_checks: leader_state_by_leader_dex.len(),
+        refs_generated: 0,
+        pending_entries_persisted: 0,
+        skipped_seen_fills: 0,
+        skipped_no_close_fill: 0,
+        skipped_leader_still_has_side: 0,
+        skipped_ambiguous_scope: 0,
+        errors: Vec::new(),
+        generated_refs: Vec::new(),
+    };
+
+    for candidate in candidates {
+        if candidate.ambiguous_scope {
+            report.skipped_ambiguous_scope += 1;
+            continue;
+        }
+        let (_market, dex) = copy_daemon_market_dex_for_coin(&candidate.coin);
+        let dex = dex.unwrap_or_default();
+        let Some(fills) = fills_by_leader_dex.get(&(candidate.leader_id.clone(), dex.clone()))
+        else {
+            report.skipped_no_close_fill += 1;
+            continue;
+        };
+        let mut matching_close_fills = fills
+            .iter()
+            .filter(|fill| {
+                fill.coin == candidate.coin
+                    && fill.time
+                        >= candidate
+                            .opened_at_ms
+                            .saturating_sub(COPY_DAEMON_DOWNTIME_BACKFILL_OPEN_GRACE_MS)
+                    && copy_live_daemon_backfill_fill_closes_local_side(fill, candidate.local_side)
+            })
+            .collect::<Vec<_>>();
+        matching_close_fills.sort_by_key(|fill| fill.time);
+        if matching_close_fills.is_empty() {
+            report.skipped_no_close_fill += 1;
+            continue;
+        }
+        report.close_fills_considered += matching_close_fills.len();
+        let unseen_close_fills = matching_close_fills
+            .into_iter()
+            .filter(|fill| {
+                let seen = copy_live_daemon_backfill_fill_seen(persistence, fill);
+                if seen {
+                    report.skipped_seen_fills += 1;
+                }
+                !seen
+            })
+            .collect::<Vec<_>>();
+        if unseen_close_fills.is_empty() {
+            continue;
+        }
+        let Some(state) = leader_state_by_leader_dex.get(&(candidate.leader_id.clone(), dex))
+        else {
+            report.errors.push(format!(
+                "downtime backfill skipped {} {} {}: current leader state unavailable",
+                candidate.leader_id, candidate.local_account_id, candidate.coin
+            ));
+            continue;
+        };
+        if copy_live_daemon_leader_state_has_same_side(state, &candidate.coin, candidate.local_side)
+        {
+            report.skipped_leader_still_has_side += 1;
+            continue;
+        }
+        let first_fill_time = unseen_close_fills
+            .iter()
+            .map(|fill| fill.time)
+            .min()
+            .unwrap_or(now_ms);
+        let last_fill_time = unseen_close_fills
+            .iter()
+            .map(|fill| fill.time)
+            .max()
+            .unwrap_or(now_ms);
+        let signal_id = format!(
+            "copy-downtime-backfill-flat:{}:{}:{}:{}:{}-{}",
+            candidate.leader_id,
+            candidate.local_account_id,
+            candidate.coin,
+            copy_live_daemon_order_side_key(candidate.local_side),
+            first_fill_time,
+            last_fill_time
+        );
+        if persistence
+            .ledger_entries
+            .iter()
+            .any(|entry| entry.signal_id == signal_id)
+        {
+            report.skipped_seen_fills += unseen_close_fills.len();
+            continue;
+        }
+        let cloid_seed = format!(
+            "copy-downtime-backfill-flat:{}:{}:{}:{}:{}:{}",
+            candidate.local_account_id,
+            candidate.leader_id,
+            candidate.coin,
+            copy_live_daemon_order_side_key(candidate.local_side),
+            first_fill_time,
+            last_fill_time
+        );
+        report.generated_refs.push(CopyLiveDaemonWouldSubmitRef {
+            record_index: persistence.ledger_entries.len() + report.generated_refs.len(),
+            signal_id,
+            leader_id: candidate.leader_id.clone(),
+            leader_address: candidate.leader_address.clone(),
+            order: CopyExecutionCanaryWouldSubmit {
+                account_id: candidate.local_account_id.clone(),
+                worker_id: format!("worker-{}", candidate.local_account_id),
+                coin: candidate.coin.clone(),
+                side: opposite_order_side(candidate.local_side),
+                notional_usd: candidate.exposure_notional_usd,
+                reduce_only: true,
+                cloid: uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, cloid_seed.as_bytes())
+                    .to_string(),
+            },
+        });
+    }
+    report.refs_generated = report.generated_refs.len();
+    report
+}
+
+fn copy_live_daemon_pending_close_entries_for_backfill_refs(
+    refs: &[CopyLiveDaemonWouldSubmitRef],
+    candidates: &[CopyLiveDaemonBackfillExposureCandidate],
+    now_ms: u64,
+) -> Vec<strategies::smart_money::CopyLedgerEntry> {
+    refs.iter()
+        .filter_map(|plan| {
+            let local_side = opposite_order_side(plan.order.side);
+            let candidate = candidates.iter().find(|candidate| {
+                candidate.local_account_id == plan.order.account_id
+                    && candidate.leader_id == plan.leader_id
+                    && candidate.coin == plan.order.coin
+                    && candidate.local_side == local_side
+            })?;
+            Some(strategies::smart_money::CopyLedgerEntry {
+                local_account_id: plan.order.account_id.clone(),
+                leader_id: plan.leader_id.clone(),
+                leader_group: candidate.leader_id.clone(),
+                signal_id: plan.signal_id.clone(),
+                coin: plan.order.coin.clone(),
+                local_side,
+                order_cloid: Some(plan.order.cloid.clone()),
+                order_oid: None,
+                submitted_at_ms: Some(now_ms),
+                filled_at_ms: None,
+                planned_notional_usd: plan.order.notional_usd,
+                pending_notional_usd: plan.order.notional_usd,
+                filled_notional_usd: 0.0,
+                remaining_notional_usd: plan.order.notional_usd,
+                status: strategies::smart_money::CopyLedgerStatus::PendingClose,
+            })
+        })
+        .collect()
+}
+
+fn copy_live_daemon_backfill_seen_event_keys(refs: &[CopyLiveDaemonWouldSubmitRef]) -> Vec<String> {
+    refs.iter()
+        .map(|plan| format!("copy-downtime-backfill-submitted:{}", plan.signal_id))
+        .collect()
+}
+
+fn copy_live_daemon_order_side_from_key(key: &str) -> Option<domain::OrderSide> {
+    match key {
+        "buy" => Some(domain::OrderSide::Buy),
+        "sell" => Some(domain::OrderSide::Sell),
+        _ => None,
+    }
+}
+
+fn copy_live_daemon_backfill_fill_closes_local_side(
+    fill: &hyperliquid::UserFill,
+    local_side: domain::OrderSide,
+) -> bool {
+    let dir = fill.dir.to_ascii_lowercase();
+    match local_side {
+        domain::OrderSide::Buy => dir.contains("close long") || dir.contains("reduce long"),
+        domain::OrderSide::Sell => dir.contains("close short") || dir.contains("reduce short"),
+    }
+}
+
+fn copy_live_daemon_backfill_fill_seen(
+    persistence: &strategies::smart_money::CopyPersistenceSnapshot,
+    fill: &hyperliquid::UserFill,
+) -> bool {
+    let event_fragment = format!("{}:{}:{}:{}", fill.hash, fill.oid, fill.time, fill.coin);
+    persistence.seen_event_keys.iter().any(|key| {
+        key.contains(&event_fragment)
+            || (key.contains(&fill.oid.to_string())
+                && key.contains(&fill.time.to_string())
+                && key.contains(&fill.coin))
+    })
+}
+
+fn copy_live_daemon_leader_state_has_same_side(
+    state: &hyperliquid::ClearinghouseState,
+    coin: &str,
+    local_side: domain::OrderSide,
+) -> bool {
+    state.asset_positions.iter().any(|asset_position| {
+        asset_position.position.coin == coin
+            && asset_position.position.szi.parse::<f64>().ok().is_some_and(
+                |size| match local_side {
+                    domain::OrderSide::Buy => size > 1e-12,
+                    domain::OrderSide::Sell => size < -1e-12,
+                },
+            )
+    })
+}
+
 fn copy_live_daemon_recover_pending_reduce_plan_refs(
     persistence: &strategies::smart_money::CopyPersistenceSnapshot,
     target_accounts: &[String],
@@ -17185,6 +18229,15 @@ fn copy_live_daemon_recover_pending_reduce_plan_refs(
                 "copy-pending-reduce-retry:{}:{}:{}:{}",
                 entry.local_account_id, entry.coin, entry.signal_id, entry.remaining_notional_usd
             );
+            let cloid = entry
+                .order_cloid
+                .as_ref()
+                .filter(|cloid| !cloid.trim().is_empty())
+                .cloned()
+                .unwrap_or_else(|| {
+                    uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, cloid_seed.as_bytes())
+                        .to_string()
+                });
             CopyLiveDaemonWouldSubmitRef {
                 record_index: offset,
                 signal_id: entry.signal_id.clone(),
@@ -17197,8 +18250,7 @@ fn copy_live_daemon_recover_pending_reduce_plan_refs(
                     side: opposite_order_side(entry.local_side),
                     notional_usd: entry.remaining_notional_usd,
                     reduce_only: true,
-                    cloid: uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, cloid_seed.as_bytes())
-                        .to_string(),
+                    cloid,
                 },
             }
         })
@@ -17209,6 +18261,27 @@ fn copy_live_daemon_order_refs_to_orders(
     refs: &[CopyLiveDaemonWouldSubmitRef],
 ) -> Vec<CopyExecutionCanaryWouldSubmit> {
     refs.iter().map(|plan| plan.order.clone()).collect()
+}
+
+fn copy_live_daemon_has_startup_backfill_submit_candidate(
+    options: &CopyLiveDaemonSupervisorOptions,
+    refs: &[CopyLiveDaemonWouldSubmitRef],
+) -> bool {
+    options.submit
+        && refs
+            .iter()
+            .any(|plan| plan.signal_id.starts_with("copy-downtime-backfill-flat:"))
+}
+
+fn copy_live_daemon_has_new_submit_candidate(
+    options: &CopyLiveDaemonSupervisorOptions,
+    refs: &[CopyLiveDaemonWouldSubmitRef],
+    submitted_plan_cloids: &HashSet<String>,
+) -> bool {
+    options.submit
+        && refs
+            .iter()
+            .any(|plan| !submitted_plan_cloids.contains(&plan.order.cloid))
 }
 
 #[cfg(test)]
