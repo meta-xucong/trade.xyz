@@ -797,6 +797,64 @@ function Set-LatestSoakPid {
     return $null
 }
 
+function Confirm-CopyLiveSoakStartedAfterStartError {
+    param(
+        [datetime]$StartedAt,
+        [string]$StartError
+    )
+    Start-Sleep -Seconds 2
+    $statusError = ""
+    try {
+        $status = Invoke-Json "/api/copy/live-soak/status"
+        if ($status.ok -and $status.data.running) {
+            $statusPid = 0
+            if ($null -ne $status.data.pid) {
+                [void][int]::TryParse([string]$status.data.pid, [ref]$statusPid)
+            }
+            if ($statusPid -gt 0) {
+                Set-SoakPidFile -Pid $statusPid
+            }
+            Write-MonitorLog "frontend start request failed but status shows running run_id=$($status.data.run_id) pid=$statusPid error=$StartError"
+            return $true
+        }
+    } catch {
+        $statusError = $_.Exception.Message
+    }
+
+    $soakPid = Set-LatestSoakPid $StartedAt
+    if ($soakPid) {
+        Write-MonitorLog "frontend start request failed but soak process appeared pid=$soakPid error=$StartError"
+        return $true
+    }
+
+    $existingAfterStart = Get-SoakWrapperProcess
+    if ($existingAfterStart) {
+        Set-SoakPidFile -Pid $existingAfterStart.ProcessId
+        Write-MonitorLog "frontend start request failed but existing soak process was found pid=$($existingAfterStart.ProcessId) error=$StartError"
+        return $true
+    }
+
+    try {
+        $status = Invoke-Json "/api/copy/live-soak/status"
+        if ($status.ok -and $status.data.running) {
+            $statusPid = 0
+            if ($null -ne $status.data.pid) {
+                [void][int]::TryParse([string]$status.data.pid, [ref]$statusPid)
+            }
+            if ($statusPid -gt 0) {
+                Set-SoakPidFile -Pid $statusPid
+            }
+            Write-MonitorLog "frontend start request failed but delayed status shows running run_id=$($status.data.run_id) pid=$statusPid error=$StartError"
+            return $true
+        }
+    } catch {
+        $statusError = $_.Exception.Message
+    }
+
+    Write-MonitorLog "frontend start request failed and no async start was observed error=$StartError status_error=$statusError"
+    return $false
+}
+
 function Start-CopyLiveSoak {
     if (Test-CopyLiveSoakPaused) {
         Write-MonitorLog "restart skipped; copy live soak is paused by operator"
@@ -828,7 +886,15 @@ function Start-CopyLiveSoak {
     if (-not [string]::IsNullOrWhiteSpace($resolvedBotExePath)) {
         $body.bot_exe_path = $resolvedBotExePath
     }
-    $start = Invoke-Json "/api/copy/live-soak/start" "POST" $body
+    try {
+        $start = Invoke-Json "/api/copy/live-soak/start" "POST" $body
+    } catch {
+        $startError = $_.Exception.Message
+        if (Confirm-CopyLiveSoakStartedAfterStartError -StartedAt $startedAt -StartError $startError) {
+            return
+        }
+        throw
+    }
     if ($start.ok) {
         $statusPid = 0
         $statusPidRunning = $false
@@ -952,6 +1018,13 @@ function Set-RestartFailurePause {
     }
 }
 
+function Set-PositionTruthUnattributedPause {
+    param([string]$Diagnostic)
+    Send-ConfirmedStopNotification -Reason "position_truth_unattributed" -Diagnostic $Diagnostic
+    Set-Content -LiteralPath $copyLiveSoakPausePath -Value "position_truth_unattributed $(Get-Date -Format o)" -Encoding ascii
+    Reset-StopCandidate "paused_after_position_truth_risk"
+}
+
 $monitorAccountIds = Get-RuntimeAccountIds
 $monitorMarkets = Get-RuntimeMarkets
 if ([double]::IsNaN($MaxTotalNotionalUsd) -or [double]::IsInfinity($MaxTotalNotionalUsd) -or $MaxTotalNotionalUsd -le 0.0) {
@@ -973,20 +1046,27 @@ while ($true) {
             $diagnostic = "position_truth_unattributed_live_exposure; $positionTruthRisk"
             Write-MonitorLog "detected stopped soak; diagnostic: $diagnostic"
             if (Test-StopCandidateConfirmed -Reason "position_truth_unattributed" -Diagnostic $diagnostic) {
+                $recoverySucceeded = $false
+                $recoveryThrew = $false
                 try {
                     Stop-SoakProcessesForRestart -Reason "position_truth_unattributed_recovery"
-                    if (Invoke-UnattributedLedgerRecovery -Diagnostic $diagnostic) {
-                        Reset-StopCandidate "recovered_after_position_truth_risk"
-                        Start-CopyLiveSoak
-                    } else {
-                        Send-ConfirmedStopNotification -Reason "position_truth_unattributed" -Diagnostic $diagnostic
-                        Set-Content -LiteralPath $copyLiveSoakPausePath -Value "position_truth_unattributed $(Get-Date -Format o)" -Encoding ascii
-                        Reset-StopCandidate "paused_after_position_truth_risk"
-                    }
+                    $recoverySucceeded = Invoke-UnattributedLedgerRecovery -Diagnostic $diagnostic
                 } catch {
-                    Send-ConfirmedStopNotification -Reason "position_truth_unattributed" -Diagnostic "$diagnostic; recovery_error=$($_.Exception.Message)"
-                    Set-Content -LiteralPath $copyLiveSoakPausePath -Value "position_truth_unattributed $(Get-Date -Format o)" -Encoding ascii
-                    Reset-StopCandidate "paused_after_position_truth_risk"
+                    $recoveryThrew = $true
+                    Set-PositionTruthUnattributedPause -Diagnostic "$diagnostic; recovery_error=$($_.Exception.Message)"
+                }
+                if ($recoverySucceeded) {
+                    Reset-StopCandidate "recovered_after_position_truth_risk"
+                    try {
+                        Start-CopyLiveSoak
+                        Reset-StopCandidate "restart_after_position_truth_recovery"
+                    } catch {
+                        $restartError = $_.Exception.Message
+                        Write-MonitorLog "unattributed recovery cleared risk but restart failed; preserving recovery result error=$restartError"
+                        Set-RestartFailurePause -Detail "post_unattributed_recovery_restart_failed; $restartError"
+                    }
+                } elseif (-not $recoveryThrew) {
+                    Set-PositionTruthUnattributedPause -Diagnostic $diagnostic
                 }
             }
             Start-Sleep -Seconds $PollSecs
